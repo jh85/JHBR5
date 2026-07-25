@@ -4,7 +4,7 @@
 #include <memory>
 #include <vector>
 
-#include "dlshogi_mcts/types.h"
+#include "mcts/types.h"
 #include "shogi/board.h"
 #include "shogi/types.h"
 

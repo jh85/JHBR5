@@ -63,9 +63,9 @@ Re-add iteratively after the base port works:
 
 ### Step 1: clean port of dlshogi's UctSearch
 
-1. Create `dlshogi_mcts/` directory (parallel to `lc0_mcts/`).
+1. Create `mcts/` directory (parallel to `lc0_mcts/`).
 2. Copy `DeepLearningShogi/usi/UctSearch.{cpp,h}` and `Node.h` into
-   `dlshogi_mcts/`. Adjust includes and namespaces.
+   `mcts/`. Adjust includes and namespaces.
 3. Adapt to our types:
    - `Position*` → `lczero::ShogiBoard*` (different API; need a shim
      or selective rewrite).

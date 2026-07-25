@@ -5,7 +5,7 @@ Last audited: 2026-07-24
 ## Scope and classification
 
 This inventory follows the source files that are compiled into the `jhbr2`
-binary: `main.cc`, `usi/`, `dlshogi_mcts/`, `inference/`, `shogi/`, `mate/`,
+binary: `main.cc`, `usi/`, `mcts/`, `inference/`, `shogi/`, `mate/`,
 and the runtime YBB reader in `book/`. It intentionally excludes training,
 conversion, match-runner, and Gote-book-generator scripts.
 
@@ -56,7 +56,7 @@ The parser also accepts dlshogi-compatible aliases `c_init`, `c_base`,
 recommended experiment ranges. Suggested initial ranges are in
 `docs/ENGINE_STRENGTH_ROADMAP.md`.
 
-The active PUCT score in `dlshogi_mcts/search_primitives.cc` is:
+The active PUCT score in `mcts/search_primitives.cc` is:
 
 ```text
 c = c_init + log((parent_visits + c_base + 1) / c_base)
@@ -186,7 +186,7 @@ grace loop check every 1 ms.
 
 ## Hard-coded MCTS constants and policies
 
-Sources: `dlshogi_mcts/uct_search.*`, `search_primitives.*`, `types.h`, and
+Sources: `mcts/uct_search.*`, `search_primitives.*`, `types.h`, and
 `uct_node.*`.
 
 | Constant/policy | Current value | Class | Notes |

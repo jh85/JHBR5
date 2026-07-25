@@ -10,9 +10,9 @@ Panda23 with 2x RTX 3090.
 
 The clean dlshogi-style MCTS implementation is in:
 
-- `dlshogi_mcts/types.h`
-- `dlshogi_mcts/uct_node.{h,cc}`
-- `dlshogi_mcts/uct_search.{h,cc}`
+- `mcts/types.h`
+- `mcts/uct_node.{h,cc}`
+- `mcts/uct_search.{h,cc}`
 
 USI is currently wired to `dlshogi_mcts::Search` through
 `usi/usi_engine.{h,cc}`. CMake also has explicit TensorRT/cuDNN roots:
@@ -331,7 +331,7 @@ If observed NPS is far below target:
 4. Try `leaf-mate-mode off` first to isolate pure MCTS/NN throughput.
 5. Compare `trtexec` batch latency for `input_planes=128x48x9x9` and
    `256x48x9x9`.
-6. Inspect `dlshogi_mcts/uct_search.cc` for search loop bottlenecks before
+6. Inspect `mcts/uct_search.cc` for search loop bottlenecks before
    changing the algorithm.
 
 ## Files Changed In This Session
@@ -340,7 +340,7 @@ If observed NPS is far below target:
 - `CMakeLists.txt`
 - `usi/usi_engine.h`
 - `usi/usi_engine.cc`
-- `dlshogi_mcts/`
+- `mcts/`
 
 Build artifacts and engines are ignored by git:
 

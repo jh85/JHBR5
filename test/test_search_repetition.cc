@@ -1,6 +1,6 @@
 #include <cstdio>
 
-#include "dlshogi_mcts/search_repetition.h"
+#include "mcts/search_repetition.h"
 #include "shogi/bitboard.h"
 #include "shogi/board.h"
 #include "shogi/types.h"

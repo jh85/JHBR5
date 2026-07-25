@@ -24,7 +24,7 @@ The governing rule is:
 
 ## Current repository state and user-owned files
 
-- The current search backend is `dlshogi_mcts/`; the retired lc0 MCTS backend
+- The current search backend is `mcts/`; the retired lc0 MCTS backend
   has already been removed.
 - `build.sh` has an uncommitted user change selecting a different model and
   TensorRT workspace. Do not overwrite or include it in unrelated commits.
@@ -46,10 +46,10 @@ The governing rule is:
 |---|---|---|
 | Exact legal-move capacity bound | Complete | `91ec837` |
 | Concurrent NN cache with in-flight deduplication and statistics | Complete | `c9a0655`, `inference/nn_cache.h` |
-| Persistent subtree reuse | Complete | `d127b53`, `dlshogi_mcts/uct_node.*` |
+| Persistent subtree reuse | Complete | `d127b53`, `mcts/uct_node.*` |
 | Independent root-repetition correction | Complete | `dd1d546` |
 | Standard USI `info` reporting for depth, seldepth, CP, nodes, NPS, time, and PV | Complete | `dd1d546`, `usi/search_info.*` |
-| Terminal-value backup and dlshogi PUCT semantics | Complete | `d72cefd`, `dlshogi_mcts/search_primitives.*` |
+| Terminal-value backup and dlshogi PUCT semantics | Complete | `d72cefd`, `mcts/search_primitives.*` |
 | Non-finite NN/tree containment and one-shot diagnostics | Complete, investigation remains open | `fc5212f` |
 | Shallow mate search through 7 plies and root mate guard | Complete | `mate/shallow_mate.h`, `5f36892` |
 | Specialized mate-in-one routine | Complete | `0d18270` |
@@ -150,7 +150,7 @@ Add deterministic tests around:
 - cancellation and stop paths during TensorRT failures.
 
 Prefer small pure functions such as those in
-`dlshogi_mcts/search_primitives.*`. Every discovered bug should receive the
+`mcts/search_primitives.*`. Every discovered bug should receive the
 smallest reproducing position and a permanent regression test.
 
 ### 1.2 Board differential testing

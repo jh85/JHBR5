@@ -1,4 +1,4 @@
-#include "dlshogi_mcts/uct_search.h"
+#include "mcts/uct_search.h"
 
 #include <algorithm>
 #include <array>
@@ -10,8 +10,8 @@
 #include <unordered_map>
 #include <utility>
 
-#include "dlshogi_mcts/search_primitives.h"
-#include "dlshogi_mcts/search_repetition.h"
+#include "mcts/search_primitives.h"
+#include "mcts/search_repetition.h"
 #include "inference/nn_diagnostics.h"
 #include "mate/shallow_mate.h"
 

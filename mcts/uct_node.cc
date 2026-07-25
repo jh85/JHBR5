@@ -1,4 +1,4 @@
-#include "dlshogi_mcts/uct_node.h"
+#include "mcts/uct_node.h"
 
 #include <algorithm>
 #include <condition_variable>

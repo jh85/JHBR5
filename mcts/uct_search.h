@@ -8,7 +8,7 @@
 #include <mutex>
 #include <vector>
 
-#include "dlshogi_mcts/uct_node.h"
+#include "mcts/uct_node.h"
 #include "inference/nn_cache.h"
 #ifdef USE_TENSORRT
 #include "inference/nn_tensorrt.h"

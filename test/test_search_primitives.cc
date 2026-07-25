@@ -4,7 +4,7 @@
 #include <memory>
 #include <vector>
 
-#include "dlshogi_mcts/search_primitives.h"
+#include "mcts/search_primitives.h"
 
 namespace {
 

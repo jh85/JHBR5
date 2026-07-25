@@ -5,7 +5,7 @@
 #include <utility>
 #include <vector>
 
-#include "dlshogi_mcts/uct_search.h"
+#include "mcts/uct_search.h"
 #include "shogi/bitboard.h"
 #include "shogi/board.h"
 #include "shogi/types.h"

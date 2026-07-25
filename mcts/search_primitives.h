@@ -2,7 +2,7 @@
 
 #include <vector>
 
-#include "dlshogi_mcts/uct_node.h"
+#include "mcts/uct_node.h"
 
 namespace dlshogi_mcts {
 

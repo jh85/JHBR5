@@ -20,7 +20,7 @@
 #include "inference/nn_eval.h"
 #endif
 #include "book/opening_book.h"
-#include "dlshogi_mcts/uct_search.h"
+#include "mcts/uct_search.h"
 #include "shogi/board.h"
 
 namespace jhbr2 {

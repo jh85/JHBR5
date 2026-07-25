@@ -3,7 +3,7 @@
 This document is the kickoff brief for a fresh agent session. The
 goal is **step 1 of the migration plan in `docs/dlshogi_port_plan.md`**:
 create a clean port of dlshogi's `UctSearch` into a new
-`dlshogi_mcts/` directory, keeping it side-by-side with the existing
+`mcts/` directory, keeping it side-by-side with the existing
 `lc0_mcts/` until validated.
 
 Read first (in order):
@@ -61,18 +61,18 @@ flat-Node-array approach.
 
 ## What you create in this step
 
-A **new directory** `dlshogi_mcts/` containing:
+A **new directory** `mcts/` containing:
 
-1. `dlshogi_mcts/uct_node.{h,cc}` — port of
+1. `mcts/uct_node.{h,cc}` — port of
    `DeepLearningShogi/cppshogi/Node.h` and any `.cpp` it ships
    with. Contains `child_node_t`, `uct_node_t`.
-2. `dlshogi_mcts/uct_search.{h,cc}` — port of
+2. `mcts/uct_search.{h,cc}` — port of
    `DeepLearningShogi/usi/UctSearch.{h,cpp}`. Contains
    `UCTSearcher`, `UCTSearcherGroup`, the search loop, PUCT,
    backup, the bucket-hashed position mutex array.
-3. `dlshogi_mcts/types.h` — any shared enums (Color, GameResult,
+3. `mcts/types.h` — any shared enums (Color, GameResult,
    etc.) needed by uct_search but not in our existing types.
-4. `dlshogi_mcts/board_shim.{h,cc}` — adapter functions translating
+4. `mcts/board_shim.{h,cc}` — adapter functions translating
    between dlshogi's `Position*` API and our `lczero::ShogiBoard`.
    This is the trickiest file; details below.
 
@@ -96,7 +96,7 @@ Add to `CMakeLists.txt`:
 option(USE_DLSHOGI_MCTS "Use dlshogi-ported MCTS instead of lc0_mcts" OFF)
 if(USE_DLSHOGI_MCTS)
   add_subdirectory(dlshogi_mcts)
-  target_link_libraries(jhbr2 PRIVATE dlshogi_mcts)
+  target_link_libraries(jhbr3 PRIVATE mcts)
   target_compile_definitions(jhbr2 PRIVATE USE_DLSHOGI_MCTS=1)
 else()
   target_link_libraries(jhbr2 PRIVATE mcts)  # current lc0_mcts
@@ -106,7 +106,7 @@ endif()
 In `usi/usi_engine.cc`:
 ```cpp
 #ifdef USE_DLSHOGI_MCTS
-  #include "dlshogi_mcts/uct_search.h"
+  #include "mcts/uct_search.h"
   using SearchT = dlshogi_shogi::UCTSearcher;
 #else
   #include "lc0_mcts/search.h"
@@ -270,7 +270,7 @@ acceptance for step 3 in the master plan.
 │   ├── concurrency_dlshogi_vs_jhbr2.md
 │   ├── dlshogi_port_plan.md
 │   └── dlshogi_port_step1_briefing.md  # ← this file
-└── dlshogi_mcts/              # ← what you create
+└── mcts/              # ← what you create
 ```
 
 ## When to commit

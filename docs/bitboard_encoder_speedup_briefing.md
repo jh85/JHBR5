@@ -70,7 +70,7 @@ shogi/
 
 ## What's out of scope
 
-- **Don't touch the MCTS code** (`lc0_mcts/`, `dlshogi_mcts/`). That's
+- **Don't touch the MCTS code** (`lc0_mcts/`, `mcts/`). That's
   a separate effort.
 - **Don't change the public API** of `bitboard.h` / `encoder.h`. Other
   code (board, search, mate solvers) calls these by signature.
@@ -305,7 +305,7 @@ worth a release.
 /home/ei/Downloads/JHBR2/
 ├── shogi/                  # ← board, bitboard, encoder, types (your focus)
 ├── lc0_mcts/               # current MCTS (don't touch)
-├── dlshogi_mcts/           # in-progress port (don't touch)
+├── mcts/           # in-progress port (don't touch)
 ├── inference/              # NN evaluator (don't touch)
 ├── usi/                    # USI handler (don't touch)
 ├── mate/                   # mate detection (don't touch)

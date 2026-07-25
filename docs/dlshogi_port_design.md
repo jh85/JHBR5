@@ -56,10 +56,10 @@ gap is due to BT4 model size, not architecture.
 
 | Old | New |
 |---|---|
-| `lc0_mcts/search.{h,cc}` | `dlshogi_mcts/uct_search.{h,cc}` (clean reimplementation) |
-| `lc0_mcts/node.{h,cc}` | `dlshogi_mcts/uct_node.{h,cc}` (clean reimplementation) |
+| `lc0_mcts/search.{h,cc}` | `mcts/uct_search.{h,cc}` (clean reimplementation) |
+| `lc0_mcts/node.{h,cc}` | `mcts/uct_node.{h,cc}` (clean reimplementation) |
 | `lc0_mcts/backend.h` | (removed — direct evaluator calls) |
-| `lc0_mcts/types.h` | merged into `uct_node.h` or kept minimal in `dlshogi_mcts/types.h` |
+| `lc0_mcts/types.h` | merged into `uct_node.h` or kept minimal in `mcts/types.h` |
 
 The retired `lc0_mcts/` implementation was deleted after dlshogi_mcts
 became the verified production backend.
@@ -67,7 +67,7 @@ became the verified production backend.
 ## 4. Module file structure (clean target)
 
 ```
-dlshogi_mcts/
+mcts/
 ├── CMakeLists.txt
 ├── types.h           # Result/Color enums and helpers (small)
 ├── uct_node.h        # uct_node_t, child_node_t, NodeTree
@@ -659,19 +659,19 @@ After each implementation step:
 - Book integration. Keep the existing book code; just call into
   it from CmdGo before invoking the MCTS, same as today.
 
-## 18. Scrap from existing dlshogi_mcts/ directory
+## 18. Scrap from existing mcts/ directory
 
 After this clean reimplementation lands:
 
-- Delete `dlshogi_mcts/{color,piece,position,score,move,
+- Delete `mcts/{color,piece,position,score,move,
   generateMoves,init,overloadEnumOperators,common,fastmath,
   Message,nn_tensorrt,mate,int8_calibrator,search}.h*`.
-- Delete `dlshogi_mcts/{cppshogi,uct_node,uct_search}.{cpp,h}`
+- Delete `mcts/{cppshogi,uct_node,uct_search}.{cpp,h}`
   (replaced by the new files).
-- Keep only the new `dlshogi_mcts/{types,uct_node,uct_search}.{h,cc}`
+- Keep only the new `mcts/{types,uct_node,uct_search}.{h,cc}`
   + `CMakeLists.txt`.
 
-Net result: ~1500 lines in `dlshogi_mcts/`, all in jhbr2's idioms,
+Net result: ~1500 lines in `mcts/`, all in jhbr2's idioms,
 no stubs, no dlshogi-specific includes.
 
 ## 19. Why this is better than the mechanical port
@@ -696,7 +696,7 @@ formulas; the code structure comes from jhbr2's idioms.
 
 A previous attempt at mechanical porting produced an
 ifdef-stripped version of dlshogi's source at
-`~/Downloads/dlsport/JHBR2/dlshogi_mcts/` (local-only, not in
+`~/Downloads/dlsport/JHBR2/mcts/` (local-only, not in
 git). The following compile options were determined to be
 **unneeded for our use case** and stripped from that local copy
 via `unifdef -U`:
@@ -721,7 +721,7 @@ management). But **don't** carry over its stub files
 only to make the mechanical port compile and serve no purpose in
 the clean reimplementation specified by this design.
 
-If `~/Downloads/dlsport/JHBR2/dlshogi_mcts/` doesn't exist on
+If `~/Downloads/dlsport/JHBR2/mcts/` doesn't exist on
 your machine, the original `DeepLearningShogi/usi/UctSearch.cpp`
 is the same algorithm; just mentally skip the
 `#ifdef ONNXRUNTIME / MULTI_PONDER / etc.` branches.

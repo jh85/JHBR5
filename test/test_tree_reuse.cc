@@ -4,7 +4,7 @@
 #include <thread>
 #include <vector>
 
-#include "dlshogi_mcts/uct_node.h"
+#include "mcts/uct_node.h"
 #include "shogi/bitboard.h"
 #include "shogi/board.h"
 #include "shogi/types.h"

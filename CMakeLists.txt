@@ -77,10 +77,10 @@ set(SHOGI_ENGINE_SRCS
 # Search and inference backends
 option(USE_TENSORRT "Use native TensorRT backend (no ONNX Runtime needed)" OFF)
 
-set(DLSHOGI_MCTS_SRCS
-  dlshogi_mcts/search_primitives.cc
-  dlshogi_mcts/uct_node.cc
-  dlshogi_mcts/uct_search.cc
+set(MCTS_SRCS
+  mcts/search_primitives.cc
+  mcts/uct_node.cc
+  mcts/uct_search.cc
 )
 
 if(USE_TENSORRT)
@@ -145,9 +145,9 @@ target_include_directories(nn_backend PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(nn_backend PUBLIC shogi_core)
 
 # ---- Library: dlshogi-style MCTS ----
-add_library(dlshogi_mcts STATIC ${DLSHOGI_MCTS_SRCS})
-target_include_directories(dlshogi_mcts PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
-target_link_libraries(dlshogi_mcts PUBLIC nn_backend mate_solver shogi_core)
+add_library(mcts STATIC ${MCTS_SRCS})
+target_include_directories(mcts PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(mcts PUBLIC nn_backend mate_solver shogi_core)
 
 if(USE_TENSORRT)
   # Native TensorRT backend.
@@ -195,7 +195,7 @@ endif()
 
 # ---- Executable ----
 add_executable(jhbr3 main.cc ${USI_SRCS})
-target_link_libraries(jhbr3 PRIVATE dlshogi_mcts nn_backend mate_solver
+target_link_libraries(jhbr3 PRIVATE mcts nn_backend mate_solver
                                     opening_book time_manager shogi_core)
 if(NOT USE_TENSORRT AND ORT_INCLUDE)
   target_include_directories(jhbr3 PRIVATE ${ORT_INCLUDE})
@@ -215,7 +215,7 @@ add_executable(test_nn_cache test/test_nn_cache.cc)
 # ---- Test: MCTS subtree reuse ----
 add_executable(test_tree_reuse
   test/test_tree_reuse.cc
-  dlshogi_mcts/uct_node.cc
+  mcts/uct_node.cc
 )
 target_link_libraries(test_tree_reuse PRIVATE shogi_core)
 
@@ -224,7 +224,7 @@ target_link_libraries(test_tree_reuse PRIVATE shogi_core)
 # not link nn_backend or inherit USE_TENSORRT.
 add_executable(test_lockfree_search
   test/test_lockfree_search.cc
-  ${DLSHOGI_MCTS_SRCS}
+  ${MCTS_SRCS}
 )
 target_link_libraries(test_lockfree_search PRIVATE mate_solver shogi_core)
 
@@ -235,8 +235,8 @@ target_link_libraries(test_search_repetition PRIVATE shogi_core)
 # ---- Test: MCTS terminal backup, PUCT/FPU, and proven propagation ----
 add_executable(test_search_primitives
   test/test_search_primitives.cc
-  dlshogi_mcts/search_primitives.cc
-  dlshogi_mcts/uct_node.cc
+  mcts/search_primitives.cc
+  mcts/uct_node.cc
 )
 target_link_libraries(test_search_primitives PRIVATE shogi_core)
 
