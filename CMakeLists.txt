@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.18)
-project(jhbr2 LANGUAGES CXX)
+project(jhbr3 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -8,7 +8,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 # validation and containment remain compiled in when this is disabled.
 option(ENABLE_NN_DIAGNOSTICS "Log the first invalid NN/MCTS value" ON)
 if(ENABLE_NN_DIAGNOSTICS)
-  add_compile_definitions(JHBR2_ENABLE_NN_DIAGNOSTICS=1)
+  add_compile_definitions(JHBR3_ENABLE_NN_DIAGNOSTICS=1)
 endif()
 
 # ---- Build type ----
@@ -194,11 +194,11 @@ elseif(ORT_INCLUDE)
 endif()
 
 # ---- Executable ----
-add_executable(jhbr2 main.cc ${USI_SRCS})
-target_link_libraries(jhbr2 PRIVATE dlshogi_mcts nn_backend mate_solver
+add_executable(jhbr3 main.cc ${USI_SRCS})
+target_link_libraries(jhbr3 PRIVATE dlshogi_mcts nn_backend mate_solver
                                     opening_book time_manager shogi_core)
 if(NOT USE_TENSORRT AND ORT_INCLUDE)
-  target_include_directories(jhbr2 PRIVATE ${ORT_INCLUDE})
+  target_include_directories(jhbr3 PRIVATE ${ORT_INCLUDE})
 endif()
 
 # ---- Test: move generation correctness ----

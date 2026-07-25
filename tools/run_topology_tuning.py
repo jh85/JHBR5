@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Unattended GPU-topology screening for JHBR2.
+"""Unattended GPU-topology screening for JHBR3.
 
 The driver performs three stages:
 

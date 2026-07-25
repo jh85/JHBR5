@@ -12,8 +12,8 @@ Examples:
     strength-openings.txt --count 512
 
   tools/run_strength_test.sh match \
-    --engine-a ./build-trt/jhbr2 \
-    --engine-b ./build-trt/jhbr2 \
+    --engine-a ./build-trt/jhbr3 \
+    --engine-b ./build-trt/jhbr3 \
     --openings strength-openings.txt --pairs 200 --nodes 100000 \
     --option-a OnnxModel=/data/model.engine \
     --option-b OnnxModel=/data/model.engine

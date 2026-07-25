@@ -326,8 +326,8 @@ class MCTSEngine:
 class USIEngine:
     """USI protocol handler."""
 
-    ENGINE_NAME = "JHBR2"
-    ENGINE_AUTHOR = "JHBR2 Team"
+    ENGINE_NAME = "JHBR3"
+    ENGINE_AUTHOR = "JHBR3 Team"
 
     def __init__(self, onnx_path=None, config=None):
         self.onnx_path = onnx_path
@@ -538,7 +538,7 @@ def log(msg):
 if __name__ == "__main__":
     import argparse
 
-    parser = argparse.ArgumentParser(description="JHBR2 Shogi USI Engine")
+    parser = argparse.ArgumentParser(description="JHBR3 Shogi USI Engine")
     parser.add_argument("--onnx", default="shogi_bt4_test.onnx",
                         help="ONNX model path")
     parser.add_argument("--nodes", type=int, default=800,

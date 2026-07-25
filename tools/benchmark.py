@@ -1,30 +1,30 @@
 """
-NPS benchmark for jhbr2.
+NPS benchmark for JHBR3.
 
 Port of dlshogi's `DeepLearningShogi/dlshogi/utils/benchmark.py`
-adapted to jhbr2's USI options. Drives the engine through 100
+adapted to JHBR3's USI options. Drives the engine through 100
 real-game positions (curated by Tadao Yamaoka) and reports NPS
 statistics aggregated across positions.
 
 Usage:
     python tools/benchmark.py \\
-        ./build/jhbr2 \\
+        ./build/jhbr3 \\
         ./shogi_bt4_epoch23.engine \\
         --workers-per-gpu 16 --gpus 8 --minibatch 256 --byoyomi 1000
 
 Compare two leaf-mate configurations:
     # current production
-    python tools/benchmark.py ./build/jhbr2 model.engine \\
+    python tools/benchmark.py ./build/jhbr3 model.engine \\
         --leaf-mate-mode shallow --leaf-mate-depth 5 > shallow.log
 
     # no leaf mate search
-    python tools/benchmark.py ./build/jhbr2 model.engine \\
+    python tools/benchmark.py ./build/jhbr3 model.engine \\
         --leaf-mate-mode off > mate-off.log
 
 Notes vs the dlshogi original:
   - dlshogi uses cshogi.usi.Engine; this script uses raw subprocess
     so it has no Python dependency beyond the standard library.
-  - Option name mapping (dlshogi → jhbr2):
+  - Option name mapping (dlshogi → JHBR3):
         DNN_Model       → OnnxModel
         DNN_Batch_Size  → MinibatchSize
         UCT_NodeLimit   → MaxNodes
@@ -32,7 +32,7 @@ Notes vs the dlshogi original:
         ReuseSubtree    → (always enabled)
         Byoyomi_Margin  → (n/a)
         Resign_Threshold→ ResignThreshold
-        USI_Ponder      → (n/a — jhbr2 doesn't ponder)
+        USI_Ponder      → (n/a — JHBR3 doesn't ponder)
         PV_Interval     → (n/a)
 """
 
@@ -157,7 +157,7 @@ POSITIONS = [
 def main():
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument('engine', help='Path to jhbr2 binary')
+    p.add_argument('engine', help='Path to jhbr3 binary')
     p.add_argument('model', help='Path to ONNX or TensorRT engine model')
     p.add_argument(
         '--workers-per-gpu', '--threads',

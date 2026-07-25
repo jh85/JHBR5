@@ -273,7 +273,7 @@ def main() -> int:
             digest.update(chunk)
     source_hash = digest.hexdigest()
     with args.output.open("w", encoding="utf-8") as output:
-        output.write("# JHBR2 paired strength-test opening suite\n")
+        output.write("# JHBR3 paired strength-test opening suite\n")
         output.write(f"# source={args.book.resolve()}\n")
         output.write(f"# source_sha256={source_hash}\n")
         output.write(

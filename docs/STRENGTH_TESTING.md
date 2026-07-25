@@ -21,7 +21,7 @@ centipawns of the best YBB move and rejects final positions whose best stored
 evaluation is more than 250 centipawns from equality. The file records the
 source-book SHA-256 and generation parameters.
 
-This opening suite is only a test input. JHBR2's `BookFile` and
+This opening suite is only a test input. JHBR3's `BookFile` and
 `UseGoteExitBook` remain disabled during normal A/B tests.
 
 ## 2. Run a fast screening match
@@ -29,11 +29,11 @@ This opening suite is only a test input. JHBR2's `BookFile` and
 The following example compares one option while holding everything else fixed:
 
 ```bash
-MODEL=/workspace/JHBR2/engines/shogi_bt4_epoch3.engine
+MODEL=/workspace/JHBR3/engines/shogi_bt4_epoch3.engine
 
 ./tools/run_strength_test.sh match \
-  --engine-a ./build-trt/jhbr2 \
-  --engine-b ./build-trt/jhbr2 \
+  --engine-a ./build-trt/jhbr3 \
+  --engine-b ./build-trt/jhbr3 \
   --openings build-strength/openings-512.txt \
   --pairs 200 --nodes 100000 \
   --option-a OnnxModel="$MODEL" \
@@ -65,8 +65,8 @@ For the current eight-RTX-5090 production configuration:
 
 ```bash
 python3 tools/run_topology_tuning.py \
-  --engine ./build-trt/jhbr2 \
-  --model /workspace/JHBR2/engines/current.engine \
+  --engine ./build-trt/jhbr3 \
+  --model /workspace/JHBR3/engines/current.engine \
   --openings build-strength/openings-512.txt \
   --gpus 8 \
   --baseline-workers 16 \
@@ -105,8 +105,8 @@ deployment topology:
 
 ```bash
 ./tools/run_strength_test.sh match \
-  --engine-a ./build-trt/jhbr2 \
-  --engine-b ./build-trt/jhbr2 \
+  --engine-a ./build-trt/jhbr3 \
+  --engine-b ./build-trt/jhbr3 \
   --openings build-strength/openings-512.txt \
   --pairs 100 --main-time-ms 300000 --byoyomi-ms 10000 \
   --option-a OnnxModel="$MODEL" \

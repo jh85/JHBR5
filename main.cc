@@ -1,11 +1,11 @@
 /*
-  JHBR2 Shogi Engine — Main Entry Point
+  JHBR3 Shogi Engine — Main Entry Point
 
   Runs the USI protocol handler. The engine reads commands from stdin
   and writes responses to stdout.
 
   Usage:
-    ./jhbr2
+    ./jhbr3
     (then type USI commands, or connect via a Shogi GUI)
 */
 
@@ -19,7 +19,7 @@
 #include <unistd.h>
 
 static void crash_handler(int sig) {
-  fprintf(stderr, "\n=== JHBR2 CRASH: signal %d ===\n", sig);
+  fprintf(stderr, "\n=== JHBR3 CRASH: signal %d ===\n", sig);
   void* frames[32];
   int n = backtrace(frames, 32);
   backtrace_symbols_fd(frames, n, 2);  // write to stderr

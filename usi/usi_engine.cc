@@ -1,5 +1,5 @@
 /*
-  JHBR2 Shogi Engine — USI Protocol Implementation
+  JHBR3 Shogi Engine — USI Protocol Implementation
   Uses the dlshogi-style MCTS search.
 */
 
@@ -156,7 +156,7 @@ static std::string FormatNNCacheStats(const NNCacheStats& stats) {
   return out.str();
 }
 
-// USI hashfull is expressed in permill.  JHBR2 does not have a fixed-size
+// USI hashfull is expressed in permill. JHBR3 does not have a fixed-size
 // MCTS node arena like dlshogi, so its bounded NN position cache is the only
 // meaningful hash-table occupancy to report.
 static int NNCacheHashfull(const NNCacheStats& stats) {

@@ -7,10 +7,10 @@ This document assumes you have:
 - TensorRT installed at `$TENSORRT_PATH`
 - cuDNN installed at `$CUDNN_PATH`
 - `shogi_bt4_epoch23_dynamic.onnx`
-- a fresh checkout of the JHBR2 repo
+- a fresh checkout of the JHBR3 repo
 
 The native TensorRT build does not load ONNX directly at runtime. Build the
-`jhbr2` binary first, then convert the ONNX model to a TensorRT `.engine` file
+`jhbr3` binary first, then convert the ONNX model to a TensorRT `.engine` file
 with `trtexec`.
 
 ## 1. Set Paths
@@ -40,7 +40,7 @@ ls "$MODEL_ONNX"
 From the repo root:
 
 ```bash
-cd /path/to/JHBR2
+cd /path/to/JHBR3
 
 cmake -S . -B build-trt -DCMAKE_BUILD_TYPE=Release -DUSE_TENSORRT=ON \
   -DCUDAToolkit_ROOT="$CUDA_PATH" \
@@ -75,13 +75,13 @@ cmake --build build-trt -j"$(nproc)"
 The binary should be:
 
 ```bash
-build-trt/jhbr2
+build-trt/jhbr3
 ```
 
 Check dynamic libraries:
 
 ```bash
-ldd build-trt/jhbr2 | grep -E 'nvinfer|cudart|not found'
+ldd build-trt/jhbr3 | grep -E 'nvinfer|cudart|not found'
 ```
 
 There should be no `not found` lines. `libnvinfer` should resolve from
@@ -97,7 +97,7 @@ There should be no `not found` lines. `libnvinfer` should resolve from
 
 ## 5. Build A TensorRT Engine
 
-Create an engine for the JHBR2 model:
+Create an engine for the JHBR3 model:
 
 ```bash
 mkdir -p engines
@@ -133,10 +133,10 @@ to a different GPU architecture, TensorRT version, CUDA stack, or driver stack.
 Use the engine path from the previous step:
 
 ```bash
-ENGINE=/path/to/JHBR2/engines/shogi_bt4_epoch23_trt_b256.engine
+ENGINE=/path/to/JHBR3/engines/shogi_bt4_epoch23_trt_b256.engine
 
 printf 'usi\nsetoption name OnnxModel value %s\nsetoption name ModelFormat value jhbr2\nsetoption name NumGPUs value 1\nsetoption name WorkersPerGpu value 2\nsetoption name MinibatchSize value 128\nisready\nposition startpos\ngo nodes 256\nquit\n' "$ENGINE" \
-| ./build-trt/jhbr2
+| ./build-trt/jhbr3
 ```
 
 Expected:
@@ -154,10 +154,10 @@ serialized TensorRT `.engine` file there.
 For a two-GPU machine:
 
 ```bash
-ENGINE=/path/to/JHBR2/engines/shogi_bt4_epoch23_trt_b256.engine
+ENGINE=/path/to/JHBR3/engines/shogi_bt4_epoch23_trt_b256.engine
 
 printf 'usi\nsetoption name OnnxModel value %s\nsetoption name ModelFormat value jhbr2\nsetoption name NumGPUs value 2\nsetoption name WorkersPerGpu value 2\nsetoption name MinibatchSize value 128\nisready\nposition startpos\ngo byoyomi 1000\nquit\n' "$ENGINE" \
-| ./build-trt/jhbr2
+| ./build-trt/jhbr3
 ```
 
 `MinibatchSize` is the per-worker search batch. The TensorRT engine's
@@ -166,8 +166,9 @@ split automatically at that limit.
 
 ## 8. Optional ONNX Runtime Fallback
 
-The fallback build accepts one JHBR2 ONNX model whose batch dimension is
-dynamic. Fixed-batch models and `_bN.onnx` sidecar models are not supported.
+The fallback build accepts one JHBR3 ONNX model using the inherited `jhbr2`
+model format whose batch dimension is dynamic. Fixed-batch models and
+`_bN.onnx` sidecar models are not supported.
 
 ```bash
 cmake -S . -B build-ort -DCMAKE_BUILD_TYPE=Release \
@@ -194,8 +195,8 @@ If runtime loading fails:
 
 ```bash
 export LD_LIBRARY_PATH=$TENSORRT_PATH/lib:$CUDNN_PATH/lib:$CUDA_PATH/lib64:$LD_LIBRARY_PATH
-ldd build-trt/jhbr2 | grep 'not found'
+ldd build-trt/jhbr3 | grep 'not found'
 ```
 
 If TensorRT says the engine is incompatible, rebuild the engine on the same
-machine where you will run JHBR2.
+machine where you will run JHBR3.

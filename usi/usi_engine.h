@@ -1,5 +1,5 @@
 /*
-  JHBR2 Shogi Engine — USI Protocol Handler
+  JHBR3 Shogi Engine — USI Protocol Handler
 
   Implements the Universal Shogi Interface protocol for communication
   with Shogi GUIs (ShogiGUI, Shogidokoro, etc.) and tournament software.
@@ -27,8 +27,8 @@ namespace jhbr2 {
 
 class USIEngine {
  public:
-  static constexpr const char* ENGINE_NAME = "JHBR2";
-  static constexpr const char* ENGINE_AUTHOR = "JHBR2 Team";
+  static constexpr const char* ENGINE_NAME = "JHBR3";
+  static constexpr const char* ENGINE_AUTHOR = "JHBR3 Team";
 
   USIEngine();
 

@@ -2,7 +2,7 @@
 
 End-to-end recipe for training the **148-plane JHBR2 model** (dlshogi-style
 input + WDL value + MLH moves-left head) from YaneuraOu `.pack` files, and
-turning the result into a TensorRT engine the `jhbr2` binary can run.
+turning the result into a TensorRT engine the `jhbr3` binary can run.
 
 Pipeline:
 

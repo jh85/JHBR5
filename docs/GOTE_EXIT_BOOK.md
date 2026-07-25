@@ -1,13 +1,13 @@
 # Gote early-exit YBB book
 
-JHBR2 can use a generated opening policy that tries to force Sente out of a
+JHBR3 can use a generated opening policy that tries to force Sente out of a
 source YaneuraOu Binary Book (YBB) as early as possible. The policy is used
-only when JHBR2 is Gote. Normal `BookFile` behavior remains available for
+only when JHBR3 is Gote. Normal `BookFile` behavior remains available for
 Sente and whenever the feature is disabled.
 
 ## Generate the monthly book
 
-From the JHBR2 repository:
+From the JHBR3 repository:
 
 ```bash
 ./tools/generate_gote_exit_book.sh /path/to/new_user_book1.ybb
@@ -50,7 +50,7 @@ its output is incomplete and must not be used for play.
 
 The source must be a distributed/PetaShock-style YBB whose stored move lists
 contain the in-book transpositions that should participate in minimax
-processing. JHBR2 now reads YBB V1 directly; the old text `.db` format is no
+processing. JHBR3 reads YBB V1 directly; the old text `.db` format is no
 longer supported.
 
 ## Enable the policy in USI

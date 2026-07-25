@@ -3,7 +3,7 @@
 export CUDA_PATH=/usr/local/cuda
 export TENSORRT_PATH=/data/new_jhbr2/TensorRT-11.1.0.106
 export CUDNN_PATH=/data/new_jhbr2/cudnn-linux-x86_64-9.24.0.43_cuda13-archive
-export MODEL_ONNX=/data/new_jhbr2/JHBR2/shogi_bt4_epoch1_dynamic_fp16.onnx
+export MODEL_ONNX=/data/new_jhbr2/JHBR3/shogi_bt4_epoch1_dynamic_fp16.onnx
 export CC=clang
 export CXX=clang++
 export BUILD_DIR=build-trt

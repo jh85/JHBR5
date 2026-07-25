@@ -8,7 +8,7 @@
 
 namespace jhbr2 {
 
-// One complete, GUI-facing USI search record.  JHBR2 currently reports a
+// One complete, GUI-facing USI search record. JHBR3 currently reports a
 // single PV, but keeping multipv explicit matches the common YaneuraOu form
 // and avoids making zero mean "unspecified" in clients.
 struct USISearchInfo {

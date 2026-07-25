@@ -8,13 +8,13 @@
 // helper remain active when logging is disabled; only the diagnostic message
 // is compiled out.  Configure with -DENABLE_NN_DIAGNOSTICS=OFF after the
 // incident has been identified.
-#ifndef JHBR2_ENABLE_NN_DIAGNOSTICS
-#define JHBR2_ENABLE_NN_DIAGNOSTICS 0
+#ifndef JHBR3_ENABLE_NN_DIAGNOSTICS
+#define JHBR3_ENABLE_NN_DIAGNOSTICS 0
 #endif
 
 namespace jhbr2::nn_diagnostics {
 
-#if JHBR2_ENABLE_NN_DIAGNOSTICS
+#if JHBR3_ENABLE_NN_DIAGNOSTICS
 
 inline std::atomic<bool> g_first_failure_logged{false};
 
