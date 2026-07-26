@@ -6,7 +6,7 @@ This document assumes you have:
 - CUDA installed at `$CUDA_PATH`
 - TensorRT installed at `$TENSORRT_PATH`
 - cuDNN installed at `$CUDNN_PATH`
-- `shogi_bt4_epoch23_dynamic.onnx`
+- `model.onnx`
 - a fresh checkout of the JHBR3 repo
 
 The native TensorRT build does not load ONNX directly at runtime. Build the
@@ -19,7 +19,7 @@ with `trtexec`.
 export CUDA_PATH=/path/to/cuda
 export TENSORRT_PATH=/path/to/TensorRT
 export CUDNN_PATH=/path/to/cudnn
-export MODEL_ONNX=/path/to/shogi_bt4_epoch23_dynamic.onnx
+export MODEL_ONNX=/path/to/model.onnx
 
 export LD_LIBRARY_PATH=$TENSORRT_PATH/lib:$CUDNN_PATH/lib:$CUDA_PATH/lib64:$LD_LIBRARY_PATH
 ```
@@ -104,7 +104,7 @@ mkdir -p engines
 
 $TENSORRT_PATH/bin/trtexec \
   --onnx="$MODEL_ONNX" \
-  --saveEngine=engines/shogi_bt4_epoch23_trt_b256.engine \
+  --saveEngine=engines/model_b256.engine \
   --fp16 \
   --minShapes=input_planes:1x148x9x9 \
   --optShapes=input_planes:128x148x9x9 \
@@ -117,7 +117,7 @@ If engine build fails because of memory, retry with a smaller profile:
 ```bash
 $TENSORRT_PATH/bin/trtexec \
   --onnx="$MODEL_ONNX" \
-  --saveEngine=engines/shogi_bt4_epoch23_trt_b128.engine \
+  --saveEngine=engines/model_b128.engine \
   --fp16 \
   --minShapes=input_planes:1x148x9x9 \
   --optShapes=input_planes:128x148x9x9 \
@@ -133,7 +133,7 @@ to a different GPU architecture, TensorRT version, CUDA stack, or driver stack.
 Use the engine path from the previous step:
 
 ```bash
-ENGINE=/path/to/JHBR3/engines/shogi_bt4_epoch23_trt_b256.engine
+ENGINE=/path/to/JHBR3/engines/model_b256.engine
 
 printf 'usi\nsetoption name OnnxModel value %s\nsetoption name ModelFormat value jhbr2\nsetoption name NumGPUs value 1\nsetoption name WorkersPerGpu value 2\nsetoption name MinibatchSize value 128\nisready\nposition startpos\ngo nodes 256\nquit\n' "$ENGINE" \
 | ./build-trt/jhbr3
@@ -154,7 +154,7 @@ serialized TensorRT `.engine` file there.
 For a two-GPU machine:
 
 ```bash
-ENGINE=/path/to/JHBR3/engines/shogi_bt4_epoch23_trt_b256.engine
+ENGINE=/path/to/JHBR3/engines/model_b256.engine
 
 printf 'usi\nsetoption name OnnxModel value %s\nsetoption name ModelFormat value jhbr2\nsetoption name NumGPUs value 2\nsetoption name WorkersPerGpu value 2\nsetoption name MinibatchSize value 128\nisready\nposition startpos\ngo byoyomi 1000\nquit\n' "$ENGINE" \
 | ./build-trt/jhbr3
