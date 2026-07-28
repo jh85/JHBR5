@@ -88,15 +88,112 @@ Fixed-node matches remain the right choice for search-semantic parameters,
 where an NPS difference should not change the nominal work budget. Keep
 `--minibatch-values` at or below the TensorRT engine's reported `max_batch`;
 larger requests are split and do not create a true larger inference batch.
+For clock-based matches, the runner automatically raises `MaxNodes` to
+10,000,000 unless an explicit `--option-a MaxNodes=...` or
+`--option-b MaxNodes=...` is supplied; otherwise JHBR3's default 800-node cap
+would end most searches before the clock budget.
 
 Additional engine settings can be held constant with repeatable
 `--engine-option NAME=VALUE` arguments. The driver controls `OnnxModel`,
-`WorkersPerGpu`, `MinibatchSize`, `NumGPUs`, and `NNCacheSize` itself.
+`WorkersPerGpu`, `MinibatchSize`, `MaxNodes`, `NumGPUs`, and `NNCacheSize`
+itself.
 
 The script deliberately does not change engine defaults. NPS selects only the
 candidate sent to the paired match; inspect `result.json` and the strength
 confidence interval before adopting it. A final winner must still be confirmed
 with the production eight-GPU topology and production clock.
+
+### Automated SPSA search-parameter tuning
+
+`tools/run_spsa_tuning.py` tunes continuous USI search parameters after the
+TensorRT profile, worker count, and minibatch size have been frozen. Each
+iteration creates simultaneous plus/minus perturbations around the current
+parameter vector and compares them directly in one color-reversed match. The
+driver alternates which perturbation is engine A, uses logarithmic coordinates
+for `CBase`, bounds noisy updates, tail-averages the later SPSA centers, and can
+run a final baseline-versus-recommendation match.
+
+On this two-RTX-3090 host, using the batch-64 TensorRT plan:
+
+```bash
+python3 tools/run_spsa_tuning.py \
+  --engine ./build-trt/jhbr3 \
+  --model ./engines/shogi_bt4_epoch3_trt_o64_m64_ws16384.engine \
+  --openings /data/new_jhbr2/JHBR2/build-strength/openings-512.txt \
+  --preset nonroot-puct \
+  --engine-option WorkersPerGpu=2 \
+  --engine-option MinibatchSize=64 \
+  --engine-option NNCacheSize=0 \
+  --iterations 30 --pairs-per-iteration 8 --nodes 4000 \
+  --gpu-devices 0,1 --gpus-per-worker 1 \
+  --confirmation-pairs 100 \
+  --confirmation-byoyomi-ms 1000 \
+  --confirmation-gpus-per-worker 2 \
+  --output spsa-runs/rtx3090-nonroot
+```
+
+The screening phase above launches one pair worker per GPU and uses fixed
+nodes. The confirmation phase exposes both GPUs to each engine and uses the
+real one-second clock. A separate opening file can be reserved for confirmation
+with `--confirmation-openings`.
+
+For a new eight-RTX-5090 machine, run topology tuning first, then substitute its
+selected worker and minibatch values below:
+
+```bash
+python3 tools/run_spsa_tuning.py \
+  --engine ./build-trt/jhbr3 \
+  --model /workspace/JHBR3/engines/current.engine \
+  --openings build-strength/openings-512.txt \
+  --preset puct \
+  --engine-option WorkersPerGpu=BEST_WORKERS \
+  --engine-option MinibatchSize=BEST_BATCH \
+  --engine-option NNCacheSize=BEST_CACHE \
+  --iterations 40 --pairs-per-iteration 16 --nodes TARGET_NODES \
+  --gpu-devices 0,1,2,3,4,5,6,7 --gpus-per-worker 1 \
+  --confirmation-pairs 100 \
+  --confirmation-main-time-ms 300000 \
+  --confirmation-byoyomi-ms 10000 \
+  --confirmation-gpus-per-worker 8 \
+  --output spsa-runs/rtx5090-puct
+```
+
+Choose `TARGET_NODES` from the median nodes per move at the intended production
+clock. This keeps fixed-node screening close to the search regime that will
+actually be deployed. With eight GPUs and `--gpus-per-worker 1`, sixteen
+opening pairs take two parallel waves per SPSA iteration. The full-machine
+confirmation intentionally uses one pair worker because each engine sees all
+eight GPUs.
+
+The built-in presets are:
+
+- `nonroot-puct`: `CInit`, logarithmic `CBase`, and `FpuReduction`;
+- `puct`: the three non-root parameters plus their root variants;
+- `none`: only explicitly supplied `--parameter` values.
+
+Custom continuous parameters use:
+
+```text
+--parameter NAME=INITIAL:MIN:MAX[:linear|log[:float|int]]
+```
+
+For example,
+`--parameter MovesLeftWeight=0.01:0.0:0.05:linear:float`.
+Integer/discrete parameters are accepted for controlled experiments, but SPSA
+is normally a poor optimizer for mate depths, worker counts, and minibatch
+sizes. Use grids for those.
+
+Every run contains `config.json`, append-only `history.jsonl`, `state.json`,
+`result.json`, per-iteration strength-test directories, and an optional
+`confirmation/` directory. An interrupted run resumes with the identical
+command plus `--resume`; both SPSA state and partially completed paired matches
+are reused. Use `--dry-run` to validate paths, parameter bounds, GPU grouping,
+and the first generated match command without creating a run.
+
+SPSA is a noisy screening optimizer, not its own proof of improvement. Adopt
+only the tail-averaged `recommendation_options` from `result.json`, and only
+when its fresh confirmation match is convincing. Do not tune topology and
+PUCT in the same SPSA run.
 
 ## 3. Confirm using the production GPU topology and time control
 

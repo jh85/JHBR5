@@ -10,6 +10,9 @@ dist/
 build/
 build-*/
 strength-runs/
+topology-runs/
+spsa-runs/
+promotion-finetune/
 .venv/
 venv/
 

@@ -34,6 +34,9 @@ except ImportError as exc:  # pragma: no cover - exercised by wrapper
     ) from exc
 
 
+TIMED_MAX_NODES = 10_000_000
+
+
 def utc_now() -> str:
     return dt.datetime.now(dt.timezone.utc).isoformat()
 
@@ -672,6 +675,13 @@ class MatchRun:
         self.worker_count = worker_count
         self.options_a = parse_options(args.option_a)
         self.options_b = parse_options(args.option_b)
+        if args.nodes is None:
+            # A USI clock does not replace JHBR3's persistent MaxNodes
+            # option. Avoid silently turning a timed match into an 800-node
+            # match while preserving any explicit caller-provided cap.
+            for options in (self.options_a, self.options_b):
+                if not has_option(options, "MaxNodes"):
+                    options["MaxNodes"] = str(TIMED_MAX_NODES)
         if self.gpu_groups:
             for options in (self.options_a, self.options_b):
                 if not has_option(options, "NumGPUs"):

@@ -32,11 +32,13 @@ from typing import Any
 
 NPS_MEDIAN_RE = re.compile(r"^\s*median\s*:\s*([0-9,]+)\s*$")
 NPS_MEAN_RE = re.compile(r"^\s*mean\s*:\s*([0-9,]+)\s*$")
+TIMED_MAX_NODES = 10_000_000
 CONTROLLED_OPTIONS = {
     "onnxmodel",
     "workerspergpu",
     "threads",
     "minibatchsize",
+    "maxnodes",
     "numgpus",
     "nncachesize",
     "leafmatemode",
@@ -245,6 +247,7 @@ class TopologyTuning:
             "engine_options": self.extra_options,
             "benchmark_byoyomi_ms": args.benchmark_byoyomi_ms,
             "benchmark_positions": args.benchmark_positions,
+            "timed_max_nodes": TIMED_MAX_NODES,
             "interaction_top_k": args.interaction_top_k,
             "leaf_mate_mode": args.leaf_mate_mode,
             "leaf_mate_depth": args.leaf_mate_depth,
@@ -314,6 +317,8 @@ class TopologyTuning:
             str(self.args.gpus),
             "--minibatch",
             str(batch),
+            "--nodelimit",
+            str(TIMED_MAX_NODES),
             "--byoyomi",
             str(self.args.benchmark_byoyomi_ms),
             "--limit",
@@ -393,6 +398,10 @@ class TopologyTuning:
         # LeafMateDepth must precede LeafMateMode: setting mode=off last keeps
         # leaf mate search disabled instead of re-enabling it via the depth.
         common_options = {
+            # CmdGo retains the engine's MaxNodes option even when a clock is
+            # supplied. Raise the default 800-node cap so the paired match is
+            # genuinely time-controlled, like the throughput benchmark.
+            "MaxNodes": str(TIMED_MAX_NODES),
             "NNCacheSize": str(self.args.nn_cache_size),
             "LeafMateDepth": str(self.args.leaf_mate_depth),
             "LeafMateMode": self.args.leaf_mate_mode,
