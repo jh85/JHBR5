@@ -45,7 +45,9 @@ except Exception:
 # For now we do everything in Python.
 from shogi_model_v2 import (ShogiBT4v2, ShogiBT4v2Config,
                             make_direction_policy_index, POLICY_SIZE,
-                            NUM_DIRECTIONS, NUM_PROMO_DIRECTIONS)
+                            NUM_DIRECTIONS, NUM_PROMO_DIRECTIONS,
+                            load_state_dict_with_promotion_migration,
+                            strip_state_dict_wrapper_prefix)
 # unpack_planes is pure numpy (no compiled .so needed) — safe to import for
 # loading packed shards on any training machine.
 import jhbr2_encoder
@@ -473,6 +475,122 @@ class _Tee:
         self.fh.flush()
 
 
+FINETUNE_SCOPES = ("promotion", "policy", "last", "full")
+
+
+def load_training_checkpoint(path):
+    """Load a checkpoint on CPU, using mmap when the PyTorch version supports it."""
+    kwargs = dict(map_location="cpu", weights_only=False)
+    try:
+        return torch.load(path, mmap=True, **kwargs)
+    except TypeError:
+        return torch.load(path, **kwargs)
+
+
+def restore_checkpoint_config(checkpoint):
+    """Construct the exact model configuration recorded in a checkpoint."""
+    cfg = ShogiBT4v2Config()
+    for key, value in checkpoint.get("cfg", {}).items():
+        if hasattr(cfg, key):
+            setattr(cfg, key, value)
+    return cfg
+
+
+def configure_finetune_scope(model, scope, last_encoders=4):
+    """Select trainable parameters before DDP wraps the model.
+
+    DDP registers trainable parameters at construction time, so stages that
+    change this scope must be separate invocations.  A checkpoint produced by
+    one stage can be supplied to the next with ``--finetune-from``.
+    """
+    if scope not in FINETUNE_SCOPES:
+        raise ValueError(f"Unknown fine-tune scope: {scope}")
+
+    for parameter in model.parameters():
+        parameter.requires_grad = False
+
+    def unfreeze(module):
+        if module is not None:
+            for parameter in module.parameters():
+                parameter.requires_grad = True
+
+    if scope == "promotion":
+        unfreeze(model.policy_head.promotion_delta)
+    elif scope == "policy":
+        unfreeze(model.policy_head)
+    elif scope == "last":
+        if not 1 <= last_encoders <= len(model.encoders):
+            raise ValueError(
+                f"--finetune-last-encoders must be in [1, {len(model.encoders)}], "
+                f"got {last_encoders}"
+            )
+        for encoder in model.encoders[-last_encoders:]:
+            unfreeze(encoder)
+        unfreeze(model.final_norm)
+        unfreeze(model.policy_head)
+        unfreeze(model.value_head)
+        unfreeze(model.mlh_head)
+        # smolgen_global is shared by every encoder.  Keep it frozen in this
+        # partial-trunk stage so earlier blocks really remain frozen.
+        for parameter in model.smolgen_global.parameters():
+            parameter.requires_grad = False
+    else:
+        for parameter in model.parameters():
+            parameter.requires_grad = True
+
+    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    if trainable == 0:
+        raise RuntimeError(f"Fine-tune scope {scope!r} selected no parameters")
+    return trainable
+
+
+def build_training_optimizer(model, base_lr, weight_decay, *,
+                             grouped=False, trunk_lr=None, policy_lr=None,
+                             promotion_lr=None):
+    """Build AdamW, optionally with reproducible differential-LR groups."""
+    if not grouped:
+        parameters = [p for p in model.parameters() if p.requires_grad]
+        if not parameters:
+            raise RuntimeError("No trainable parameters")
+        return torch.optim.AdamW(parameters, lr=base_lr,
+                                 weight_decay=weight_decay)
+
+    trunk_lr = base_lr if trunk_lr is None else trunk_lr
+    policy_lr = base_lr if policy_lr is None else policy_lr
+    promotion_lr = policy_lr if promotion_lr is None else promotion_lr
+    buckets = {"trunk": [], "policy": [], "promotion": []}
+    for name, parameter in model.named_parameters():
+        if not parameter.requires_grad:
+            continue
+        if name.startswith("policy_head.promotion_delta."):
+            buckets["promotion"].append(parameter)
+        elif name.startswith("policy_head."):
+            buckets["policy"].append(parameter)
+        else:
+            buckets["trunk"].append(parameter)
+
+    lrs = {
+        "trunk": trunk_lr,
+        "policy": policy_lr,
+        "promotion": promotion_lr,
+    }
+    groups = [
+        {"params": buckets[name], "lr": lrs[name], "group_name": name}
+        for name in ("trunk", "policy", "promotion")
+        if buckets[name]
+    ]
+    if not groups:
+        raise RuntimeError("No trainable parameters")
+    return torch.optim.AdamW(groups, lr=base_lr, weight_decay=weight_decay)
+
+
+def optimizer_lr_summary(optimizer):
+    return ", ".join(
+        f"{group.get('group_name', f'group{i}')}={group['lr']:.2e}"
+        for i, group in enumerate(optimizer.param_groups)
+    )
+
+
 def train(args):
     # --- Distributed (DDP) setup: auto-enabled when launched via torchrun ---
     #   single GPU / DataParallel:  python shogi_train.py ...
@@ -520,27 +638,111 @@ def train(args):
     # Move index function (v2: direction-based, returns index directly)
     move_info_to_idx = build_move_index()
 
-    # --- Model ---
-    cfg = ShogiBT4v2Config()
-    if args.d_model:
-        cfg.embedding_size = args.d_model
-        cfg.policy_d_model = args.d_model
-    if args.encoders:
-        cfg.num_encoders = args.encoders
-    if args.heads:
-        cfg.num_heads = args.heads
+    # --- Checkpoint and model configuration ---
+    checkpoint_path = args.finetune_from or args.resume
+    checkpoint = None
+    if checkpoint_path:
+        if not os.path.exists(checkpoint_path):
+            raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
+        log(f"Loading checkpoint metadata from {checkpoint_path}")
+        checkpoint = load_training_checkpoint(checkpoint_path)
+        cfg = restore_checkpoint_config(checkpoint)
+    else:
+        cfg = ShogiBT4v2Config()
+
+    def apply_architecture_option(arg_value, attr, display_name):
+        if arg_value is None:
+            return
+        current = getattr(cfg, attr)
+        if checkpoint is not None and current != arg_value:
+            raise ValueError(
+                f"{display_name}={arg_value} conflicts with checkpoint value "
+                f"{current}; fine-tuning must keep the checkpoint architecture"
+            )
+        setattr(cfg, attr, arg_value)
+
+    apply_architecture_option(args.d_model, "embedding_size", "--d-model")
+    apply_architecture_option(args.d_model, "policy_d_model", "--d-model")
+    apply_architecture_option(args.encoders, "num_encoders", "--encoders")
+    apply_architecture_option(args.heads, "num_heads", "--heads")
     if args.gated_attention:
-        cfg.gated_attention = True
+        apply_architecture_option(True, "gated_attention", "--gated-attention")
     if args.pre_norm:
-        cfg.pre_norm = True
+        apply_architecture_option(True, "pre_norm", "--pre-norm")
 
     model = ShogiBT4v2(cfg).to(device)
+
+    # Resolve fine-tuning scope.  A resumed fine-tuning run restores the scope
+    # saved in its checkpoint unless the user explicitly supplies one.
+    saved_training = checkpoint.get("training_config", {}) if checkpoint else {}
+    finetune_scope = (
+        args.finetune_scope
+        or (saved_training.get("finetune_scope") if args.resume else None)
+        or "full"
+    )
+    finetune_last_encoders = (
+        args.finetune_last_encoders
+        if args.finetune_last_encoders is not None
+        else (saved_training.get("finetune_last_encoders", 4)
+              if args.resume else 4)
+    )
+
+    start_epoch = 0
+    restored_opt_steps = 0
+    if args.finetune_from:
+        legacy = load_state_dict_with_promotion_migration(
+            model, checkpoint["model"])
+        if legacy:
+            log("  Loaded legacy epoch-3 weights; promotion delta initialized to zero")
+        else:
+            log("  Loaded all model weights, including a trained promotion delta")
+    elif args.resume:
+        if checkpoint.get("partial_epoch"):
+            raise ValueError(
+                "This checkpoint stopped in the middle of an epoch and has no "
+                "saved data cursor. Start the next stage with --finetune-from "
+                "instead of --resume."
+            )
+        state_dict = strip_state_dict_wrapper_prefix(checkpoint["model"])
+        try:
+            model.load_state_dict(state_dict)
+        except RuntimeError as exc:
+            raise RuntimeError(
+                "An exact --resume requires a checkpoint containing the current "
+                "promotion-delta parameters. Use --finetune-from to migrate an "
+                "older checkpoint without restoring its optimizer."
+            ) from exc
+        start_epoch = checkpoint.get("epoch", 0)
+        restored_opt_steps = checkpoint.get("opt_steps", 0)
+        log(f"  Resuming exact training state at epoch {start_epoch}")
+
+    # Frozen/trainable selection must happen before DDP construction.
+    if args.finetune_from or args.resume and saved_training.get("is_finetune"):
+        trainable_params = configure_finetune_scope(
+            model, finetune_scope, finetune_last_encoders)
+    elif args.finetune_scope is not None:
+        trainable_params = configure_finetune_scope(
+            model, finetune_scope, finetune_last_encoders)
+    else:
+        trainable_params = sum(p.numel() for p in model.parameters()
+                               if p.requires_grad)
+
     # Unwrapped reference for checkpoint save / ONNX export: shares parameters
     # with the DDP/DataParallel/torch.compile-wrapped `model`, but its
     # state_dict keys carry no 'module.' / '_orig_mod.' prefixes.
     base_model = model
-    log(f"Model parameters: {model.count_parameters():,}")
-    if args.grad_checkpoint:
+    total_params = sum(p.numel() for p in model.parameters())
+    log(f"Model parameters: {total_params:,} total, {trainable_params:,} trainable")
+    if args.finetune_from or saved_training.get("is_finetune"):
+        log(f"Fine-tune scope: {finetune_scope}"
+            + (f" (last {finetune_last_encoders} encoders)"
+               if finetune_scope == "last" else ""))
+
+    use_grad_checkpoint = args.grad_checkpoint
+    if use_grad_checkpoint and finetune_scope in ("promotion", "policy"):
+        use_grad_checkpoint = False
+        log("Gradient checkpointing ignored: the transformer trunk is frozen")
+    if use_grad_checkpoint:
         model.gradient_checkpointing = True
         log("Gradient (activation) checkpointing: ON")
     accum = max(1, args.grad_accum)
@@ -548,26 +750,33 @@ def train(args):
         log(f"Grad accumulation: {accum} micro-batches "
             f"(effective batch = {args.batch * accum * world_size})")
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr,
-                                  weight_decay=args.wd)
-
-    # --- Resume from checkpoint ---
-    start_epoch = 0
-    if args.resume:
-        if os.path.exists(args.resume):
-            log(f"Resuming from {args.resume}")
-            ckpt = torch.load(args.resume, map_location=device, weights_only=False)
-            # Handle DataParallel state_dict keys (strip 'module.' prefix)
-            state_dict = ckpt['model']
-            if any(k.startswith('module.') for k in state_dict):
-                state_dict = {k.replace('module.', ''): v for k, v in state_dict.items()}
-            model.load_state_dict(state_dict)
-            if 'optimizer' in ckpt:
-                optimizer.load_state_dict(ckpt['optimizer'])
-            start_epoch = ckpt.get('epoch', 0)
-            log(f"  Resumed at epoch {start_epoch}")
-        else:
-            log(f"Checkpoint not found: {args.resume}, starting from scratch")
+    saved_has_groups = bool(
+        checkpoint and any(
+            "group_name" in group
+            for group in checkpoint.get("optimizer", {}).get("param_groups", [])
+        )
+    )
+    grouped_optimizer = bool(
+        args.finetune_from or saved_has_groups
+        or args.trunk_lr is not None
+        or args.policy_lr is not None
+        or args.promotion_lr is not None
+    )
+    optimizer = build_training_optimizer(
+        model, args.lr, args.wd, grouped=grouped_optimizer,
+        trunk_lr=args.trunk_lr, policy_lr=args.policy_lr,
+        promotion_lr=args.promotion_lr)
+    if args.resume and "optimizer" in checkpoint:
+        try:
+            optimizer.load_state_dict(checkpoint["optimizer"])
+        except ValueError as exc:
+            raise ValueError(
+                "The optimizer in this checkpoint does not match the selected "
+                "fine-tune scope. Resume with the same scope, or start a new "
+                "stage with --finetune-from."
+            ) from exc
+    log(f"Optimizer learning rates: {optimizer_lr_summary(optimizer)}")
+    del checkpoint
 
     # --- Mixed precision: fp16 (default) or bf16 (--bf16, better for big models) ---
     amp_dtype = torch.bfloat16 if args.bf16 else torch.float16
@@ -629,7 +838,9 @@ def train(args):
     else:
         approx_positions = len(dataset)
     steps_per_epoch = max(1, approx_positions // max(1, world_size) // args.batch // accum)
-    total_opt_steps = max(2, (args.epochs - start_epoch) * steps_per_epoch)
+    total_opt_steps = max(1, (args.epochs - start_epoch) * steps_per_epoch)
+    if args.max_steps is not None:
+        total_opt_steps = min(total_opt_steps, args.max_steps)
     warmup_steps = min(warmup_steps, total_opt_steps - 1)
     cosine_steps = max(1, total_opt_steps - warmup_steps)
     _cosine = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=cosine_steps)
@@ -644,8 +855,10 @@ def train(args):
         f"{total_opt_steps} optimizer steps (~{steps_per_epoch}/epoch), stepped per-step")
 
     # --- Training loop ---
-    opt_steps = 0    # persistent optimizer-step count
+    opt_steps = restored_opt_steps  # persistent count stored in checkpoints
+    run_opt_steps = 0               # optimizer steps in this invocation
     n_skipped = 0    # optimizer steps skipped due to non-finite gradients
+    stop_requested = False
     for epoch in range(start_epoch, args.epochs):
         model.train()
         total_loss = 0
@@ -749,9 +962,10 @@ def train(args):
                         optimizer.zero_grad(set_to_none=True)
                         # Per-step LR schedule (warmup + cosine). Guard against
                         # stepping cosine past T_max (would ramp the LR back up).
-                        if opt_steps < total_opt_steps:
+                        if run_opt_steps < total_opt_steps:
                             scheduler.step()
                         opt_steps += 1
+                        run_opt_steps += 1
 
                     total_loss += loss.item()
                     total_policy_loss += policy_loss.item()
@@ -760,6 +974,9 @@ def train(args):
                     shard_loss += loss.item()
                     shard_n += 1
                     n_batches += 1
+                    if args.max_steps is not None and run_opt_steps >= args.max_steps:
+                        stop_requested = True
+                        break
 
                 # Print after each shard: current-shard loss (live signal) plus
                 # the cumulative epoch average and current LR.
@@ -772,6 +989,8 @@ def train(args):
                 log(f"  Epoch {epoch+1} shard {shard_id:03d}: loss={cur_loss:.4f} "
                     f"(cum {cum_loss:.4f}, lr {cur_lr:.2e}, "
                     f"{samples/1e6:.1f}M, {speed:.0f}/s)")
+                if stop_requested:
+                    break
         else:
             # Text dataset: single loader for entire epoch
             loader = DataLoader(dataset, batch_size=args.batch, shuffle=True,
@@ -802,14 +1021,19 @@ def train(args):
                 torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
                 scaler.step(optimizer)
                 scaler.update()
-                if opt_steps < total_opt_steps:
+                if run_opt_steps < total_opt_steps:
                     scheduler.step()
                 opt_steps += 1
+                run_opt_steps += 1
 
                 total_loss += loss.item()
                 total_policy_loss += policy_loss.item()
                 total_value_loss += value_loss.item()
                 n_batches += 1
+
+                if args.max_steps is not None and run_opt_steps >= args.max_steps:
+                    stop_requested = True
+                    break
 
                 if n_batches % 1000 == 0:
                     avg_loss = total_loss / n_batches
@@ -852,21 +1076,40 @@ def train(args):
                                  f'{elapsed:.1f}', f'{samples_per_sec:.0f}',
                                  n_batches * args.batch * world_size, n_batches])
 
-        # Save checkpoint (rank 0 only)
-        if (epoch + 1) % args.save_every == 0 and is_main:
+        # Save checkpoint (rank 0 only). A step-limited run always saves its
+        # final state; continue it as a new stage with --finetune-from because
+        # the trainer does not persist a mid-shard data cursor.
+        periodic_save = ((epoch + 1) % args.save_every == 0)
+        if (periodic_save or stop_requested) and is_main:
             os.makedirs(args.save_dir, exist_ok=True)
-            path = os.path.join(args.save_dir, f"shogi_bt4_epoch{epoch+1}.pt")
+            filename = (f"shogi_bt4_step{opt_steps}.pt" if stop_requested
+                        else f"shogi_bt4_epoch{epoch+1}.pt")
+            path = os.path.join(args.save_dir, filename)
             torch.save({
                 'epoch': epoch + 1,
+                'opt_steps': opt_steps,
+                'partial_epoch': stop_requested,
                 'model': base_model.state_dict(),
                 'optimizer': optimizer.state_dict(),
                 'cfg': vars(cfg),
+                'training_config': {
+                    'is_finetune': bool(
+                        args.finetune_from or saved_training.get("is_finetune")),
+                    'finetune_scope': finetune_scope,
+                    'finetune_last_encoders': finetune_last_encoders,
+                    'trunk_lr': args.trunk_lr,
+                    'policy_lr': args.policy_lr,
+                    'promotion_lr': args.promotion_lr,
+                },
             }, path)
             log(f"  Saved {path}")
 
         # Keep all ranks aligned before the next epoch.
         if is_dist:
             dist.barrier()
+        if stop_requested:
+            log(f"Stopped after requested {run_opt_steps} optimizer steps")
+            break
 
     # Export to ONNX (rank 0 only)
     if args.export_onnx and is_main:
@@ -942,7 +1185,36 @@ if __name__ == "__main__":
     parser.add_argument("--save-every", type=int, default=5)
     parser.add_argument("--save-dir", default=".", help="Directory for checkpoint files")
     parser.add_argument("--export-onnx", default=None, help="Export ONNX after training")
-    parser.add_argument("--resume", default=None, help="Resume from checkpoint (.pt file)")
+    checkpoint_group = parser.add_mutually_exclusive_group()
+    checkpoint_group.add_argument(
+        "--resume", default=None,
+        help="Exactly resume a current-format checkpoint, including optimizer")
+    checkpoint_group.add_argument(
+        "--finetune-from", default=None,
+        help="Initialize model weights/config from a checkpoint but start a "
+             "fresh optimizer and epoch schedule; migrates legacy epoch-3 weights")
+    parser.add_argument(
+        "--finetune-scope", choices=FINETUNE_SCOPES, default=None,
+        help="Trainable parameters: promotion=new promotion branch only; "
+             "policy=complete policy head; last=all heads plus the last N "
+             "encoders; full=entire model (default: full)")
+    parser.add_argument(
+        "--finetune-last-encoders", type=int, default=None,
+        help="Number of trailing encoders trained by --finetune-scope last "
+             "(default: 4)")
+    parser.add_argument(
+        "--trunk-lr", type=float, default=None,
+        help="Differential LR for non-policy parameters (default: --lr)")
+    parser.add_argument(
+        "--policy-lr", type=float, default=None,
+        help="Differential LR for the existing policy head (default: --lr)")
+    parser.add_argument(
+        "--promotion-lr", type=float, default=None,
+        help="Differential LR for the promotion delta (default: --policy-lr)")
+    parser.add_argument(
+        "--max-steps", type=int, default=None,
+        help="Stop and save after this many optimizer steps in this invocation; "
+             "useful for short promotion-only stages")
     parser.add_argument("--log-csv", default=None, help="Log training stats to CSV file")
     parser.add_argument("--log-file", default=None,
                         help="Also write all console output (per-shard progress "
@@ -968,4 +1240,8 @@ if __name__ == "__main__":
     parser.add_argument("--workers", type=int, default=4,
                         help="DataLoader workers (increase for PSV: 32-64)")
     args = parser.parse_args()
+    if args.max_steps is not None and args.max_steps < 1:
+        parser.error("--max-steps must be at least 1")
+    if args.finetune_last_encoders is not None and args.finetune_last_encoders < 1:
+        parser.error("--finetune-last-encoders must be at least 1")
     train(args)

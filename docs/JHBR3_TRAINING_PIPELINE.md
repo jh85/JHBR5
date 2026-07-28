@@ -228,6 +228,101 @@ torchrun --nproc_per_node=8 shogi_train.py \
 
 Keep the architecture options identical to the original run.
 
+### Fine-tune epoch 3 for independent promotion scoring
+
+The policy head now has a zero-initialized `promotion_delta` layer. It adds a
+contextual logit correction to the ten promotion directions without changing
+the 2,187-output model interface:
+
+```text
+non-promotion logit = existing attention move logit
+promotion logit     = existing attention move logit + promotion_delta
+```
+
+An older epoch-3 checkpoint does not contain the two new tensors. Use
+`--finetune-from`, not `--resume`: the former permits exactly this migration,
+keeps every existing weight, leaves the new layer at zero, and starts a fresh
+optimizer/LR schedule. `--resume` remains strict and is only for an exact
+current-format continuation.
+
+Fine-tuning stages that freeze different parameters must be separate
+invocations. DDP registers trainable parameters when it starts and cannot
+safely unfreeze a previously omitted parameter set in-place.
+
+#### Two-GPU stage 1: promotion branch only
+
+This example processes about 3.1 million positions
+(`12,000 steps × global batch 256`):
+
+```bash
+cd /data/new_jhbr2/JHBR3
+mkdir -p promotion-finetune/stage1
+
+/data/new_jhbr2/venv/bin/torchrun --nproc_per_node=2 shogi_train.py \
+  --data /data/new_jhbr2/shards2/aggshard \
+  --finetune-from /data/new_jhbr2/shogi_bt4_epoch3.pt \
+  --finetune-scope promotion \
+  --epochs 1 \
+  --lr 3e-4 \
+  --promotion-lr 3e-4 \
+  --warmup-steps 500 \
+  --grad-clip 0.5 \
+  --bf16 \
+  --batch 128 \
+  --grad-accum 1 \
+  --workers 6 \
+  --max-steps 12000 \
+  --save-dir promotion-finetune/stage1 \
+  --save-every 1 \
+  --log-csv promotion-finetune/stage1/run.csv \
+  --log-file promotion-finetune/stage1/run.log
+```
+
+The transformer is frozen, so activation checkpointing is unnecessary. The
+step-limited run writes `shogi_bt4_step12000.pt`. A partial-epoch checkpoint
+has no saved data cursor and deliberately cannot be passed to `--resume`; it
+is the initialization for the next `--finetune-from` stage.
+
+#### Two-GPU stage 2: heads plus the last four encoders
+
+Start conservatively with about one quarter of a corpus pass:
+
+```bash
+mkdir -p promotion-finetune/stage2
+
+/data/new_jhbr2/venv/bin/torchrun --nproc_per_node=2 shogi_train.py \
+  --data /data/new_jhbr2/shards2/aggshard \
+  --finetune-from promotion-finetune/stage1/shogi_bt4_step12000.pt \
+  --finetune-scope last \
+  --finetune-last-encoders 4 \
+  --epochs 1 \
+  --lr 1e-5 \
+  --trunk-lr 1e-5 \
+  --policy-lr 1e-4 \
+  --promotion-lr 1e-4 \
+  --warmup-steps 1000 \
+  --grad-clip 0.5 \
+  --bf16 \
+  --grad-checkpoint \
+  --batch 32 \
+  --grad-accum 4 \
+  --workers 6 \
+  --max-steps 100000 \
+  --save-dir promotion-finetune/stage2 \
+  --save-every 1 \
+  --log-csv promotion-finetune/stage2/run.csv \
+  --log-file promotion-finetune/stage2/run.log
+```
+
+Here the effective global batch remains
+`32 × 2 GPUs × 4 accumulation = 256`. Reduce the micro-batch and increase
+accumulation by the same factor if a 24 GB GPU runs out of memory.
+
+Evaluate stage 2 before unfreezing the complete trunk. A later full-model
+stage uses `--finetune-scope full` and can retain the same differential
+learning rates. Always use a new output directory so the original epoch-3
+checkpoint remains untouched.
+
 ## 5. Convert a checkpoint to ONNX
 
 `checkpoint2onnx.py` does not create a TensorRT engine directly. It creates

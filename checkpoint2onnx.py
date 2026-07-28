@@ -2,7 +2,11 @@ import sys
 sys.path.insert(0, ".")
 from pathlib import Path
 import torch
-from shogi_model_v2 import ShogiBT4v2, ShogiBT4v2Config
+from shogi_model_v2 import (
+    ShogiBT4v2,
+    ShogiBT4v2Config,
+    load_state_dict_with_promotion_migration,
+)
 
 def main():
     if len(sys.argv) < 3:
@@ -22,7 +26,9 @@ def main():
         if hasattr(cfg,k):
             setattr(cfg,k,v)
     model = ShogiBT4v2(cfg)
-    model.load_state_dict(ckpt["model"], strict=False)
+    legacy = load_state_dict_with_promotion_migration(model, ckpt["model"])
+    if legacy:
+        print("legacy checkpoint: promotion delta is zero (policy is unchanged)")
     model.eval()
 
     dynamic_axes = None

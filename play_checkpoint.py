@@ -26,7 +26,11 @@ import numpy as np
 import torch
 import cshogi
 
-from shogi_model_v2 import ShogiBT4v2, ShogiBT4v2Config
+from shogi_model_v2 import (
+    ShogiBT4v2,
+    ShogiBT4v2Config,
+    load_state_dict_with_promotion_migration,
+)
 from shogi_train import sfen_to_planes, move_to_policy_index
 
 
@@ -38,13 +42,13 @@ def load_model(path, device):
             setattr(cfg, k, v)
     model = ShogiBT4v2(cfg)
     state = ckpt["model"]
-    if any(k.startswith("module.") for k in state):
-        state = {k.replace("module.", ""): v for k, v in state.items()}
-    model.load_state_dict(state)
+    legacy = load_state_dict_with_promotion_migration(model, state)
     model.to(device).eval()
     epoch = ckpt.get("epoch", "?")
     print(f"Loaded {path} (epoch {epoch}, {model.count_parameters():,} params, "
           f"d={cfg.embedding_size} x{cfg.num_encoders})")
+    if legacy:
+        print("  Legacy checkpoint: promotion delta is zero; policy is unchanged.")
     return model
 
 

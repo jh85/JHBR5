@@ -4,8 +4,9 @@ BT4-v2 Transformer Model for Shogi.
 Changes from v1:
   - Policy uses dlshogi-style (destination, direction) encoding (2187 classes)
   - Promotion is encoded as separate directions (no promo_offset)
-  - Policy head uses attention + 1x1 conv hybrid
-  - Bilinear promotion scoring conditioned on (from, to)
+  - Policy head uses attention for board moves and learned drop queries
+  - Promotion logits receive an independent, contextual direction/destination
+    delta so promote/non-promote choices are trainable
 
 Architecture:
   - PE-Dense input embedding (same as v1)
@@ -325,8 +326,10 @@ class DirectionPolicyHead(nn.Module):
     For board moves: uses Q @ K.T attention to score (from, to) pairs,
     then converts to (direction, destination) format.
 
-    For promotion: uses bilinear scoring conditioned on both Q[from] and
-    K[to], trained independently from move selection.
+    For promotion: adds an independently learned contextual delta to the
+    attention move score.  The delta is zero-initialized by ShogiBT4v2 so an
+    older checkpoint initially retains its exact policy behavior while
+    fine-tuning can learn promote/non-promote preferences.
 
     For drops: learned query vectors (same as v1).
 
@@ -343,6 +346,12 @@ class DirectionPolicyHead(nn.Module):
         self.act = get_activation(cfg.activation)
         self.wq = nn.Linear(d, d)
         self.wk = nn.Linear(d, d)
+
+        # Promotion preference for each of the 10 board-move directions at
+        # each destination.  `pe` comes from a globally contextual transformer
+        # token, so this can condition on the source piece and full position.
+        # ShogiBT4v2 zero-initializes this AFTER the model-wide initializer.
+        self.promotion_delta = nn.Linear(d, NUM_PROMO_DIRECTIONS)
 
         # Drop move embeddings: 7 learned query vectors
         self.drop_queries = nn.Parameter(torch.randn(NUM_DROP_TYPES, d) * 0.02)
@@ -422,12 +431,22 @@ class DirectionPolicyHead(nn.Module):
         dq = self.drop_queries.unsqueeze(0)  # (1, 7, d)
         drop_logits = torch.matmul(dq, K.transpose(-2, -1)) * scale  # (B, 7, 81)
 
+        # Independent promotion preference.  Linear returns destination-major
+        # (B, 81, 10); transpose before flattening to match the policy layout
+        # direction * 81 + destination.
+        promotion_delta = self.promotion_delta(pe)
+        promotion_delta = promotion_delta.transpose(1, 2).flatten(1)
+
         # Build policy by concatenation instead of clone+slice assignment.
-        # board_policy[:, :drop_start] are board moves, rest replaced by drops.
         drop_start = (NUM_DIRECTIONS + NUM_PROMO_DIRECTIONS) * 81  # 1620
-        board_part = board_policy[:, :drop_start]  # (B, 1620)
+        nonpromotion_part = board_policy[:, :NUM_DIRECTIONS * 81]
+        promotion_part = (
+            board_policy[:, NUM_DIRECTIONS * 81:drop_start] + promotion_delta
+        )
         drop_part = drop_logits.flatten(1)          # (B, 567)
-        policy = torch.cat([board_part, drop_part], dim=1)  # (B, 2187)
+        policy = torch.cat(
+            [nonpromotion_part, promotion_part, drop_part], dim=1
+        )  # (B, 2187)
 
         return policy
 
@@ -503,6 +522,12 @@ class ShogiBT4v2(nn.Module):
         # letting big models train at a usable batch size on smaller GPUs.
         self.gradient_checkpointing = False
         self._init_weights()
+        # Backward-compatible migration: loading an epoch-3 checkpoint leaves
+        # these missing parameters at zero, reproducing the old policy logits
+        # exactly until fine-tuning learns a promotion preference.  This must
+        # happen after _init_weights(), which initializes every Linear module.
+        nn.init.zeros_(self.policy_head.promotion_delta.weight)
+        nn.init.zeros_(self.policy_head.promotion_delta.bias)
         # Start attention gates near "open" (sigmoid(3)≈0.95) so gated attention
         # begins as a near-identity change and only learns to close where useful.
         if cfg.gated_attention:
@@ -522,7 +547,12 @@ class ShogiBT4v2(nn.Module):
     def forward(self, x):
         h = self.embedding(x)
         for enc in self.encoders:
-            if self.gradient_checkpointing and self.training:
+            checkpoint_this_block = (
+                self.gradient_checkpointing
+                and self.training
+                and any(parameter.requires_grad for parameter in enc.parameters())
+            )
+            if checkpoint_this_block:
                 h = torch.utils.checkpoint.checkpoint(enc, h, use_reentrant=False)
             else:
                 h = enc(h)
@@ -535,6 +565,47 @@ class ShogiBT4v2(nn.Module):
 
     def count_parameters(self):
         return sum(p.numel() for p in self.parameters() if p.requires_grad)
+
+
+PROMOTION_DELTA_STATE_KEYS = frozenset({
+    "policy_head.promotion_delta.weight",
+    "policy_head.promotion_delta.bias",
+})
+
+
+def strip_state_dict_wrapper_prefix(state_dict):
+    """Remove DataParallel/DDP's `module.` prefix when present."""
+    if any(key.startswith("module.") for key in state_dict):
+        return {
+            key.removeprefix("module."): value
+            for key, value in state_dict.items()
+        }
+    return state_dict
+
+
+def load_state_dict_with_promotion_migration(model, state_dict):
+    """Load a checkpoint, allowing only the legacy promotion-delta omission.
+
+    Returns True when an older checkpoint was migrated.  Any unrelated
+    missing or unexpected key remains a hard error instead of being silently
+    hidden behind unrestricted ``strict=False``.
+    """
+    state_dict = strip_state_dict_wrapper_prefix(state_dict)
+    incompatible = model.load_state_dict(state_dict, strict=False)
+    missing = set(incompatible.missing_keys)
+    unexpected = set(incompatible.unexpected_keys)
+    legacy = missing == PROMOTION_DELTA_STATE_KEYS and not unexpected
+    if missing and not legacy:
+        raise RuntimeError(
+            "Checkpoint is missing unexpected model parameters: "
+            + ", ".join(sorted(missing))
+        )
+    if unexpected:
+        raise RuntimeError(
+            "Checkpoint contains unexpected model parameters: "
+            + ", ".join(sorted(unexpected))
+        )
+    return legacy
 
 
 # =====================================================================
