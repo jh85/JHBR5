@@ -273,6 +273,9 @@ Search::Search(std::vector<jhbr2::NNEvaluator*> evaluators,
     : config_(config),
       evaluators_(std::move(evaluators)),
       nn_cache_(config.nn_cache_size) {
+  in_flight_playouts_ =
+      static_cast<int>(evaluators_.size()) * config_.workers_per_gpu *
+      config_.minibatch_size;
   groups_.reserve(evaluators_.size());
   for (int g = 0; g < static_cast<int>(evaluators_.size()); ++g) {
     groups_.emplace_back(this, evaluators_[g], g, config_.workers_per_gpu,
@@ -305,6 +308,7 @@ void Search::PrepareForNewGame() {
 
 bool Search::IsSearchActive() const {
   if (stop_.load(std::memory_order_acquire)) return false;
+  if (adaptive_stop_.load(std::memory_order_acquire)) return false;
   if (config_.max_nodes > 0 &&
       playout_count_.load(std::memory_order_acquire) >= config_.max_nodes) {
     return false;
@@ -326,6 +330,15 @@ void Search::RejectRootMates() {
     return;
   }
 
+  jhbr2::shallow_mate::SearchLimits limits;
+  limits.stop = &stop_;
+  if (config_.time_budget.mode == jhbr2::TimeManagementMode::kOn &&
+      config_.time_budget.root_guard_deadline_ms > 0) {
+    limits.deadline =
+        timer_.start() + std::chrono::milliseconds(
+                             config_.time_budget.root_guard_deadline_ms);
+  }
+
   // Usually this checks only the selected move. If it permits a forced
   // mate, mark it as winning for the opponent and try the next-best root
   // candidate using the visits already gathered by MCTS.
@@ -336,12 +349,102 @@ void Search::RejectRootMates() {
 
     ShogiBoard reply = root_board_;
     reply.DoMove(child.move);
-    if (!jhbr2::shallow_mate::HasMateWithin(
-            reply, config_.root_mate_depth)) {
+    const auto probe = jhbr2::shallow_mate::ProbeMateWithin(
+        reply, config_.root_mate_depth, &limits);
+    if (probe == jhbr2::shallow_mate::ProbeResult::kCancelled) {
+      root_mate_cancelled_ = true;
+      return;
+    }
+    if (probe == jhbr2::shallow_mate::ProbeResult::kNoMate) {
       return;
     }
     child.SetWin();
   }
+}
+
+jhbr2::RootSearchSnapshot Search::CaptureRootSnapshot() const {
+  jhbr2::RootSearchSnapshot snapshot;
+  snapshot.elapsed_ms = timer_.ElapsedMs();
+  snapshot.new_playouts =
+      playout_count_.load(std::memory_order_acquire);
+  if (!root_ || !root_->IsEvaled() || root_->child_num <= 0) {
+    return snapshot;
+  }
+
+  snapshot.best_index = static_cast<int>(SelectBestChild(root_));
+  int second = -1;
+  int second_visits = std::numeric_limits<int>::min();
+  float second_prior = -1.0f;
+  for (int i = 0; i < root_->child_num; ++i) {
+    if (i == snapshot.best_index || root_->child[i].IsWin()) continue;
+    const int visits =
+        root_->child[i].move_count.load(std::memory_order_acquire);
+    if (visits > second_visits ||
+        (visits == second_visits && root_->child[i].nnrate > second_prior)) {
+      second = i;
+      second_visits = visits;
+      second_prior = root_->child[i].nnrate;
+    }
+  }
+  snapshot.second_index = second;
+
+  const auto read_child = [](const child_node_t& child,
+                             std::int64_t* visits, float* q) {
+    *visits =
+        std::max(child.move_count.load(std::memory_order_acquire), 0);
+    if (child.IsLose()) {
+      *q = 1.0f;
+    } else if (child.IsWin()) {
+      *q = 0.0f;
+    } else {
+      const float wins = child.win.load(std::memory_order_acquire);
+      *q = *visits > 0 ? wins / static_cast<float>(*visits) : 0.5f;
+      if (!std::isfinite(*q)) *q = 0.5f;
+    }
+  };
+  read_child(root_->child[snapshot.best_index], &snapshot.best_visits,
+             &snapshot.best_q);
+  // A selected proven-win edge means the root is won. SelectBestChild can
+  // select a proven-loss edge only when every root move is proven losing, so
+  // that case is also a complete root result.
+  snapshot.best_proven = root_->child[snapshot.best_index].IsLose() ||
+                         root_->child[snapshot.best_index].IsWin();
+  if (second >= 0) {
+    read_child(root_->child[second], &snapshot.second_visits,
+               &snapshot.second_q);
+  }
+  return snapshot;
+}
+
+void Search::MaybeManageTime(bool force) {
+  if (config_.time_budget.mode == jhbr2::TimeManagementMode::kOff ||
+      !config_.time_budget.HasAdaptiveDeadline()) {
+    return;
+  }
+
+  const int elapsed_ms = timer_.ElapsedMs();
+  int previous = last_time_check_ms_.load(std::memory_order_relaxed);
+  if (!force && elapsed_ms - previous < 20) return;
+  if (!last_time_check_ms_.compare_exchange_strong(
+          previous, elapsed_ms, std::memory_order_acq_rel,
+          std::memory_order_relaxed) &&
+      !force) {
+    return;
+  }
+  bool expected = false;
+  if (!time_check_busy_.compare_exchange_strong(
+          expected, true, std::memory_order_acq_rel,
+          std::memory_order_relaxed)) {
+    return;
+  }
+
+  const auto decision =
+      time_controller_.Update(CaptureRootSnapshot());
+  if (config_.time_budget.mode == jhbr2::TimeManagementMode::kOn &&
+      decision.should_stop) {
+    adaptive_stop_.store(true, std::memory_order_release);
+  }
+  time_check_busy_.store(false, std::memory_order_release);
 }
 
 unsigned Search::SelectBestChild(const uct_node_t* node) const {
@@ -364,11 +467,17 @@ unsigned Search::SelectBestChild(const uct_node_t* node) const {
 }
 
 SearchResult Search::Run(ShogiBoard board, uint64_t starting_pos_key,
-                         const std::vector<Move>& moves) {
+                         const std::vector<Move>& moves,
+                         Clock::time_point move_start) {
   stop_.store(false, std::memory_order_release);
+  adaptive_stop_.store(false, std::memory_order_release);
   playout_count_.store(0, std::memory_order_release);
   nn_cache_.ResetStats();
-  timer_.Restart();
+  timer_.Restart(move_start);
+  time_controller_.Reset(config_.time_budget, in_flight_playouts_);
+  last_time_check_ms_.store(-1000000, std::memory_order_release);
+  time_check_busy_.store(false, std::memory_order_release);
+  root_mate_cancelled_ = false;
   last_info_ms_ = 0;
   root_board_ = std::move(board);
   tree_reused_ = tree_.ResetToPosition(starting_pos_key, moves);
@@ -383,13 +492,17 @@ SearchResult Search::Run(ShogiBoard board, uint64_t starting_pos_key,
     result.best_move = root_legal[0];
     result.tree_reused = tree_reused_;
     result.root_visits_before = root_visits_before_;
+    result.time_sec = timer_.ElapsedMs() / 1000.0f;
     result.nn_cache = nn_cache_.GetStats();
+    result.time_budget = config_.time_budget;
+    result.time_decision = time_controller_.decision();
     return result;
   }
 
   ExpandRoot();
   for (auto& group : groups_) group.Run();
   for (auto& group : groups_) group.Join();
+  MaybeManageTime(true);
   RejectRootMates();
   MaybeOutputInfo();
   return BuildResult();
@@ -753,6 +866,7 @@ void UCTSearcher::ParallelUctSearch() {
     }
 
     grp_->owner->MaybeOutputInfo();
+    grp_->owner->MaybeManageTime();
   }
 }
 
@@ -820,6 +934,23 @@ SearchResult Search::BuildResult() const {
   result.time_sec = timer_.ElapsedMs() / 1000.0f;
   result.nps = result.time_sec > 0.001f ? result.nodes / result.time_sec : 0.0f;
   result.nn_cache = nn_cache_.GetStats();
+  result.time_budget = config_.time_budget;
+  result.time_decision = time_controller_.decision();
+  result.root_mate_cancelled = root_mate_cancelled_;
+  if (result.time_decision.reason == jhbr2::TimeStopReason::kNone) {
+    if (config_.max_nodes > 0 && result.nodes >= config_.max_nodes) {
+      result.time_decision.reason = jhbr2::TimeStopReason::kNodeLimit;
+    } else if (stop_.load(std::memory_order_acquire)) {
+      result.time_decision.reason = jhbr2::TimeStopReason::kExternal;
+    } else if (config_.max_time > 0.0f &&
+               timer_.ElapsedMs() >=
+                   static_cast<int>(config_.max_time * 1000.0f)) {
+      result.time_decision.reason =
+          config_.time_budget.mode == jhbr2::TimeManagementMode::kOn
+              ? jhbr2::TimeStopReason::kLatest
+              : jhbr2::TimeStopReason::kLegacyLimit;
+    }
+  }
   if (!root_ || root_->child_num == 0) return result;
 
   const unsigned best = SelectBestChild(root_);

@@ -97,13 +97,20 @@ overshoot the exact limit by work already gathered into their batches.
 | `DfPnMaxTime` | 4000 ms | 100--60,000 | Tune/time | Wall-time cap for concurrent root DFPN |
 | `MaxMoveTime` | 0 | 0--300,000 ms | Operational | Hard move cap; zero disables |
 | `MaxMoveTime1m` | 0 | 0--60,000 ms | Operational | Replaces `MaxMoveTime` when remaining main time is below 60 seconds; zero disables |
+| `TimeManagement` | `shadow` | `off`, `shadow`, `on` | Operational/test | `off` uses only the legacy allocator; `shadow` logs adaptive decisions while legacy timing controls play; `on` enables adaptive stopping |
+| `MoveOverheadMs` | 100 ms | 0--5000 | Operational/safety | Reserved from the legal clock and explicit move-time deadline in adaptive mode |
+| `TimeMaxExtensionPercent` | 175 | 100--300 | Tune/time | Maximum adaptive extension as a percentage of target time; below 60 seconds it is capped at 125%, and below 10 seconds extensions are disabled |
+| `TimeDebug` | `false` | check | Operational | Emits the calculated time points before search; shadow/on always emit one final `time_result` record |
 
 `LeafMateMode=dfpn` is accepted only for old configuration compatibility and
 is treated as `off`. It is no longer advertised.
 
 Root mate rejection normally checks only the MCTS-selected move. If that move
 allows mate, it marks the move losing and checks the next-best candidate,
-continuing for at most the number of root legal moves.
+continuing for at most the number of root legal moves. In adaptive mode this
+post-search guard shares the move's absolute response deadline. Cancellation
+returns "unknown" and preserves the MCTS candidate instead of treating an
+incomplete mate probe as a proof.
 
 ### Model/backend and opening-book controls
 
@@ -138,6 +145,7 @@ These are command parameters rather than persistent options:
 | `btime`, `wtime` | Selects remaining main time for the side to move | Operational |
 | `binc`, `winc` | Selects per-move increment for the side to move | Operational |
 | `byoyomi` | Shared per-move byoyomi | Operational |
+| `go movetime T` | Searches within the explicit move deadline, reserving `MoveOverheadMs` | Operational |
 | `go mate infinite` | DFPN limit of 10,000,000 nodes | Operational |
 | `go mate T` | DFPN limit `max(T_ms * 200, 100,000)` plus wall-time stop | Operational |
 | `ponder` | Parsed but does not alter search | Protocol limitation |
@@ -150,11 +158,16 @@ This is a known architectural limitation, not a tuning parameter.
 
 The timed `go mate` loop polls every 10 ms.
 
-## Hard-coded time-manager constants
+## Time manager
+
+`TimeManagement=off` retains the legacy behavior in the table below.
+`TimeManagement=shadow` computes and reports the adaptive policy but leaves
+these legacy limits in control. This is the default so a new binary can gather
+machine-specific timing evidence without changing move choice.
 
 Source: `usi/time_manager.cc`.
 
-| Constant/branch | Current value | Class | Meaning |
+| Legacy constant/branch | Current value | Class | Meaning |
 |---|---:|---|---|
 | Byoyomi allocation | 0.90 | Tune/time | MCTS seconds are 90% of byoyomi |
 | Main-time fraction | 0.05 | Tune/time | Used only when byoyomi is zero |
@@ -164,6 +177,42 @@ Source: `usi/time_manager.cc`.
 | Explicit-cap floor | 0.5 s | Operational | Minimum MCTS budget after that subtraction |
 | Watchdog grace | 2000 ms | Operational/safety | Added when no explicit move cap exists |
 | DFPN deadline reserve | 50 ms | Operational/safety | DFPN cap stays this far inside hard deadline |
+
+With `TimeManagement=on`, all time points are measured from receipt of `go`
+with one steady clock:
+
+```text
+phase_divisor = 14 + 26 * clamp((40 - game_ply) / 40, 0, 1)
+target = max(main_time / phase_divisor + 0.8 * increment,
+             byoyomi - MoveOverheadMs)
+```
+
+The target is bounded by the legal response deadline and option caps.
+Pure byoyomi and `go movetime` use one safe deadline and do not stop early or
+extend. Main-time searches may stop after `earliest` when the best move has
+been stable and its visit lead cannot be caught at an upper-bound NPS.
+At `target`, an unstable best move, close visit race, or adverse Q comparison
+can extend the search up to `latest`. The worker in-flight allowance is
+`NumGPUs * WorkersPerGpu * MinibatchSize`.
+
+The exact watchdog, MCTS, concurrent root DFPN, post-MCTS shallow mate guard,
+and DFPN grace wait use the same absolute response deadline. Condition
+variables replace the former 50 ms watchdog polling delay.
+
+Recommended rollout:
+
+```text
+setoption name TimeManagement value shadow
+setoption name MoveOverheadMs value 100
+```
+
+Collect `time_result` and `time_response` lines under the real GUI/network
+topology. Once response latency stays comfortably inside the candidate
+deadline, enable the policy with:
+
+```text
+setoption name TimeManagement value on
+```
 
 Root DFPN uses bands based on
 `available_ms = main_time + increment + byoyomi`:

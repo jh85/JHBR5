@@ -6,6 +6,7 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <chrono>
 #include <fstream>
 #include <string>
 #include <vector>
@@ -116,6 +117,23 @@ int main() {
         check("Starting position: 0 checking moves",
               n == 0,
               "got " + std::to_string(n));
+    }
+
+    // A root guard whose deadline has already passed must return unknown
+    // without mutating the position. Bool leaf probes remain unchanged.
+    {
+        ShogiBoard b;
+        b.SetStartPos();
+        const uint64_t before = b.Hash();
+        jhbr2::shallow_mate::SearchLimits limits;
+        limits.deadline =
+            std::chrono::steady_clock::now() - std::chrono::milliseconds(1);
+        const auto result =
+            jhbr2::shallow_mate::ProbeMateWithin(b, 7, &limits);
+        check("Expired shallow-mate guard is cancelled",
+              result == jhbr2::shallow_mate::ProbeResult::kCancelled);
+        check("Cancelled shallow-mate guard restores board",
+              b.Hash() == before);
     }
 
     // 2. Position with known checking and non-checking moves:

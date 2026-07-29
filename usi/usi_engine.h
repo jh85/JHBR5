@@ -22,6 +22,7 @@
 #include "book/opening_book.h"
 #include "mcts/uct_search.h"
 #include "shogi/board.h"
+#include "usi/time_manager.h"
 
 namespace jhbr2 {
 
@@ -71,6 +72,10 @@ class USIEngine {
   int dfpn_max_time_ms_ = 4000;
   int max_move_time_ms_ = 0;
   int max_move_time_1m_ms_ = 0;
+  TimeManagementMode time_management_mode_ = TimeManagementMode::kShadow;
+  int move_overhead_ms_ = 100;
+  int time_max_extension_percent_ = 175;
+  bool time_debug_ = false;
   std::string book_path_;
   std::string gote_exit_book_path_ = "user_book1_gote_exit.ybb";
   bool use_gote_exit_book_ = false;

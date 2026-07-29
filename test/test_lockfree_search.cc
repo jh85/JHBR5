@@ -143,11 +143,48 @@ void TestConcurrentSearchAndReuse() {
         fresh.root_visits_before == 0);
 }
 
+void TestAdaptiveDeadlineStopsWorkers() {
+  ShogiBoard start;
+  start.SetStartPos();
+
+  jhbr2::NNEvaluator evaluator("", false, 0, 2);
+  SearchConfig config;
+  config.workers_per_gpu = 2;
+  config.minibatch_size = 8;
+  config.max_nodes = 10000000;
+  config.leaf_mate_depth = 0;
+  config.root_mate_depth = 0;
+
+  jhbr2::TimeBudget budget;
+  budget.mode = jhbr2::TimeManagementMode::kOn;
+  budget.earliest_stop_ms = 80;
+  budget.target_stop_ms = 80;
+  budget.latest_search_ms = 80;
+  budget.response_deadline_ms = 200;
+  budget.root_guard_deadline_ms = 200;
+  budget.mcts_time_seconds = 0.08f;
+
+  Search search({&evaluator}, config);
+  search.SetTimeBudget(budget);
+  const SearchResult result = search.Run(start, start.Hash(), {});
+
+  Check("adaptive deadline returns a legal move",
+        !result.best_move.is_null() &&
+            IsLegalMove(start, result.best_move));
+  Check("adaptive deadline performs playouts", result.nodes > 0);
+  Check("adaptive deadline does not run away",
+        result.time_sec >= 0.05f && result.time_sec < 0.5f);
+  Check("adaptive deadline reports a timed stop",
+        result.time_decision.reason == jhbr2::TimeStopReason::kTargetStable ||
+            result.time_decision.reason == jhbr2::TimeStopReason::kLatest);
+}
+
 }  // namespace
 
 int main() {
   lczero::ShogiTables::Init();
   TestConcurrentSearchAndReuse();
+  TestAdaptiveDeadlineStopsWorkers();
   std::printf("\n=== Lock-free MCTS search: %d failed ===\n", failures);
   return failures == 0 ? 0 : 1;
 }

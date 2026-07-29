@@ -28,6 +28,9 @@
 //
 #pragma once
 
+#include <atomic>
+#include <chrono>
+
 #include "shogi/board.h"
 #include "shogi/types.h"
 
@@ -39,6 +42,32 @@ using lczero::MoveList;
 using lczero::UndoInfo;
 
 namespace shallow_mate {
+
+enum class ProbeResult {
+    kMate,
+    kNoMate,
+    kCancelled,
+};
+
+// Optional cooperative cancellation for the post-MCTS root guard. The normal
+// leaf probe passes nullptr and retains the old low-overhead bool API.
+struct SearchLimits {
+    using Clock = std::chrono::steady_clock;
+
+    Clock::time_point deadline = Clock::time_point::max();
+    const std::atomic<bool>* stop = nullptr;
+    bool cancelled = false;
+
+    bool ShouldStop() {
+        if ((stop && stop->load(std::memory_order_acquire)) ||
+            (deadline != Clock::time_point::max() &&
+             Clock::now() >= deadline)) {
+            cancelled = true;
+            return true;
+        }
+        return false;
+    }
+};
 
 // =============================================================
 // Helper: does playing m give check to the opponent?
@@ -79,8 +108,10 @@ inline bool MoveGivesCheck(ShogiBoard& board, Move m) {
 // Forward declarations
 // =============================================================
 
-template <int depth>             bool MateInEvenPly(ShogiBoard& board);
-template <int depth, bool INCHECK = false> bool MateInOddPly(ShogiBoard& board);
+template <int depth>
+bool MateInEvenPly(ShogiBoard& board, SearchLimits* limits = nullptr);
+template <int depth, bool INCHECK = false>
+bool MateInOddPly(ShogiBoard& board, SearchLimits* limits = nullptr);
 
 // =============================================================
 // Hand-tuned 3-ply mate (base case for MateInOddPly<3>).
@@ -94,7 +125,8 @@ template <int depth, bool INCHECK = false> bool MateInOddPly(ShogiBoard& board);
 // The common false path uses GenerateCheckingMovesNonCheck() to avoid
 // the runtime in-check check and the legal-move fallback.
 template <bool INCHECK = false>
-inline bool MateIn3Ply(ShogiBoard& board) {
+inline bool MateIn3Ply(ShogiBoard& board, SearchLimits* limits = nullptr) {
+    if (limits && limits->ShouldStop()) return false;
     // OR node (depth 1): try each checking move.
     // Use specialized GenerateCheckingMoves (Phase 6) — direct
     // bitboard-based enumeration of moves that cause check, avoiding
@@ -102,6 +134,7 @@ inline bool MateIn3Ply(ShogiBoard& board) {
     auto checking_moves = INCHECK ? board.GenerateCheckingMoves()
                                   : board.GenerateCheckingMovesNonCheck();
     for (size_t i = 0; i < checking_moves.size(); ++i) {
+        if (limits && limits->ShouldStop()) return false;
         Move m1 = checking_moves[i];
 
         UndoInfo undo1 = board.DoMove(m1, true);
@@ -131,6 +164,10 @@ inline bool MateIn3Ply(ShogiBoard& board) {
         // For each evasion, check if attacker has mate-in-1 after.
         bool all_evasions_lose = true;
         for (size_t j = 0; j < evasions.size(); ++j) {
+            if (limits && limits->ShouldStop()) {
+                all_evasions_lose = false;
+                break;
+            }
             Move m2 = evasions[j];
 
             UndoInfo undo2 = board.DoMove(m2);
@@ -167,6 +204,10 @@ inline bool MateIn3Ply(ShogiBoard& board) {
                 !board.FindMateInOneNonCheck().is_null();
 
             board.UndoMove(m2, undo2);
+            if (limits && limits->ShouldStop()) {
+                all_evasions_lose = false;
+                break;
+            }
             if (!found_mate1) {
                 all_evasions_lose = false;
                 break;
@@ -174,6 +215,7 @@ inline bool MateIn3Ply(ShogiBoard& board) {
         }
 
         board.UndoMove(m1, undo1);
+        if (limits && limits->cancelled) return false;
         if (all_evasions_lose) return true;
     }
     return false;
@@ -188,14 +230,16 @@ inline bool MateIn3Ply(ShogiBoard& board) {
 // checking move leads to a position where MateInEvenPly<depth-1>
 // returns true.
 template <int depth, bool INCHECK>
-inline bool MateInOddPly(ShogiBoard& board) {
+inline bool MateInOddPly(ShogiBoard& board, SearchLimits* limits) {
     static_assert(depth >= 1 && (depth % 2) == 1,
                   "MateInOddPly: depth must be positive odd");
+    if (limits && limits->ShouldStop()) return false;
 
     // Specialized check-only generator (Phase 6).
     auto moves = INCHECK ? board.GenerateCheckingMoves()
                          : board.GenerateCheckingMovesNonCheck();
     for (size_t i = 0; i < moves.size(); ++i) {
+        if (limits && limits->ShouldStop()) return false;
         Move m = moves[i];
 
         UndoInfo undo = board.DoMove(m, true);
@@ -214,12 +258,12 @@ inline bool MateInOddPly(ShogiBoard& board) {
         }
 
         // Recurse into AND node at depth-1.
-        if (MateInEvenPly<depth - 1>(board)) {
-            board.UndoMove(m, undo);
+        const bool sub = MateInEvenPly<depth - 1>(board, limits);
+        board.UndoMove(m, undo);
+        if (limits && limits->cancelled) return false;
+        if (sub) {
             return true;
         }
-
-        board.UndoMove(m, undo);
     }
     return false;
 }
@@ -232,9 +276,10 @@ inline bool MateInOddPly(ShogiBoard& board) {
 // by attacker's checking move). We're checking if EVERY evasion leads
 // to a position where MateInOddPly<depth-1> returns true.
 template <int depth>
-inline bool MateInEvenPly(ShogiBoard& board) {
+inline bool MateInEvenPly(ShogiBoard& board, SearchLimits* limits) {
     static_assert(depth >= 0 && (depth % 2) == 0,
                   "MateInEvenPly: depth must be non-negative even");
+    if (limits && limits->ShouldStop()) return false;
 
     if constexpr (depth == 0) {
         return !board.HasLegalEvasion();
@@ -247,6 +292,7 @@ inline bool MateInEvenPly(ShogiBoard& board) {
     }
 
     for (size_t i = 0; i < moves.size(); ++i) {
+        if (limits && limits->ShouldStop()) return false;
         Move m = moves[i];
         UndoInfo undo = board.DoMove(m);
 
@@ -268,11 +314,12 @@ inline bool MateInEvenPly(ShogiBoard& board) {
         bool attacker_in_check = undo.gave_check;
         bool sub;
         if (attacker_in_check) {
-            sub = MateInOddPly<depth - 1, true>(board);
+            sub = MateInOddPly<depth - 1, true>(board, limits);
         } else {
-            sub = MateInOddPly<depth - 1, false>(board);
+            sub = MateInOddPly<depth - 1, false>(board, limits);
         }
         board.UndoMove(m, undo);
+        if (limits && limits->cancelled) return false;
 
         if (!sub) {
             // Defender's evasion led to a non-mate position → escaped.
@@ -288,21 +335,23 @@ inline bool MateInEvenPly(ShogiBoard& board) {
 
 // MateInOddPly<3> uses the hand-tuned MateIn3Ply
 template <>
-inline bool MateInOddPly<3, false>(ShogiBoard& board) {
-    return MateIn3Ply<false>(board);
+inline bool MateInOddPly<3, false>(ShogiBoard& board, SearchLimits* limits) {
+    return MateIn3Ply<false>(board, limits);
 }
 template <>
-inline bool MateInOddPly<3, true>(ShogiBoard& board) {
-    return MateIn3Ply<true>(board);
+inline bool MateInOddPly<3, true>(ShogiBoard& board, SearchLimits* limits) {
+    return MateIn3Ply<true>(board, limits);
 }
 
 // MateInOddPly<1> — direct mate-in-1 detection
 template <>
-inline bool MateInOddPly<1, false>(ShogiBoard& board) {
+inline bool MateInOddPly<1, false>(ShogiBoard& board, SearchLimits* limits) {
+    if (limits && limits->ShouldStop()) return false;
     return !board.FindMateInOneNonCheck().is_null();
 }
 template <>
-inline bool MateInOddPly<1, true>(ShogiBoard& board) {
+inline bool MateInOddPly<1, true>(ShogiBoard& board, SearchLimits* limits) {
+    if (limits && limits->ShouldStop()) return false;
     return !board.FindMateInOne().is_null();
 }
 
@@ -315,19 +364,28 @@ inline bool MateInOddPly<1, true>(ShogiBoard& board) {
 // mate within `depth` plies; false if no such mate is found within
 // the depth limit (which doesn't prove no mate exists — could just
 // be deeper than `depth`).
-inline bool HasMateWithin(ShogiBoard& board, int depth) {
+inline bool HasMateWithin(ShogiBoard& board, int depth,
+                          SearchLimits* limits = nullptr) {
     bool in_check = board.InCheck();
     switch (depth) {
-        case 1: return in_check ? MateInOddPly<1, true>(board)
-                                : MateInOddPly<1, false>(board);
-        case 3: return in_check ? MateInOddPly<3, true>(board)
-                                : MateInOddPly<3, false>(board);
-        case 5: return in_check ? MateInOddPly<5, true>(board)
-                                : MateInOddPly<5, false>(board);
-        case 7: return in_check ? MateInOddPly<7, true>(board)
-                                : MateInOddPly<7, false>(board);
+        case 1: return in_check ? MateInOddPly<1, true>(board, limits)
+                                : MateInOddPly<1, false>(board, limits);
+        case 3: return in_check ? MateInOddPly<3, true>(board, limits)
+                                : MateInOddPly<3, false>(board, limits);
+        case 5: return in_check ? MateInOddPly<5, true>(board, limits)
+                                : MateInOddPly<5, false>(board, limits);
+        case 7: return in_check ? MateInOddPly<7, true>(board, limits)
+                                : MateInOddPly<7, false>(board, limits);
         default: return false;
     }
+}
+
+inline ProbeResult ProbeMateWithin(ShogiBoard& board, int depth,
+                                   SearchLimits* limits) {
+    if (limits) limits->cancelled = false;
+    const bool mate = HasMateWithin(board, depth, limits);
+    if (limits && limits->cancelled) return ProbeResult::kCancelled;
+    return mate ? ProbeResult::kMate : ProbeResult::kNoMate;
 }
 
 }  // namespace shallow_mate

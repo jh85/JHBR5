@@ -9,10 +9,12 @@
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <condition_variable>
 #include <exception>
 #include <iomanip>
 #include <iostream>
 #include <limits>
+#include <mutex>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -117,6 +119,14 @@ static ModelFormat ParseModelFormat(const std::string& s) {
   if (v == "dlshogi" || v == "dlshogimodel") return ModelFormat::kDlshogi;
   if (v == "jhbr2" || v == "default") return ModelFormat::kJHBR2;
   return ModelFormat::kAuto;
+}
+
+static TimeManagementMode ParseTimeManagementMode(const std::string& s) {
+  const std::string value = ToLower(s);
+  if (value == "off") return TimeManagementMode::kOff;
+  if (value == "shadow") return TimeManagementMode::kShadow;
+  if (value == "on") return TimeManagementMode::kOn;
+  throw std::invalid_argument("expected off, shadow, or on");
 }
 
 static std::string ModelFormatToString(ModelFormat format) {
@@ -260,6 +270,10 @@ void USIEngine::CmdUsi() {
   Send("option name DfPnMaxTime type spin default 4000 min 100 max 60000");
   Send("option name MaxMoveTime type spin default 0 min 0 max 300000");
   Send("option name MaxMoveTime1m type spin default 0 min 0 max 60000");
+  Send("option name TimeManagement type combo default shadow var off var shadow var on");
+  Send("option name MoveOverheadMs type spin default 100 min 0 max 5000");
+  Send("option name TimeMaxExtensionPercent type spin default 175 min 100 max 300");
+  Send("option name TimeDebug type check default false");
   Send("option name BookFile type string default ");
   Send("option name UseGoteExitBook type check default false");
   Send("option name GoteExitBookFile type string default "
@@ -499,6 +513,15 @@ void USIEngine::CmdSetOption(const std::vector<std::string>& parts) {
       max_move_time_ms_ = std::clamp(ParseInt(value), 0, 300000);
     } else if (name_lower == "maxmovetime1m") {
       max_move_time_1m_ms_ = std::clamp(ParseInt(value), 0, 60000);
+    } else if (name_lower == "timemanagement") {
+      time_management_mode_ = ParseTimeManagementMode(value);
+    } else if (name_lower == "moveoverheadms") {
+      move_overhead_ms_ = std::clamp(ParseInt(value), 0, 5000);
+    } else if (name_lower == "timemaxextensionpercent") {
+      time_max_extension_percent_ =
+          std::clamp(ParseInt(value), 100, 300);
+    } else if (name_lower == "timedebug") {
+      time_debug_ = ToLower(value) == "true" || value == "1";
     } else if (name_lower == "bookfile") {
       book_path_ = value;
       books_dirty_ = true;
@@ -581,6 +604,7 @@ void USIEngine::CmdPosition(const std::vector<std::string>& parts) {
 }
 
 void USIEngine::CmdGo(const std::vector<std::string>& parts) {
+  const auto move_start_time = std::chrono::steady_clock::now();
   if (evaluators_.empty()) {
     Send("bestmove resign");
     return;
@@ -588,7 +612,11 @@ void USIEngine::CmdGo(const std::vector<std::string>& parts) {
 
   // Parse time controls.
   int btime = 0, wtime = 0, byoyomi = 0, binc = 0, winc = 0;
+  int move_time = 0;
   int nodes_limit = max_nodes_;
+  bool has_explicit_nodes = false;
+  bool infinite = false;
+  bool ponder = false;
 
   size_t i = 1;
   while (i < parts.size()) {
@@ -602,14 +630,21 @@ void USIEngine::CmdGo(const std::vector<std::string>& parts) {
       binc = std::stoi(parts[i + 1]); i += 2;
     } else if (parts[i] == "winc" && i + 1 < parts.size()) {
       winc = std::stoi(parts[i + 1]); i += 2;
+    } else if (parts[i] == "movetime" && i + 1 < parts.size()) {
+      move_time = std::stoi(parts[i + 1]); i += 2;
     } else if (parts[i] == "nodes" && i + 1 < parts.size()) {
-      nodes_limit = std::stoi(parts[i + 1]); i += 2;
+      nodes_limit = std::stoi(parts[i + 1]);
+      has_explicit_nodes = true;
+      i += 2;
     } else if (parts[i] == "infinite") {
-      nodes_limit = 10000000; i++;
+      nodes_limit = 10000000;
+      infinite = true;
+      i++;
     } else if (parts[i] == "mate") {
       CmdGoMate(parts);
       return;
     } else if (parts[i] == "ponder") {
+      ponder = true;
       i++;
     } else {
       i++;
@@ -622,14 +657,36 @@ void USIEngine::CmdGo(const std::vector<std::string>& parts) {
   time_control.increment_ms =
       board_.side_to_move() == BLACK ? binc : winc;
   time_control.byoyomi_ms = byoyomi;
+  time_control.move_time_ms = move_time;
+  time_control.game_ply = board_.ply();
   time_control.has_main_time = btime > 0 || wtime > 0;
+  time_control.has_explicit_nodes = has_explicit_nodes;
+  time_control.infinite = infinite;
+  time_control.ponder = ponder;
 
   TimeOptions time_options;
   time_options.max_move_time_ms = max_move_time_ms_;
   time_options.max_move_time_1m_ms = max_move_time_1m_ms_;
   time_options.dfpn_max_time_ms = dfpn_max_time_ms_;
+  time_options.move_overhead_ms = move_overhead_ms_;
+  time_options.max_extension_percent = time_max_extension_percent_;
+  time_options.mode = time_management_mode_;
   const TimeBudget time_budget =
       TimeManager::Compute(time_control, time_options);
+  if (time_debug_) {
+    std::ostringstream timing;
+    timing << "time_budget mode="
+           << TimeManagementModeName(time_budget.mode)
+           << " ply=" << time_control.game_ply
+           << " earliest_ms=" << time_budget.earliest_stop_ms
+           << " target_ms=" << time_budget.target_stop_ms
+           << " latest_ms=" << time_budget.latest_search_ms
+           << " response_ms=" << time_budget.response_deadline_ms
+           << " actual_mcts_ms="
+           << static_cast<int>(time_budget.mcts_time_seconds * 1000.0f)
+           << " hard_ms=" << time_budget.hard_deadline_ms;
+    Log(timing.str());
+  }
 
   // Check entering-king declaration.
   if (board_.CanDeclareWin()) {
@@ -668,14 +725,15 @@ void USIEngine::CmdGo(const std::vector<std::string>& parts) {
   // Configure the dlshogi-style MCTS search.
   search_config_.max_nodes = nodes_limit;
   search_config_.max_time = time_budget.mcts_time_seconds;
+  search_config_.time_budget = time_budget;
 
   // --- Launch root df-pn in parallel ---
-  auto move_start_time = std::chrono::steady_clock::now();
-
   // Keep the solver and its result in one state shared with the worker.
   struct DfpnState {
     MateDfpnSolver solver;
     std::atomic<bool> done{false};
+    std::mutex mutex;
+    std::condition_variable cv;
     Move mate_move;
     ShogiBoard board;
     DfpnState(size_t nodes, const ShogiBoard& b) : solver(nodes), board(b) {}
@@ -683,15 +741,23 @@ void USIEngine::CmdGo(const std::vector<std::string>& parts) {
   auto dfpn =
       std::make_shared<DfpnState>(time_budget.root_dfpn_nodes, board_);
 
-  const auto dfpn_time_deadline =
+  auto dfpn_time_deadline =
       move_start_time +
       std::chrono::milliseconds(time_budget.root_dfpn_time_ms);
+  if (time_budget.mode == TimeManagementMode::kOn &&
+      time_budget.response_deadline_ms > 0) {
+    dfpn_time_deadline = std::min(
+        dfpn_time_deadline,
+        move_start_time +
+            std::chrono::milliseconds(time_budget.response_deadline_ms));
+  }
   auto dfpn_thread =
       std::thread([dfpn, root_dfpn_nodes = time_budget.root_dfpn_nodes,
                    dfpn_time_deadline]() {
         dfpn->mate_move = dfpn->solver.search(
             dfpn->board, root_dfpn_nodes, dfpn_time_deadline);
         dfpn->done.store(true, std::memory_order_release);
+        dfpn->cv.notify_all();
       });
 
   // --- Run dlshogi-style MCTS ---
@@ -723,36 +789,70 @@ void USIEngine::CmdGo(const std::vector<std::string>& parts) {
   // first one ever issued.
   search_->SetMaxTime(search_config_.max_time);
   search_->SetMaxNodes(search_config_.max_nodes);
+  search_->SetTimeBudget(time_budget);
 
-  // Watchdog: hard deadline enforcement for timed searches. Pure node-limited
-  // searches intentionally have no implicit time cap.
-  std::atomic<bool> search_done{false};
+  // Exact watchdog: a condition-variable deadline avoids the old 0-50 ms
+  // polling/join delay. Pure node-limited searches remain uncapped.
+  std::mutex watchdog_mutex;
+  std::condition_variable watchdog_cv;
+  bool search_done = false;
   std::thread watchdog;
   if (time_budget.hard_deadline_ms > 0) {
+    const auto hard_deadline =
+        move_start_time +
+        std::chrono::milliseconds(time_budget.hard_deadline_ms);
     watchdog = std::thread(
-        [this, &search_done,
-         hard_deadline_ms = time_budget.hard_deadline_ms, move_start_time]() {
-          while (!search_done.load(std::memory_order_acquire)) {
-            auto elapsed_ms =
-                std::chrono::duration_cast<std::chrono::milliseconds>(
-                    std::chrono::steady_clock::now() - move_start_time)
-                    .count();
-            if (elapsed_ms >= hard_deadline_ms) {
-              if (search_) search_->Stop();
-              return;
-            }
-            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        [this, dfpn, &watchdog_mutex, &watchdog_cv, &search_done,
+         hard_deadline]() {
+          std::unique_lock<std::mutex> lock(watchdog_mutex);
+          if (!watchdog_cv.wait_until(
+                  lock, hard_deadline, [&search_done] { return search_done; })) {
+            if (search_) search_->Stop();
+            dfpn->solver.stop();
           }
         });
   }
 
   auto result =
-      search_->Run(board_, position_start_key_, position_moves_);
-  search_done.store(true, std::memory_order_release);
+      search_->Run(board_, position_start_key_, position_moves_,
+                   move_start_time);
+  {
+    std::lock_guard<std::mutex> lock(watchdog_mutex);
+    search_done = true;
+  }
+  watchdog_cv.notify_all();
   if (watchdog.joinable()) watchdog.join();
   Log(std::string("tree_reused ") + (result.tree_reused ? "true" : "false") +
       " root_visits_before " +
       std::to_string(result.root_visits_before));
+  if (time_management_mode_ != TimeManagementMode::kOff || time_debug_) {
+    const auto& decision = result.time_decision;
+    const auto& snapshot = decision.snapshot;
+    std::ostringstream timing;
+    timing << "time_result mode="
+           << TimeManagementModeName(result.time_budget.mode)
+           << " reason=" << TimeStopReasonName(decision.reason)
+           << " search_ms="
+           << static_cast<int>(result.time_sec * 1000.0f)
+           << " budget_ms=" << result.time_budget.earliest_stop_ms << "/"
+           << result.time_budget.target_stop_ms << "/"
+           << result.time_budget.latest_search_ms
+           << " response_ms=" << result.time_budget.response_deadline_ms
+           << " effective_ms=" << decision.effective_deadline_ms
+           << " playouts=" << snapshot.new_playouts
+           << " best_visits=" << snapshot.best_visits
+           << " second_visits=" << snapshot.second_visits
+           << " best_q=" << std::fixed << std::setprecision(4)
+           << snapshot.best_q
+           << " second_q=" << snapshot.second_q
+           << " stable_ms=" << decision.stable_ms
+           << " projected=" << decision.projected_remaining
+           << " best_changes=" << decision.best_changes
+           << " extension=" << (decision.extension_active ? 1 : 0)
+           << " root_mate_cancelled="
+           << (result.root_mate_cancelled ? 1 : 0);
+    Log(timing.str());
+  }
 
   // If MCTS finishes first, preserve the original clock-scaled grace period
   // for root df-pn. The grace period is capped by DfPnMaxTime and by the move
@@ -768,12 +868,26 @@ void USIEngine::CmdGo(const std::vector<std::string>& parts) {
     dfpn_wait_deadline = std::min(dfpn_wait_deadline, move_deadline);
   }
 
-  while (!dfpn->done.load(std::memory_order_acquire) &&
-         std::chrono::steady_clock::now() < dfpn_wait_deadline) {
-    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  {
+    std::unique_lock<std::mutex> lock(dfpn->mutex);
+    dfpn->cv.wait_until(lock, dfpn_wait_deadline, [dfpn] {
+      return dfpn->done.load(std::memory_order_acquire);
+    });
   }
   if (!dfpn->done.load(std::memory_order_acquire)) dfpn->solver.stop();
   if (dfpn_thread.joinable()) dfpn_thread.join();
+  if (time_management_mode_ != TimeManagementMode::kOff || time_debug_) {
+    const auto response_elapsed_ms =
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - move_start_time)
+            .count();
+    Log("time_response elapsed_ms=" +
+        std::to_string(response_elapsed_ms) +
+        " deadline_ms=" +
+        std::to_string(time_budget.response_deadline_ms) +
+        " dfpn_nodes=" +
+        std::to_string(dfpn->solver.get_nodes_searched()));
+  }
 
   // --- Choose result ---
   bool use_mate = dfpn->done.load(std::memory_order_acquire) &&

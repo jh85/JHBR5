@@ -20,15 +20,19 @@ inline void AtomicFetchAdd(std::atomic<T>* obj, T arg) {
 
 class Timer {
  public:
+  using Clock = std::chrono::steady_clock;
+
   Timer() { Restart(); }
-  void Restart() { start_ = std::chrono::steady_clock::now(); }
+  void Restart() { start_ = Clock::now(); }
+  void Restart(Clock::time_point start) { start_ = start; }
   int ElapsedMs() const {
     return static_cast<int>(std::chrono::duration_cast<std::chrono::milliseconds>(
-        std::chrono::steady_clock::now() - start_).count());
+        Clock::now() - start_).count());
   }
+  Clock::time_point start() const { return start_; }
 
  private:
-  std::chrono::steady_clock::time_point start_;
+  Clock::time_point start_;
 };
 
 }  // namespace dlshogi_mcts

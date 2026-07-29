@@ -147,7 +147,7 @@ target_link_libraries(nn_backend PUBLIC shogi_core)
 # ---- Library: dlshogi-style MCTS ----
 add_library(mcts STATIC ${MCTS_SRCS})
 target_include_directories(mcts PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
-target_link_libraries(mcts PUBLIC nn_backend mate_solver shogi_core)
+target_link_libraries(mcts PUBLIC nn_backend mate_solver time_manager shogi_core)
 
 if(USE_TENSORRT)
   # Native TensorRT backend.
@@ -226,7 +226,8 @@ add_executable(test_lockfree_search
   test/test_lockfree_search.cc
   ${MCTS_SRCS}
 )
-target_link_libraries(test_lockfree_search PRIVATE mate_solver shogi_core)
+target_link_libraries(test_lockfree_search PRIVATE mate_solver time_manager
+                                                     shogi_core)
 
 # ---- Test: root vs descendant repetition search policy ----
 add_executable(test_search_repetition test/test_search_repetition.cc)
