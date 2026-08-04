@@ -414,6 +414,7 @@ DfpnNode* MateDfpnSolver::SelectBestChild(DfpnNode& node,
 // =====================================================================
 
 MoveList MateDfpnSolver::GenerateChecks(ShogiBoard& board) {
+  if (use_fast_check_movegen_) return board.GenerateCheckingMoves();
   // Generate all legal moves, then filter for those that give check.
   MoveList all_moves = board.GenerateLegalMoves();
   MoveList checks;

@@ -22,6 +22,7 @@
 
 #pragma once
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
@@ -86,7 +87,15 @@ class DfpnNodePool {
   DfpnNodePool() = default;
 
   void Alloc(size_t num_nodes) {
-    pool_ = std::make_unique<DfpnNode[]>(num_nodes);
+    if (pool_ && alloc_size_ >= num_nodes) {
+      // Reuse the previous allocation: only the previously used prefix
+      // can differ from the freshly-constructed state, so restoring that
+      // prefix is equivalent to (and much cheaper than) reallocating.
+      std::fill_n(pool_.get(), used_, DfpnNode{});
+    } else {
+      pool_ = std::make_unique<DfpnNode[]>(num_nodes);
+      alloc_size_ = num_nodes;
+    }
     capacity_ = num_nodes;
     used_ = 0;
     exhausted_ = false;
@@ -112,7 +121,8 @@ class DfpnNodePool {
 
  private:
   std::unique_ptr<DfpnNode[]> pool_;
-  size_t capacity_ = 0;
+  size_t alloc_size_ = 0;  // physical allocation (high-water mark)
+  size_t capacity_ = 0;    // logical capacity of the current search
   size_t used_ = 0;
   bool exhausted_ = false;
 };
@@ -169,6 +179,11 @@ class MateDfpnSolver {
   // worker thread has entered search(), and that request must not be lost.
   void stop() { stop_.store(true, std::memory_order_release); }
 
+  // Benchmark-only switch: use the board's specialized checking-move
+  // generator instead of the historical filter over all legal moves.
+  // Default off to preserve the existing solver's behavior exactly.
+  void set_use_fast_check_movegen(bool v) { use_fast_check_movegen_ = v; }
+
  private:
   bool ShouldStop();
 
@@ -214,6 +229,8 @@ class MateDfpnSolver {
   // Repetition detection: track hashes on the current search path.
   std::vector<uint64_t> path_hashes_;
   bool IsRepetition(uint64_t hash) const;
+
+  bool use_fast_check_movegen_ = false;
 };
 
 }  // namespace jhbr2
