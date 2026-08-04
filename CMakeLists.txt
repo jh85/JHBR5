@@ -70,6 +70,7 @@ endif()
 set(SHOGI_ENGINE_SRCS
   shogi/board.cc
   shogi/bitboard.cc
+  shogi/mate1ply.cc
   shogi/packed_sfen.cc
   shogi/encoder.cc
 )
@@ -109,6 +110,7 @@ endif()
 # Mate solver
 set(MATE_SRCS
   mate/dfpn.cc
+  mate/bns.cc
 )
 
 # USI
@@ -289,6 +291,14 @@ target_link_libraries(test_mate1 PRIVATE shogi_core)
 add_executable(test_check_movegen test/test_check_movegen.cc)
 target_link_libraries(test_check_movegen PRIVATE shogi_core)
 
+# ---- Test: BNS (branch number search) mate solver ----
+add_executable(test_bns test/test_bns.cc)
+target_link_libraries(test_bns PRIVATE mate_solver shogi_core)
+
+# ---- Bench: mate solver comparison (dfpn / bns / bns-pndn) ----
+add_executable(bench_mate_solvers test/bench_mate_solvers.cc)
+target_link_libraries(bench_mate_solvers PRIVATE mate_solver shogi_core)
+
 # ---- Test: native on-demand YBB lookup ----
 add_executable(test_opening_book test/test_opening_book.cc)
 target_link_libraries(test_opening_book PRIVATE opening_book)
@@ -317,3 +327,7 @@ add_executable(test_search_info
   usi/search_info.cc
 )
 target_link_libraries(test_search_info PRIVATE shogi_core)
+
+# ---- Bench: solver-relevant board primitives ----
+add_executable(bench_primitives test/bench_primitives.cc)
+target_link_libraries(bench_primitives PRIVATE shogi_core)
