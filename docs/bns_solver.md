@@ -222,3 +222,26 @@ as-is on AVX-512 hardware).
 with node/time budgets, PV validation, and CSV output; external drivers
 live in `/data/new_jhbr2/dfpn/cshogi_bench/`. See the benchmark report
 in `bench_results/` for current numbers.
+
+## Engine integration and strength test
+
+The engine's root mate thread selects its solver via the USI option
+`RootMateSolver` (combo, default `bns`, var `dfpn`): `MateBnsSolver` in
+its pn/dn configuration (64 MB lazy-allocated table, 16 MB move cache)
+or the original tree df-pn. Result handling, the repetition boundary
+check, and info output are unchanged; both solvers share the same
+interface by construction.
+
+A/B strength test (2026-08-04): 200 opening pairs (400 games, colors
+swapped) from a book-derived balanced suite, byoyomi 500 ms, TensorRT
+epoch-3 148-plane model on an RTX 3090, zero failed games.
+
+    RootMateSolver=bns vs =dfpn: 51.5% score,
+    +10.4 Elo, 95% CI [-11.6, +32.3], LOS 82%
+
+The BNS side led at every 25-pair milestone and the point estimate sits
+in the expected small-positive range for a root-mate-solver upgrade,
+but 400 games cannot certify an effect of this size (confirming
+~10 Elo at 95% confidence needs roughly 1500-2000 games). Verdict:
+suggestive positive, not proven; the match harness output is resumable
+for extension.
