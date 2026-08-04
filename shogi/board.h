@@ -151,6 +151,13 @@ class ShogiBoard {
   Move FindMateInOne();
   Move FindMateInOneNonCheck();
 
+  // Fast approximate mate-in-1 (Apery/cshogi mateMoveIn1Ply port,
+  // shogi/mate1ply.cc): sound but deliberately incomplete — only
+  // near-king mates are found, and it returns null when in check.
+  // Intended as a solver shortcut; missed mates surface one expansion
+  // later in the search.
+  Move FindMateInOneApprox();
+
   // Generate the subset of legal moves that give check to the
   // opponent. Equivalent to filter(GenerateLegalMoves, MoveGivesCheck).
   //
@@ -223,6 +230,18 @@ class ShogiBoard {
   // same hand pieces, and same side to move.
   uint64_t Hash() const { return hash_; }
 
+  // Hash of the position after playing the given legal move, without
+  // making the move. Matches DoMove()'s incremental update exactly.
+  // Used by transposition-table solvers to probe child entries cheaply.
+  uint64_t HashAfter(Move m) const;
+
+  // Board-only keys (position hash with both hand components removed;
+  // side to move still included). Two positions with equal BoardKey()
+  // have the same piece placement and side to move but may differ in
+  // how captured pieces are split between the hands.
+  uint64_t BoardKey() const;
+  uint64_t BoardKeyAfter(Move m) const;
+
   // --- Sennichite (repetition) detection ---
 
   // Repetition result.
@@ -240,7 +259,11 @@ class ShogiBoard {
   // If max_back_plies is positive, only positions within that many plies of
   // the current position are considered. A non-positive value scans all
   // retained game/search history.
-  RepetitionResult CheckRepetition(int max_back_plies = 0) const;
+  //
+  // When repetition_distance is non-null and a repetition is found, it is
+  // set to the ply distance back to the matched prior occurrence.
+  RepetitionResult CheckRepetition(int max_back_plies = 0,
+                                   int* repetition_distance = nullptr) const;
 
   // Get the repetition count (how many times current position has occurred).
   int RepetitionCount() const;
@@ -333,6 +356,14 @@ class ShogiBoard {
 
   template <Color Us>
   Move FindMateInOneNonCheckImpl();
+
+  template <Color Us>
+  Move FindMateInOneApproxImpl();
+  bool MateApproxKingCanEscape(Color us, Square sq, const Bitboard& mask,
+                               const Bitboard& occ_now) const;
+  bool MateApproxPieceCanCapture(Color them, Square sq,
+                                 const Bitboard& dc_them,
+                                 const Bitboard& occ_now) const;
 
   template <Color Us>
   bool IsMateAfterMateProbe(PieceType moved_type, Square checker_square);

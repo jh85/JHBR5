@@ -39,6 +39,11 @@
 #include <cstdint>
 #include <functional>
 #include <string>
+#include <type_traits>
+
+#if defined(__SSE2__)
+#include <immintrin.h>
+#endif
 
 #include "shogi/types.h"
 
@@ -167,28 +172,111 @@ class Bitboard {
 
   // --- bitwise operators ---
 
-  Bitboard& operator|=(const Bitboard& o) { p_[0] |= o.p_[0]; p_[1] |= o.p_[1]; return *this; }
-  Bitboard& operator&=(const Bitboard& o) { p_[0] &= o.p_[0]; p_[1] &= o.p_[1]; return *this; }
-  Bitboard& operator^=(const Bitboard& o) { p_[0] ^= o.p_[0]; p_[1] ^= o.p_[1]; return *this; }
+  Bitboard& operator|=(const Bitboard& o) {
+#if defined(__SSE2__)
+    m_ = _mm_or_si128(m_, o.m_);
+#else
+    p_[0] |= o.p_[0]; p_[1] |= o.p_[1];
+#endif
+    return *this;
+  }
+  Bitboard& operator&=(const Bitboard& o) {
+#if defined(__SSE2__)
+    m_ = _mm_and_si128(m_, o.m_);
+#else
+    p_[0] &= o.p_[0]; p_[1] &= o.p_[1];
+#endif
+    return *this;
+  }
+  Bitboard& operator^=(const Bitboard& o) {
+#if defined(__SSE2__)
+    m_ = _mm_xor_si128(m_, o.m_);
+#else
+    p_[0] ^= o.p_[0]; p_[1] ^= o.p_[1];
+#endif
+    return *this;
+  }
 
-  Bitboard operator|(const Bitboard& o) const { return Bitboard(p_[0] | o.p_[0], p_[1] | o.p_[1]); }
-  Bitboard operator&(const Bitboard& o) const { return Bitboard(p_[0] & o.p_[0], p_[1] & o.p_[1]); }
-  Bitboard operator^(const Bitboard& o) const { return Bitboard(p_[0] ^ o.p_[0], p_[1] ^ o.p_[1]); }
-  Bitboard operator~() const { return Bitboard(~p_[0] & kBBMask0, ~p_[1] & kBBMask1); }
+  Bitboard operator|(const Bitboard& o) const {
+#if defined(__SSE2__)
+    if (!std::is_constant_evaluated())
+      return Bitboard(_mm_or_si128(m_, o.m_));
+#endif
+    return Bitboard(p_[0] | o.p_[0], p_[1] | o.p_[1]);
+  }
+  Bitboard operator&(const Bitboard& o) const {
+#if defined(__SSE2__)
+    if (!std::is_constant_evaluated())
+      return Bitboard(_mm_and_si128(m_, o.m_));
+#endif
+    return Bitboard(p_[0] & o.p_[0], p_[1] & o.p_[1]);
+  }
+  Bitboard operator^(const Bitboard& o) const {
+#if defined(__SSE2__)
+    if (!std::is_constant_evaluated())
+      return Bitboard(_mm_xor_si128(m_, o.m_));
+#endif
+    return Bitboard(p_[0] ^ o.p_[0], p_[1] ^ o.p_[1]);
+  }
+  Bitboard operator~() const {
+#if defined(__SSE2__)
+    // (~this) & ALL in one instruction; also strips any garbage bits.
+    if (!std::is_constant_evaluated())
+      return Bitboard(_mm_andnot_si128(m_, All().m_));
+#endif
+    return Bitboard(~p_[0] & kBBMask0, ~p_[1] & kBBMask1);
+  }
 
-  // andnot: (~this) & other.
+  // andnot: (~this) & other  (the SSE ANDN convention).
   Bitboard AndNot(const Bitboard& o) const {
+#if defined(__SSE2__)
+    if (!std::is_constant_evaluated())
+      return Bitboard(_mm_andnot_si128(m_, o.m_));
+#endif
     return Bitboard(~p_[0] & o.p_[0], ~p_[1] & o.p_[1]);
   }
 
   // Shift operations (for pawn/lance effects — shift by 1 = one rank).
-  Bitboard& operator<<=(int s) { p_[0] <<= s; p_[1] <<= s; return *this; }
-  Bitboard& operator>>=(int s) { p_[0] >>= s; p_[1] >>= s; return *this; }
-  Bitboard operator<<(int s) const { return Bitboard(p_[0] << s, p_[1] << s); }
-  Bitboard operator>>(int s) const { return Bitboard(p_[0] >> s, p_[1] >> s); }
+  Bitboard& operator<<=(int s) {
+#if defined(__SSE2__)
+    m_ = _mm_slli_epi64(m_, s);
+#else
+    p_[0] <<= s; p_[1] <<= s;
+#endif
+    return *this;
+  }
+  Bitboard& operator>>=(int s) {
+#if defined(__SSE2__)
+    m_ = _mm_srli_epi64(m_, s);
+#else
+    p_[0] >>= s; p_[1] >>= s;
+#endif
+    return *this;
+  }
+  Bitboard operator<<(int s) const {
+#if defined(__SSE2__)
+    if (!std::is_constant_evaluated())
+      return Bitboard(_mm_slli_epi64(m_, s));
+#endif
+    return Bitboard(p_[0] << s, p_[1] << s);
+  }
+  Bitboard operator>>(int s) const {
+#if defined(__SSE2__)
+    if (!std::is_constant_evaluated())
+      return Bitboard(_mm_srli_epi64(m_, s));
+#endif
+    return Bitboard(p_[0] >> s, p_[1] >> s);
+  }
 
   // Comparison.
-  bool operator==(const Bitboard& o) const { return p_[0] == o.p_[0] && p_[1] == o.p_[1]; }
+  bool operator==(const Bitboard& o) const {
+#if defined(__SSE4_1__)
+    const __m128i neq = _mm_xor_si128(m_, o.m_);
+    return _mm_test_all_zeros(neq, neq) != 0;
+#else
+    return p_[0] == o.p_[0] && p_[1] == o.p_[1];
+#endif
+  }
   bool operator!=(const Bitboard& o) const { return !(*this == o); }
 
   // --- iteration ---
@@ -236,7 +324,13 @@ class Bitboard {
   // Byte-reverse the 128-bit value (reverses byte order and swaps halves).
   // Used by Qugiy to transform right-direction rays for arithmetic.
   Bitboard byte_reverse() const {
+#if defined(__SSSE3__)
+    const __m128i shuffle =
+        _mm_set_epi8(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15);
+    return Bitboard(_mm_shuffle_epi8(m_, shuffle));
+#else
     return Bitboard(__builtin_bswap64(p_[1]), __builtin_bswap64(p_[0]));
+#endif
   }
 
   // Unpack: rearrange two Bitboards so that p[0] and p[1] from each
@@ -245,17 +339,29 @@ class Bitboard {
   // lo_out = {lo_in.p[0], hi_in.p[0]}
   static void Unpack(const Bitboard& hi_in, const Bitboard& lo_in,
                      Bitboard& hi_out, Bitboard& lo_out) {
+#if defined(__SSE2__)
+    hi_out.m_ = _mm_unpackhi_epi64(lo_in.m_, hi_in.m_);
+    lo_out.m_ = _mm_unpacklo_epi64(lo_in.m_, hi_in.m_);
+#else
     hi_out = Bitboard(lo_in.p_[1], hi_in.p_[1]);
     lo_out = Bitboard(lo_in.p_[0], hi_in.p_[0]);
+#endif
   }
 
   // Decrement two (hi:lo) pairs as independent 128-bit integers.
   // Each pair (hi.p[i], lo.p[i]) is treated as one 128-bit value.
   static void Decrement(const Bitboard& hi_in, const Bitboard& lo_in,
                         Bitboard& hi_out, Bitboard& lo_out) {
+#if defined(__SSE4_1__)
+    // Borrow from hi exactly where lo == 0 (cmpeq gives -1 there).
+    hi_out.m_ =
+        _mm_add_epi64(hi_in.m_, _mm_cmpeq_epi64(lo_in.m_, _mm_setzero_si128()));
+    lo_out.m_ = _mm_add_epi64(lo_in.m_, _mm_set1_epi64x(-1LL));
+#else
     hi_out = Bitboard(hi_in.p_[0] - (lo_in.p_[0] == 0 ? 1 : 0),
                       hi_in.p_[1] - (lo_in.p_[1] == 0 ? 1 : 0));
     lo_out = Bitboard(lo_in.p_[0] - 1, lo_in.p_[1] - 1);
+#endif
   }
 
   // --- debug ---
@@ -265,8 +371,18 @@ class Bitboard {
 
  private:
   constexpr Bitboard(uint64_t p0, uint64_t p1) : p_{p0, p1} {}
+#if defined(__SSE2__)
+  explicit Bitboard(__m128i m) : m_(m) {}
+#endif
 
-  uint64_t p_[2];
+  union {
+    uint64_t p_[2];
+#if defined(__SSE2__)
+    __m128i m_;
+#endif
+  };
+
+  friend class Bitboard256;
 };
 
 // =====================================================================
@@ -277,6 +393,72 @@ class Bitboard {
 
 class Bitboard256 {
  public:
+#if defined(__AVX2__)
+  Bitboard256() : m_(_mm256_setzero_si256()) {}
+
+  // From two Bitboards (b0 in the low 128-bit lane).
+  Bitboard256(const Bitboard& b0, const Bitboard& b1) {
+    m_ = _mm256_inserti128_si256(_mm256_castsi128_si256(b0.m_), b1.m_, 1);
+  }
+
+  // Replicate one Bitboard into both lanes.
+  explicit Bitboard256(const Bitboard& b)
+      : m_(_mm256_broadcastsi128_si256(b.m_)) {}
+
+  static Bitboard256 Zero() { return Bitboard256(); }
+
+  Bitboard256& operator&=(const Bitboard256& o) {
+    m_ = _mm256_and_si256(m_, o.m_);
+    return *this;
+  }
+  Bitboard256& operator^=(const Bitboard256& o) {
+    m_ = _mm256_xor_si256(m_, o.m_);
+    return *this;
+  }
+  Bitboard256 operator|(const Bitboard256& o) const {
+    return Bitboard256(_mm256_or_si256(m_, o.m_));
+  }
+  Bitboard256 operator&(const Bitboard256& o) const {
+    return Bitboard256(_mm256_and_si256(m_, o.m_));
+  }
+  Bitboard256 operator^(const Bitboard256& o) const {
+    return Bitboard256(_mm256_xor_si256(m_, o.m_));
+  }
+
+  Bitboard256 byte_reverse() const {
+    const __m256i shuffle = _mm256_set_epi8(
+        0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15,
+        0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15);
+    return Bitboard256(_mm256_shuffle_epi8(m_, shuffle));
+  }
+
+  static void Unpack(const Bitboard256& hi_in, const Bitboard256& lo_in,
+                     Bitboard256& hi_out, Bitboard256& lo_out) {
+    // Lane-wise 64-bit unpack matches the (lo,hi | lo,hi) lane layout.
+    hi_out.m_ = _mm256_unpackhi_epi64(lo_in.m_, hi_in.m_);
+    lo_out.m_ = _mm256_unpacklo_epi64(lo_in.m_, hi_in.m_);
+  }
+
+  static void Decrement(const Bitboard256& hi_in, const Bitboard256& lo_in,
+                        Bitboard256& hi_out, Bitboard256& lo_out) {
+    hi_out.m_ = _mm256_add_epi64(
+        hi_in.m_, _mm256_cmpeq_epi64(lo_in.m_, _mm256_setzero_si256()));
+    lo_out.m_ = _mm256_add_epi64(lo_in.m_, _mm256_set1_epi64x(-1LL));
+  }
+
+  // Merge into a single Bitboard by ORing both lanes.
+  Bitboard Merge() const {
+    Bitboard b;
+    b.m_ = _mm_or_si128(_mm256_castsi256_si128(m_),
+                        _mm256_extracti128_si256(m_, 1));
+    return b;
+  }
+
+ private:
+  explicit Bitboard256(__m256i m) : m_(m) {}
+
+  __m256i m_;
+#else
   Bitboard256() = default;
 
   // From two Bitboards.
@@ -354,6 +536,7 @@ class Bitboard256 {
 
  private:
   uint64_t p_[4] = {};
+#endif
 };
 
 // --- pre-computed tables (initialized at startup) ---

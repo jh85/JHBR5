@@ -366,6 +366,76 @@ UndoInfo ShogiBoard::DoMoveInternal(Move m, bool update_auxiliary,
   return undo;
 }
 
+uint64_t ShogiBoard::HashAfter(Move m) const {
+  // Mirrors the update_auxiliary hash updates in DoMoveInternal().
+  uint64_t h = hash_;
+  Color us = side_to_move_;
+
+  if (m.is_drop()) {
+    PieceType pt = m.drop_piece();
+    Hand hd = hand_[us];
+    h ^= HashHand(us, hd);
+    hd.Sub(pt);
+    h ^= HashHand(us, hd);
+    Piece pc = Piece::Make(us, pt);
+    h ^= Zobrist::Psq[pc.val][m.to().as_idx()];
+  } else {
+    Square to = m.to();
+    Square from = m.from();
+
+    Piece captured = piece_on(to);
+    if (!captured.IsNone()) {
+      h ^= Zobrist::Psq[captured.val][to.as_idx()];
+      PieceType cap_base = captured.GetType().Unpromote();
+      Hand hd = hand_[us];
+      h ^= HashHand(us, hd);
+      hd.Add(cap_base);
+      h ^= HashHand(us, hd);
+    }
+
+    Piece moved = piece_on(from);
+    h ^= Zobrist::Psq[moved.val][from.as_idx()];
+    if (m.is_promotion()) {
+      moved = moved.Promote();
+    }
+    h ^= Zobrist::Psq[moved.val][to.as_idx()];
+  }
+
+  h ^= Zobrist::Side;
+  return h;
+}
+
+uint64_t ShogiBoard::BoardKey() const {
+  return hash_ ^ HashHand(BLACK, hand_[BLACK]) ^ HashHand(WHITE, hand_[WHITE]);
+}
+
+uint64_t ShogiBoard::BoardKeyAfter(Move m) const {
+  // HashAfter() minus every hand-hash component.
+  uint64_t h = BoardKey();
+  Color us = side_to_move_;
+
+  if (m.is_drop()) {
+    Piece pc = Piece::Make(us, m.drop_piece());
+    h ^= Zobrist::Psq[pc.val][m.to().as_idx()];
+  } else {
+    Square to = m.to();
+    Square from = m.from();
+    Piece captured = piece_on(to);
+    if (!captured.IsNone()) {
+      h ^= Zobrist::Psq[captured.val][to.as_idx()];
+    }
+    Piece moved = piece_on(from);
+    h ^= Zobrist::Psq[moved.val][from.as_idx()];
+    if (m.is_promotion()) {
+      moved = moved.Promote();
+    }
+    h ^= Zobrist::Psq[moved.val][to.as_idx()];
+  }
+
+  h ^= Zobrist::Side;
+  return h;
+}
+
 void ShogiBoard::UndoMove(Move m, const UndoInfo& undo) {
   side_to_move_ = ~side_to_move_;
   ply_--;
@@ -687,21 +757,22 @@ MoveList ShogiBoard::GenerateEvasionMovesImpl(bool stop_after_one) {
   evasion_targets.Set(checker);
   Bitboard pinned = ComputeBlockersForKing(us) & our;
 
-  // A non-king evasion must capture the checker or interpose between
-  // a sliding checker and the king.
-  Bitboard candidates = our;
-  candidates.Clear(ksq);
-  while (candidates.Any()) {
-    Square from = candidates.Pop();
-    PieceType pt = piece_on(from).GetType();
-    Bitboard targets =
-        PieceAttacks(pt, us, from, occ) & ~our & evasion_targets;
-    if (pinned.Test(from)) {
-      targets &= ShogiTables::LineBB[from.as_idx()][ksq.as_idx()];
-    }
-
-    while (targets.Any()) {
-      Square to = targets.Pop();
+  // A non-king evasion must capture the checker or interpose between a
+  // sliding checker and the king. Every shogi piece moves exactly where
+  // it attacks, so enumerating our attackers of each target square
+  // yields the movers directly (a handful of reverse lookups instead of
+  // one attack computation per own piece).
+  while (evasion_targets.Any()) {
+    Square to = evasion_targets.Pop();
+    Bitboard froms = AttackersTo(to, occ) & our;
+    froms.Clear(ksq);
+    while (froms.Any()) {
+      Square from = froms.Pop();
+      if (pinned.Test(from) &&
+          !ShogiTables::LineBB[from.as_idx()][ksq.as_idx()].Test(to)) {
+        continue;
+      }
+      PieceType pt = piece_on(from).GetType();
       bool can_promote =
           pt.CanPromote() &&
           (from.InPromotionZone(us) || to.InPromotionZone(us));
@@ -873,7 +944,12 @@ MoveList ShogiBoard::GenerateCheckingMovesNonCheck() {
 
   MoveList result;
 
-  auto direct_check_zone = [&](PieceType pt) {
+  // Per-type direct-check destination zones by const reference — the
+  // dragon union is the only one without a precomputed table.
+  const Bitboard dragon_zone = ShogiTables::RookEffectBB[ksq_idx] |
+                               ShogiTables::DragonStepBB[ksq_idx];
+  const Bitboard zero_zone = Bitboard::Zero();
+  auto zone_of = [&](PieceType pt) -> const Bitboard& {
     switch (pt.idx) {
       case kPawn.idx:
         return ShogiTables::PawnCheckBB[ksq_idx][us];
@@ -898,41 +974,55 @@ MoveList ShogiBoard::GenerateCheckingMovesNonCheck() {
       case kHorse.idx:
         return ShogiTables::HorseCheckBB[ksq_idx];
       case kDragon.idx:
-        return ShogiTables::RookEffectBB[ksq_idx] |
-               ShogiTables::DragonStepBB[ksq_idx];
+        return dragon_zone;
       default:
-        return Bitboard::Zero();
+        return zero_zone;
     }
   };
 
-  auto possible_direct_to = [&](PieceType pt, Square from) {
-    Bitboard zone = direct_check_zone(pt);
-    if (pt.CanPromote()) {
-      Bitboard promoted_zone = direct_check_zone(pt.Promote());
-      if (!from.InPromotionZone(us)) {
-        promoted_zone &= ShogiTables::PromotionZoneBB[us];
-      }
-      zone |= promoted_zone;
-    }
-    return zone;
-  };
-
-  auto directly_attacks = [&](PieceType pt, Square to,
-                              const Bitboard& occ_after) {
-    if (!direct_check_zone(pt).Test(to)) return false;
+  // Exact direct-check destination sets for a given source piece with
+  // the source square vacated. For sliders this uses attack symmetry:
+  // a slider at `to` checks the king iff `to` lies on the same slider
+  // effect cast FROM the king square over the source-vacated occupancy
+  // (destination squares are empty or hold the captured piece, so the
+  // ray semantics match exactly). Step pieces use the exact tables.
+  auto exact_direct_sets = [&](PieceType pt, Square from, Bitboard& now,
+                               Bitboard& promo) {
+    Bitboard occ_wo = occ;
+    occ_wo.Clear(from);
     switch (pt.idx) {
-      case kPawn.idx:
-      case kKnight.idx:
-      case kSilver.idx:
-      case kGold.idx:
-      case kProPawn.idx:
-      case kProLance.idx:
-      case kProKnight.idx:
-      case kProSilver.idx:
-      case kKing.idx:
-        return true;
-      default:
-        return PieceAttacks(pt, us, to, occ_after).Test(king_sq);
+      case kRook.idx: {
+        now = ShogiTables::RookEffect(king_sq, occ_wo);
+        promo = now | ShogiTables::KingEffectBB[ksq_idx];
+        return;
+      }
+      case kBishop.idx: {
+        now = ShogiTables::BishopEffect(king_sq, occ_wo);
+        promo = now | ShogiTables::KingEffectBB[ksq_idx];
+        return;
+      }
+      case kLance.idx: {
+        now = ShogiTables::LanceEffect(them, king_sq, occ_wo);
+        promo = ShogiTables::GoldCheckBB[ksq_idx][us];
+        return;
+      }
+      case kDragon.idx: {
+        now = ShogiTables::RookEffect(king_sq, occ_wo) |
+              ShogiTables::KingEffectBB[ksq_idx];
+        promo = Bitboard::Zero();
+        return;
+      }
+      case kHorse.idx: {
+        now = ShogiTables::BishopEffect(king_sq, occ_wo) |
+              ShogiTables::KingEffectBB[ksq_idx];
+        promo = Bitboard::Zero();
+        return;
+      }
+      default: {
+        now = zone_of(pt);
+        promo = pt.CanPromote() ? zone_of(pt.Promote()) : Bitboard::Zero();
+        return;
+      }
     }
   };
 
@@ -950,10 +1040,22 @@ MoveList ShogiBoard::GenerateCheckingMovesNonCheck() {
            (from.InPromotionZone(us) || to.InPromotionZone(us));
   };
 
+  const Square our_ksq = king_sq_[us];
   auto add_if_legal = [&](Move move) {
     if (!pinned_computed) {
       pinned = ComputeBlockersForKing(us) & our;
       pinned_computed = true;
+    }
+    const Square from = move.from();
+    if (from != our_ksq) {
+      // Non-king board move: only a pin can make it illegal.
+      if (pinned.Test(from) &&
+          !ShogiTables::LineBB[from.as_idx()][our_ksq.as_idx()].Test(
+              move.to())) {
+        return;
+      }
+      result.push_back(move);
+      return;
     }
     if (IsLegal(move, pinned)) result.push_back(move);
   };
@@ -969,17 +1071,28 @@ MoveList ShogiBoard::GenerateCheckingMovesNonCheck() {
     }
   };
 
-  auto add_direct_variants = [&](Square from, Square to, PieceType pt) {
-    Bitboard occ_after = occ;
-    occ_after.Clear(from);
-    occ_after.Set(to);
-    add_variants(from, to, pt, [&](PieceType moved_pt) {
-      return directly_attacks(moved_pt, to, occ_after);
-    });
-  };
-
   auto add_discovered_variants = [&](Square from, Square to, PieceType pt) {
     add_variants(from, to, pt, [](PieceType) { return true; });
+  };
+
+  // Emit direct checks of `from` restricted to `targets`, using the
+  // exact per-source destination sets (no per-target attack tests).
+  auto emit_direct = [&](Square from, PieceType pt, Bitboard targets) {
+    Bitboard now, promo;
+    exact_direct_sets(pt, from, now, promo);
+    if (pt.CanPromote() && !from.InPromotionZone(us)) {
+      promo &= ShogiTables::PromotionZoneBB[us];
+    }
+    Bitboard direct_union = targets & (now | promo);
+    while (direct_union.Any()) {
+      Square to = direct_union.Pop();
+      if (promo.Test(to) && can_promote(pt, from, to)) {
+        add_if_legal(Move::Promotion(from, to));
+      }
+      if (now.Test(to) && !must_promote(pt, to)) {
+        add_if_legal(Move::Normal(from, to));
+      }
+    }
   };
 
   Bitboard discovered = our_blockers;
@@ -995,10 +1108,7 @@ MoveList ShogiBoard::GenerateCheckingMovesNonCheck() {
     }
 
     if (direct_candidates.Test(from)) {
-      Bitboard direct_targets = targets & line & possible_direct_to(pt, from);
-      while (direct_targets.Any()) {
-        add_direct_variants(from, direct_targets.Pop(), pt);
-      }
+      emit_direct(from, pt, targets & line);
     }
   }
 
@@ -1006,64 +1116,63 @@ MoveList ShogiBoard::GenerateCheckingMovesNonCheck() {
   while (direct.Any()) {
     Square from = direct.Pop();
     PieceType pt = piece_on(from).GetType();
-    Bitboard targets =
-        PieceAttacks(pt, us, from, occ) & ~our & possible_direct_to(pt, from);
-    while (targets.Any()) {
-      add_direct_variants(from, targets.Pop(), pt);
+    Bitboard targets = PieceAttacks(pt, us, from, occ) & ~our;
+    emit_direct(from, pt, targets);
+  }
+
+  const Bitboard empties = ~occ;
+  const Bitboard last_rank =
+      us == BLACK ? ShogiTables::RankBB[0] : ShogiTables::RankBB[8];
+  const Bitboard last_two =
+      last_rank |
+      (us == BLACK ? ShogiTables::RankBB[1] : ShogiTables::RankBB[7]);
+  Bitboard pawn_files = Bitboard::Zero();
+  {
+    Bitboard pawns = pieces(us, kPawn);
+    while (pawns.Any()) {
+      pawn_files |= ShogiTables::FileBB[pawns.Pop().file().idx];
     }
   }
 
   auto drop_targets = [&](PieceType pt) {
-    Bitboard targets = ~occ & Bitboard::All();
-
-    if (pt == kPawn || pt == kLance) {
-      targets &= ~(us == BLACK ? ShogiTables::RankBB[0]
-                               : ShogiTables::RankBB[8]);
-    }
-    if (pt == kKnight) {
-      if (us == BLACK) {
-        targets &= ~ShogiTables::RankBB[0];
-        targets &= ~ShogiTables::RankBB[1];
-      } else {
-        targets &= ~ShogiTables::RankBB[7];
-        targets &= ~ShogiTables::RankBB[8];
-      }
-    }
+    Bitboard targets = empties;
     if (pt == kPawn) {
-      Bitboard pawns = pieces(us, kPawn);
-      for (int f = 0; f < 9; ++f) {
-        if ((pawns & ShogiTables::FileBB[f]).Any()) {
-          targets &= ~ShogiTables::FileBB[f];
-        }
-      }
+      targets = (last_rank | pawn_files).AndNot(targets);
+    } else if (pt == kLance) {
+      targets = last_rank.AndNot(targets);
+    } else if (pt == kKnight) {
+      targets = last_two.AndNot(targets);
     }
-
     return targets;
   };
 
-  auto add_drop_checks = [&](PieceType pt, Bitboard check_zone,
-                             bool needs_occlusion_check) {
+  auto add_drop_checks = [&](PieceType pt, const Bitboard& check_zone) {
     if (!hand_[us].Has(pt)) return;
     Bitboard targets = drop_targets(pt) & check_zone;
     while (targets.Any()) {
       Square to = targets.Pop();
-      if (needs_occlusion_check) {
-        Bitboard occ_after = occ;
-        occ_after.Set(to);
-        if (!PieceAttacks(pt, us, to, occ_after).Test(king_sq)) continue;
-      }
       Move move = Move::Drop(pt, to);
       if (IsLegal(move, pinned)) result.push_back(move);
     }
   };
 
-  add_drop_checks(kPawn, ShogiTables::PawnCheckBB[ksq_idx][us], false);
-  add_drop_checks(kLance, ShogiTables::LanceCheckBB[ksq_idx][us], true);
-  add_drop_checks(kKnight, ShogiTables::KnightCheckBB[ksq_idx][us], false);
-  add_drop_checks(kSilver, ShogiTables::SilverCheckBB[ksq_idx][us], false);
-  add_drop_checks(kGold, ShogiTables::GoldCheckBB[ksq_idx][us], false);
-  add_drop_checks(kBishop, ShogiTables::BishopCheckBB[ksq_idx], true);
-  add_drop_checks(kRook, ShogiTables::RookEffectBB[ksq_idx], true);
+  const Hand h = hand_[us];
+  if (h.Has(kPawn))
+    add_drop_checks(kPawn, ShogiTables::PawnCheckBB[ksq_idx][us]);
+  // Slider drops check exactly on the occupancy-aware effect from the
+  // king's square (slider attack symmetry) — no per-square test needed.
+  if (h.Has(kLance))
+    add_drop_checks(kLance, ShogiTables::LanceEffect(them, king_sq, occ));
+  if (h.Has(kKnight))
+    add_drop_checks(kKnight, ShogiTables::KnightCheckBB[ksq_idx][us]);
+  if (h.Has(kSilver))
+    add_drop_checks(kSilver, ShogiTables::SilverCheckBB[ksq_idx][us]);
+  if (h.Has(kGold))
+    add_drop_checks(kGold, ShogiTables::GoldCheckBB[ksq_idx][us]);
+  if (h.Has(kBishop))
+    add_drop_checks(kBishop, ShogiTables::BishopEffect(king_sq, occ));
+  if (h.Has(kRook))
+    add_drop_checks(kRook, ShogiTables::RookEffect(king_sq, occ));
 
   return result;
 }
@@ -1748,7 +1857,7 @@ int ShogiBoard::RepetitionCount() const {
 }
 
 ShogiBoard::RepetitionResult ShogiBoard::CheckRepetition(
-    int max_back_plies) const {
+    int max_back_plies, int* repetition_distance) const {
   // Detect repetition at the FIRST prior occurrence (search-time policy
   // matching dlshogi and YaneuraOu). The actual rule fires on the 4th
   // occurrence, but treating the 2nd occurrence as already-perpetual
@@ -1775,6 +1884,7 @@ ShogiBoard::RepetitionResult ShogiBoard::CheckRepetition(
         entry.hand_white == hand_[WHITE].raw()) {
       Color us = side_to_move_;
 
+      if (repetition_distance) *repetition_distance = dist;
       if (continuous_check_[us] >= dist) {
         return RepetitionResult::kLoss;  // We were giving perpetual check
       }

@@ -303,7 +303,15 @@ class Hand {
   bool operator!=(const Hand& o) const { return data_ != o.data_; }
 
   // Does this hand have at least as many of every piece type as other?
-  constexpr bool Dominates(const Hand& other) const;
+  // Borrow-bit trick enabled by the gap bits between fields (YaneuraOu's
+  // hand_is_equal_or_superior): per-field subtraction borrows land in
+  // the gap bits, so a clean mask means every field of *this >= other's.
+  constexpr bool Dominates(const Hand& other) const {
+    constexpr uint32_t kBorrowMask =
+        (1u << 5) | (1u << 11) | (1u << 15) | (1u << 19) | (1u << 22) |
+        (1u << 26) | (1u << 31);
+    return ((data_ - other.data_) & kBorrowMask) == 0;
+  }
 
   // USI string for hand pieces (e.g. "2P1L3S" or "-" if empty).
   std::string ToString(Color c) const;
@@ -444,6 +452,11 @@ class MoveList {
   void push_back(Move m) {
     assert(count_ < kMaxLegalMoves);
     moves_[count_++] = m;
+  }
+  void assign(const Move* src, int n) {
+    assert(n <= kMaxLegalMoves);
+    for (int i = 0; i < n; i++) moves_[i] = src[i];
+    count_ = n;
   }
   int size() const { return count_; }
   bool empty() const { return count_ == 0; }
