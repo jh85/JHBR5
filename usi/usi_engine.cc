@@ -22,6 +22,7 @@
 #include <vector>
 
 #include "book/book_selection.h"
+#include "mate/bns.h"
 #include "mate/dfpn.h"
 #include "shogi/encoder.h"
 #include "usi/search_info.h"
@@ -240,6 +241,7 @@ void USIEngine::CmdUsi() {
   Send(std::string("id author ") + ENGINE_AUTHOR);
 
   Send("option name MaxNodes type spin default 800 min 1 max 10000000");
+  Send("option name RootMateSolver type combo default bns var bns var dfpn");
   Send("option name OnnxModel type string default shogi_bt4.onnx");
   Send("option name ModelFormat type combo default auto var auto var jhbr2 var dlshogi");
   Send("option name DlshogiModel type check default false");
@@ -507,6 +509,12 @@ void USIEngine::CmdSetOption(const std::vector<std::string>& parts) {
       search_config_.moves_left_cap =
           std::clamp(ParseFiniteFloat(value), 0.0f, 10000.0f);
       reset_search();
+    } else if (name_lower == "rootmatesolver") {
+      std::string mode = value;
+      std::transform(mode.begin(), mode.end(), mode.begin(), ::tolower);
+      root_mate_solver_bns_ = mode != "dfpn";
+      Log("RootMateSolver=" + std::string(root_mate_solver_bns_ ? "bns"
+                                                                : "dfpn"));
     } else if (name_lower == "dfpnmaxtime") {
       dfpn_max_time_ms_ = std::clamp(ParseInt(value), 100, 60000);
     } else if (name_lower == "maxmovetime") {
@@ -727,19 +735,47 @@ void USIEngine::CmdGo(const std::vector<std::string>& parts) {
   search_config_.max_time = time_budget.mcts_time_seconds;
   search_config_.time_budget = time_budget;
 
-  // --- Launch root df-pn in parallel ---
+  // --- Launch the root mate solver in parallel ---
   // Keep the solver and its result in one state shared with the worker.
+  // RootMateSolver selects the engine: the BNS-family solver in its
+  // pn/dn configuration (default; ~9x the mate throughput of the tree
+  // df-pn on benchmark sets) or the original tree df-pn.
   struct DfpnState {
-    MateDfpnSolver solver;
+    std::unique_ptr<MateDfpnSolver> tree;
+    std::unique_ptr<MateBnsSolver> bns;
     std::atomic<bool> done{false};
     std::mutex mutex;
     std::condition_variable cv;
     Move mate_move;
     ShogiBoard board;
-    DfpnState(size_t nodes, const ShogiBoard& b) : solver(nodes), board(b) {}
+    DfpnState(bool use_bns, size_t nodes, const ShogiBoard& b) : board(b) {
+      if (use_bns) {
+        // Table allocations are calloc-backed (lazy pages), so a fresh
+        // per-move solver costs nothing up front. Sticky stop()
+        // semantics make solver reuse across moves unsafe, exactly as
+        // with MateDfpnSolver.
+        bns = std::make_unique<MateBnsSolver>(/*tt_mb=*/64, nodes);
+        bns->set_move_cache_mb(16);
+      } else {
+        tree = std::make_unique<MateDfpnSolver>(nodes);
+      }
+    }
+    Move Search(size_t nodes, MateDfpnSolver::Deadline deadline) {
+      return bns ? bns->search(board, nodes, deadline)
+                 : tree->search(board, nodes, deadline);
+    }
+    void Stop() {
+      if (bns) bns->stop(); else tree->stop();
+    }
+    size_t NodesSearched() const {
+      return bns ? bns->get_nodes_searched() : tree->get_nodes_searched();
+    }
+    std::vector<Move> Pv() const {
+      return bns ? bns->get_pv() : tree->get_pv();
+    }
   };
-  auto dfpn =
-      std::make_shared<DfpnState>(time_budget.root_dfpn_nodes, board_);
+  auto dfpn = std::make_shared<DfpnState>(
+      root_mate_solver_bns_, time_budget.root_dfpn_nodes, board_);
 
   auto dfpn_time_deadline =
       move_start_time +
@@ -754,8 +790,8 @@ void USIEngine::CmdGo(const std::vector<std::string>& parts) {
   auto dfpn_thread =
       std::thread([dfpn, root_dfpn_nodes = time_budget.root_dfpn_nodes,
                    dfpn_time_deadline]() {
-        dfpn->mate_move = dfpn->solver.search(
-            dfpn->board, root_dfpn_nodes, dfpn_time_deadline);
+        dfpn->mate_move =
+            dfpn->Search(root_dfpn_nodes, dfpn_time_deadline);
         dfpn->done.store(true, std::memory_order_release);
         dfpn->cv.notify_all();
       });
@@ -808,7 +844,7 @@ void USIEngine::CmdGo(const std::vector<std::string>& parts) {
           if (!watchdog_cv.wait_until(
                   lock, hard_deadline, [&search_done] { return search_done; })) {
             if (search_) search_->Stop();
-            dfpn->solver.stop();
+            dfpn->Stop();
           }
         });
   }
@@ -874,7 +910,7 @@ void USIEngine::CmdGo(const std::vector<std::string>& parts) {
       return dfpn->done.load(std::memory_order_acquire);
     });
   }
-  if (!dfpn->done.load(std::memory_order_acquire)) dfpn->solver.stop();
+  if (!dfpn->done.load(std::memory_order_acquire)) dfpn->Stop();
   if (dfpn_thread.joinable()) dfpn_thread.join();
   if (time_management_mode_ != TimeManagementMode::kOff || time_debug_) {
     const auto response_elapsed_ms =
@@ -886,7 +922,7 @@ void USIEngine::CmdGo(const std::vector<std::string>& parts) {
         " deadline_ms=" +
         std::to_string(time_budget.response_deadline_ms) +
         " dfpn_nodes=" +
-        std::to_string(dfpn->solver.get_nodes_searched()));
+        std::to_string(dfpn->NodesSearched()));
   }
 
   // --- Choose result ---
@@ -909,7 +945,7 @@ void USIEngine::CmdGo(const std::vector<std::string>& parts) {
   }
 
   if (use_mate) {
-    auto pv = dfpn->solver.get_pv();
+    auto pv = dfpn->Pv();
     std::string pv_str;
     for (const auto& m : pv) {
       if (!pv_str.empty()) pv_str += " ";
@@ -921,7 +957,7 @@ void USIEngine::CmdGo(const std::vector<std::string>& parts) {
     Log("Root df-pn found mate in " + std::to_string(mate_ply) + " ply");
 
     Send("info depth 1 score mate " + std::to_string((mate_ply + 1) / 2) +
-         " nodes " + std::to_string(dfpn->solver.get_nodes_searched()) +
+         " nodes " + std::to_string(dfpn->NodesSearched()) +
          " pv " + pv_str);
     Send("bestmove " + dfpn->mate_move.ToString());
     return;

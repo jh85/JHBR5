@@ -39,6 +39,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <vector>
@@ -229,6 +230,12 @@ struct BnsTTEntry {
 };
 static_assert(sizeof(BnsTTEntry) == 24, "BnsTTEntry should stay compact");
 
+// Deleter for calloc-backed tables (lazy zero pages from the OS, so
+// allocating a large table costs no page-touching until use).
+struct BnsFreeDeleter {
+  void operator()(void* p) const { std::free(p); }
+};
+
 class BnsTT {
  public:
   static constexpr int kClusterSize = 4;
@@ -248,7 +255,8 @@ class BnsTT {
     size_t n = size_t{1} << 12;
     while (n * 2 <= want) n *= 2;
     if (n != num_entries_) {
-      table_ = std::make_unique<BnsTTEntry[]>(n);
+      table_.reset(
+          static_cast<BnsTTEntry*>(std::calloc(n, sizeof(BnsTTEntry))));
       num_entries_ = n;
       mask_ = (n - 1) & ~static_cast<size_t>(kClusterSize - 1);
       gen_ = 0;
@@ -335,7 +343,7 @@ class BnsTT {
     return (hash + static_cast<uint64_t>(ply) * 0x9E3779B97F4A7C15ull) & mask_;
   }
 
-  std::unique_ptr<BnsTTEntry[]> table_;
+  std::unique_ptr<BnsTTEntry[], BnsFreeDeleter> table_;
   size_t num_entries_ = 0;
   size_t mask_ = 0;
   uint16_t gen_ = 0;
@@ -374,7 +382,8 @@ class BnsFinalsTable {
     size_t n = size_t{1} << 12;
     while (n * 2 <= want) n *= 2;
     if (n != num_entries_) {
-      table_ = std::make_unique<BnsFinalEntry[]>(n);
+      table_.reset(
+          static_cast<BnsFinalEntry*>(std::calloc(n, sizeof(BnsFinalEntry))));
       num_entries_ = n;
       mask_ = (n - 1) & ~static_cast<size_t>(kClusterSize - 1);
       gen_ = 0;
@@ -451,7 +460,7 @@ class BnsFinalsTable {
   uint64_t hits() const { return hits_; }
 
  private:
-  std::unique_ptr<BnsFinalEntry[]> table_;
+  std::unique_ptr<BnsFinalEntry[], BnsFreeDeleter> table_;
   size_t num_entries_ = 0;
   size_t mask_ = 0;
   uint16_t gen_ = 0;
@@ -670,7 +679,7 @@ class MateBnsSolver {
   bool use_mate3_probe_ = false;
   bool move_ordering_ = false;
   size_t move_cache_mb_ = 64;
-  std::unique_ptr<MoveCacheSlot[]> move_cache_;
+  std::unique_ptr<MoveCacheSlot[], BnsFreeDeleter> move_cache_;
   size_t move_cache_mask_ = 0;
   uint16_t move_cache_gen_ = 0;
   uint64_t mcache_hits_ = 0, mcache_probes_ = 0;

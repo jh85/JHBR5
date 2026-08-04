@@ -50,7 +50,8 @@ Move MateBnsSolver::search(ShogiBoard board, size_t nodes_limit,
     size_t n = 1024;
     while (n * 2 <= want) n *= 2;
     if (move_cache_mask_ != n - 1) {
-      move_cache_ = std::make_unique<MoveCacheSlot[]>(n);
+      move_cache_.reset(
+          static_cast<MoveCacheSlot*>(std::calloc(n, sizeof(MoveCacheSlot))));
       move_cache_mask_ = n - 1;
       move_cache_gen_ = 0;
     }

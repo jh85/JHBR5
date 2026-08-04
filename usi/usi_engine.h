@@ -70,6 +70,7 @@ class USIEngine {
   int num_gpus_ = 1;
   bool use_gpu_ = true;
   int dfpn_max_time_ms_ = 4000;
+  bool root_mate_solver_bns_ = true;
   int max_move_time_ms_ = 0;
   int max_move_time_1m_ms_ = 0;
   TimeManagementMode time_management_mode_ = TimeManagementMode::kShadow;
