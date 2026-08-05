@@ -43,6 +43,8 @@ using lczero::UndoInfo;
 
 namespace shallow_mate {
 
+inline constexpr int kRepetitionLookbackPly = 16;
+
 enum class ProbeResult {
     kMate,
     kNoMate,
@@ -57,11 +59,18 @@ struct SearchLimits {
     Clock::time_point deadline = Clock::time_point::max();
     const std::atomic<bool>* stop = nullptr;
     bool cancelled = false;
+    uint32_t clock_poll_counter = 0;
 
     bool ShouldStop() {
-        if ((stop && stop->load(std::memory_order_acquire)) ||
-            (deadline != Clock::time_point::max() &&
-             Clock::now() >= deadline)) {
+        const bool stop_requested =
+            stop && stop->load(std::memory_order_acquire);
+        // steady_clock::now() is noticeably expensive in the depth-7 root
+        // guard.  Poll it immediately, then once per 64 search checkpoints;
+        // the stop flag remains responsive at every checkpoint.
+        const bool deadline_passed =
+            deadline != Clock::time_point::max() &&
+            ((clock_poll_counter++ & 63u) == 0) && Clock::now() >= deadline;
+        if (stop_requested || deadline_passed) {
             cancelled = true;
             return true;
         }
@@ -131,9 +140,13 @@ inline bool MateIn3Ply(ShogiBoard& board, SearchLimits* limits = nullptr) {
     // Use specialized GenerateCheckingMoves (Phase 6) — direct
     // bitboard-based enumeration of moves that cause check, avoiding
     // full legal-move generation on the common non-check path.
-    auto checking_moves = INCHECK ? board.GenerateCheckingMoves()
-                                  : board.GenerateCheckingMovesNonCheck();
-    for (size_t i = 0; i < checking_moves.size(); ++i) {
+    MoveList checking_moves;
+    if constexpr (INCHECK) {
+        board.GenerateCheckingMoves(&checking_moves);
+    } else {
+        board.GenerateCheckingMovesNonCheck(&checking_moves);
+    }
+    for (int i = 0; i < checking_moves.size(); ++i) {
         if (limits && limits->ShouldStop()) return false;
         Move m1 = checking_moves[i];
 
@@ -141,7 +154,7 @@ inline bool MateIn3Ply(ShogiBoard& board, SearchLimits* limits = nullptr) {
 
         // Repetition check from defender's perspective:
         // kWin/kDraw → defender survives → skip this attacker move.
-        auto rep1 = board.CheckRepetition();
+        auto rep1 = board.CheckRepetition(kRepetitionLookbackPly);
         if (rep1 == ShogiBoard::RepetitionResult::kWin ||
             rep1 == ShogiBoard::RepetitionResult::kDraw) {
             board.UndoMove(m1, undo1);
@@ -154,7 +167,8 @@ inline bool MateIn3Ply(ShogiBoard& board, SearchLimits* limits = nullptr) {
         }
 
         // AND node (depth 2): defender tries to escape.
-        auto evasions = board.GenerateEvasionMoves();
+        MoveList evasions;
+        board.GenerateEvasionMoves(&evasions);
         if (evasions.empty()) {
             // Mate-in-1 — defender has no legal evasion.
             board.UndoMove(m1, undo1);
@@ -163,7 +177,7 @@ inline bool MateIn3Ply(ShogiBoard& board, SearchLimits* limits = nullptr) {
 
         // For each evasion, check if attacker has mate-in-1 after.
         bool all_evasions_lose = true;
-        for (size_t j = 0; j < evasions.size(); ++j) {
+        for (int j = 0; j < evasions.size(); ++j) {
             if (limits && limits->ShouldStop()) {
                 all_evasions_lose = false;
                 break;
@@ -182,7 +196,7 @@ inline bool MateIn3Ply(ShogiBoard& board, SearchLimits* limits = nullptr) {
                 break;
             }
 
-            auto rep2 = board.CheckRepetition();
+            auto rep2 = board.CheckRepetition(kRepetitionLookbackPly);
             // After defender's evasion, side-to-move = attacker.
             // kWin → attacker wins → this evasion fails, try next.
             // kLoss/kDraw → attacker doesn't mate → defender escaped.
@@ -236,15 +250,19 @@ inline bool MateInOddPly(ShogiBoard& board, SearchLimits* limits) {
     if (limits && limits->ShouldStop()) return false;
 
     // Specialized check-only generator (Phase 6).
-    auto moves = INCHECK ? board.GenerateCheckingMoves()
-                         : board.GenerateCheckingMovesNonCheck();
-    for (size_t i = 0; i < moves.size(); ++i) {
+    MoveList moves;
+    if constexpr (INCHECK) {
+        board.GenerateCheckingMoves(&moves);
+    } else {
+        board.GenerateCheckingMovesNonCheck(&moves);
+    }
+    for (int i = 0; i < moves.size(); ++i) {
         if (limits && limits->ShouldStop()) return false;
         Move m = moves[i];
 
         UndoInfo undo = board.DoMove(m, true);
 
-        auto rep = board.CheckRepetition();
+        auto rep = board.CheckRepetition(kRepetitionLookbackPly);
         if (rep == ShogiBoard::RepetitionResult::kLoss) {
             // Defender loses by repetition → mate found.
             board.UndoMove(m, undo);
@@ -285,18 +303,19 @@ inline bool MateInEvenPly(ShogiBoard& board, SearchLimits* limits) {
         return !board.HasLegalEvasion();
     }
 
-    auto moves = board.GenerateEvasionMoves();
+    MoveList moves;
+    board.GenerateEvasionMoves(&moves);
     if (moves.empty()) {
         // No legal moves — defender is mated.
         return true;
     }
 
-    for (size_t i = 0; i < moves.size(); ++i) {
+    for (int i = 0; i < moves.size(); ++i) {
         if (limits && limits->ShouldStop()) return false;
         Move m = moves[i];
         UndoInfo undo = board.DoMove(m);
 
-        auto rep = board.CheckRepetition();
+        auto rep = board.CheckRepetition(kRepetitionLookbackPly);
         // After defender's doMove, side-to-move = attacker.
         if (rep == ShogiBoard::RepetitionResult::kWin) {
             // Attacker wins by repetition → this evasion fails defender.
@@ -382,7 +401,10 @@ inline bool HasMateWithin(ShogiBoard& board, int depth,
 
 inline ProbeResult ProbeMateWithin(ShogiBoard& board, int depth,
                                    SearchLimits* limits) {
-    if (limits) limits->cancelled = false;
+    if (limits) {
+        limits->cancelled = false;
+        limits->clock_poll_counter = 0;
+    }
     const bool mate = HasMateWithin(board, depth, limits);
     if (limits && limits->cancelled) return ProbeResult::kCancelled;
     return mate ? ProbeResult::kMate : ProbeResult::kNoMate;

@@ -346,6 +346,8 @@ Sources: `mate/shallow_mate.h` and `mate/dfpn.*`.
 |---|---:|---|---|
 | Shallow depths compiled | 1, 3, 5, 7 | Tune/implementation | Only odd attacker-to-move mate depths |
 | Three-ply countercheck handling | defender escape | Search approximation | Matches the documented dlshogi simplification |
+| Shallow repetition lookback | 16 plies | Search/performance | Matches dlshogi's bounded mate-search policy |
+| Root guard deadline polling | every 64 checkpoints | Performance/time | Stop flag is still checked at every checkpoint |
 | DFPN default constructor budget | 100,000 nodes | Operational | Callers normally pass an explicit limit |
 | DFPN pool scale | 8x node limit | Performance | Capped before allocation |
 | DFPN minimum pool | 1,024 nodes | Performance |
@@ -361,6 +363,13 @@ Sources: `mate/shallow_mate.h` and `mate/dfpn.*`.
 DFPN allocates from a linear pool with no hash table or garbage collection.
 The 254-child cap is structural and should receive focused correctness review
 before being changed; it is not a strength knob.
+
+Shallow checking/evasion generation writes directly into the recursive move
+buffers. Leaf and post-search root probes play/undo on their worker-private or
+quiescent board instead of cloning the heap-backed game history. A 50-position
+TensorRT comparison at `LeafMateDepth=5`, `RootMateDepth=7` measured +1.8%
+mean NPS and +3.3% median NPS over commit `c97d006`; this is a modest throughput
+improvement, not a strength claim.
 
 ## Opening-book constants and policies
 

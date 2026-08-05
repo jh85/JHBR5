@@ -99,6 +99,17 @@ void test_idempotence(const std::string& name, const std::string& sfen) {
     check(name, !any_failure);
 }
 
+std::string FindCorpus(const std::string& name) {
+    for (const std::string& prefix : {
+             std::string("../"), std::string("../../"),
+             std::string("/home/ei/Downloads/JHBR2/mate3_5_7_9_11/")}) {
+        const std::string path = prefix + name;
+        std::ifstream input(path);
+        if (input) return path;
+    }
+    return name;
+}
+
 }  // namespace
 
 
@@ -472,16 +483,20 @@ int main() {
             return;
         }
         int n_total = 0, n_correct_at_mate = 0, n_correct_below = 0;
+        bool all_restored = true;
         std::string line;
         while (std::getline(f, line) && n_total < sample_size) {
             if (line.empty()) continue;
             ShogiBoard b;
             if (!b.SetFromSfen(line)) continue;
             ++n_total;
+            const uint64_t hash_before = b.Hash();
+            const std::string sfen_before = b.ToSfen();
             if (HasMateWithin(b, mate_depth)) ++n_correct_at_mate;
             if (mate_depth > 1) {
                 if (!HasMateWithin(b, mate_depth - 2)) ++n_correct_below;
             }
+            all_restored &= b.Hash() == hash_before && b.ToSfen() == sfen_before;
         }
         std::string label = "Corpus mate-in-" + std::to_string(mate_depth) +
                             " (n=" + std::to_string(n_total) + ")";
@@ -496,12 +511,13 @@ int main() {
                   n_correct_below >= n_total * 95 / 100,
                   std::to_string(n_correct_below) + "/" + std::to_string(n_total));
         }
+        check(label + ": probe restores board", all_restored);
     };
 
     std::printf("\n=== Cross-validation on real mate puzzles ===\n\n");
-    verify_corpus("/home/ei/Downloads/JHBR2/mate3_5_7_9_11/mate3.sfen", 3, 200);
-    verify_corpus("/home/ei/Downloads/JHBR2/mate3_5_7_9_11/mate5.sfen", 5, 200);
-    verify_corpus("/home/ei/Downloads/JHBR2/mate3_5_7_9_11/mate7.sfen", 7, 100);
+    verify_corpus(FindCorpus("mate3.sfen"), 3, 200);
+    verify_corpus(FindCorpus("mate5.sfen"), 5, 200);
+    verify_corpus(FindCorpus("mate7.sfen"), 7, 100);
 
     // -------------------------------------------------------------
     // Phase 3: edge-case fixtures
@@ -690,7 +706,7 @@ int main() {
     //   - df-pn with 10,000 nodes — high-confidence reference
     // and assert they agree on the verdict.
     {
-        std::ifstream f("/home/ei/Downloads/JHBR2/mate3_5_7_9_11/mate3.sfen");
+        std::ifstream f(FindCorpus("mate3.sfen"));
         if (!f) {
             std::printf("  SKIP  Cross-check (corpus not found)\n");
         } else {

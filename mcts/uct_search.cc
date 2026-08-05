@@ -347,10 +347,13 @@ void Search::RejectRootMates() {
     auto& child = root_->child[idx];
     if (child.IsLose() || child.IsWin()) return;
 
-    ShogiBoard reply = root_board_;
-    reply.DoMove(child.move);
+    // Workers have joined before this post-search guard runs.  Play and undo
+    // on the root board directly so each rejected candidate does not clone
+    // the board and its heap-backed game history.
+    const auto undo = root_board_.DoMove(child.move);
     const auto probe = jhbr2::shallow_mate::ProbeMateWithin(
-        reply, config_.root_mate_depth, &limits);
+        root_board_, config_.root_mate_depth, &limits);
+    root_board_.UndoMove(child.move, undo);
     if (probe == jhbr2::shallow_mate::ProbeResult::kCancelled) {
       root_mate_cancelled_ = true;
       return;
@@ -578,8 +581,12 @@ PlayoutStatus UCTSearcher::UctSearch(ShogiBoard* board, child_node_t* parent,
     if (!current->IsEvaled()) {
       if (current->child_num != 0) return PlayoutStatus::kDiscarded;
       if (cfg.leaf_mate_depth > 0) {
-        ShogiBoard tmp = *board;
-        if (jhbr2::shallow_mate::HasMateWithin(tmp, cfg.leaf_mate_depth)) {
+        // The shallow solver balances every DoMove with UndoMove, including
+        // all early returns.  Search the worker-private playout board directly
+        // instead of copying its position and heap-backed game history at
+        // every newly expanded leaf.
+        if (jhbr2::shallow_mate::HasMateWithin(*board,
+                                               cfg.leaf_mate_depth)) {
           visitor.terminal_value =
               ResolveTerminalEdge(parent, EdgeOutcome::kLoss);
           return PlayoutStatus::kTerminal;

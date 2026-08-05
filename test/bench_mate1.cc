@@ -1,3 +1,4 @@
+#include <atomic>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -98,5 +99,27 @@ int main(int argc, char** argv) {
                        board, depth);
                  });
   }
+  for (const int depth : {5, 7}) {
+    const std::string label = "shallow-copy-d" + std::to_string(depth);
+    RunBenchmark(label.c_str(), &boards, repeats,
+                 [depth](ShogiBoard& board) {
+                   ShogiBoard copy = board;
+                   return jhbr2::shallow_mate::HasMateWithin(copy, depth);
+                 });
+  }
+  static const std::atomic<bool> kStopRequested{false};
+  RunBenchmark("guard-stop-d7", &boards, repeats, [](ShogiBoard& board) {
+    jhbr2::shallow_mate::SearchLimits limits;
+    limits.stop = &kStopRequested;
+    return jhbr2::shallow_mate::ProbeMateWithin(board, 7, &limits) ==
+           jhbr2::shallow_mate::ProbeResult::kMate;
+  });
+  RunBenchmark("guard-clock-d7", &boards, repeats, [](ShogiBoard& board) {
+    jhbr2::shallow_mate::SearchLimits limits;
+    limits.stop = &kStopRequested;
+    limits.deadline = Clock::now() + std::chrono::hours(1);
+    return jhbr2::shallow_mate::ProbeMateWithin(board, 7, &limits) ==
+           jhbr2::shallow_mate::ProbeResult::kMate;
+  });
   return 0;
 }
