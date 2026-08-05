@@ -21,6 +21,10 @@ namespace jhbr2 {
 using namespace lczero;
 using RepetitionResult = ShogiBoard::RepetitionResult;
 
+static int Extract3PlyLine(ShogiBoard& board, std::vector<Move>* pv,
+                           int max_checks = -1,
+                           MoveList* generated_checks = nullptr);
+
 // =====================================================================
 // Entry points
 // =====================================================================
@@ -42,6 +46,7 @@ Move MateBnsSolver::search(ShogiBoard board, size_t nodes_limit,
   limit_hit_ = false;
   resource_taint_seen_ = false;
   stop_check_counter_ = 0;
+  root_probe_moves_ready_ = false;
 
   tt_.Resize(tt_mb_);
   tt_.NewSearch();
@@ -81,10 +86,46 @@ Move MateBnsSolver::search(ShogiBoard board, size_t nodes_limit,
   const uint64_t root_hash = pos.Hash();
   path_hashes_.push_back(root_hash);
 
+  if (root_mate3_checks_ != 0) {
+    std::vector<Move> line;
+    const int distance = Extract3PlyLine(
+        pos, &line, root_mate3_checks_, &frames_[0].moves);
+    if (distance > 0) {
+      if (stop_.load(std::memory_order_acquire) ||
+          (deadline_ != Deadline::max() && Clock::now() >= deadline_)) {
+        path_hashes_.pop_back();
+        return Move();
+      }
+      BnsTTEntry* root = tt_.Store(root_hash, 0);
+      root->abn = 0;
+      root->obn = bns::kInf;
+      stats_.mate3_hits++;
+      stats_.tt_probes = tt_.probes();
+      stats_.tt_hits = tt_.hits();
+      stats_.tt_stores = tt_.stores();
+      stats_.tt_evictions = tt_.evictions();
+      pv_ = std::move(line);
+      mate_ply_ = distance;
+      root_channel_ = RootChannel::kTT;
+      root_view_ = bns::MateView();
+      path_hashes_.pop_back();
+      return pv_[0];
+    }
+    // The bounded probe already generated the complete root check list.
+    // Reuse it when the general search starts instead of generating it twice.
+    root_probe_moves_ready_ = true;
+  }
+
   if (arith_ == Arith::kBns) {
-    SearchImpl<true, false>(pos, bns::kInf, bns::kInf, 0);
+    if (paper_ghi_mode_)
+      SearchImpl<true, false, true>(pos, bns::kInf, bns::kInf, 0);
+    else
+      SearchImpl<true, false, false>(pos, bns::kInf, bns::kInf, 0);
   } else {
-    SearchImpl<true, true>(pos, bns::kInf, bns::kInf, 0);
+    if (paper_ghi_mode_)
+      SearchImpl<true, true, true>(pos, bns::kInf, bns::kInf, 0);
+    else
+      SearchImpl<true, true, false>(pos, bns::kInf, bns::kInf, 0);
   }
 
   path_hashes_.pop_back();
@@ -143,18 +184,17 @@ bool MateBnsSolver::ShouldStop() {
 
 void MateBnsSolver::RecordVerdict(uint64_t hash, int ply, bns::ChildView v,
                                   bool tainted, int anchor_ply, TaintKind kind,
-                                  uint16_t best_move, uint64_t board_key,
-                                  uint32_t attacker_hand) {
+                                  uint64_t board_key, uint32_t attacker_hand,
+                                  BnsTTEntry* cached_entry) {
   if (tainted) {
     if (kind == TaintKind::kResource) resource_taint_seen_ = true;
     overrides_.push_back({hash, v, anchor_ply, kind});
     override_version_++;
     return;
   }
-  BnsTTEntry* e = tt_.Store(hash, ply);
+  BnsTTEntry* e = tt_.Store(hash, ply, cached_entry);
   e->abn = v.abn;
   e->obn = v.obn;
-  if (best_move) e->best_move = best_move;
   if (use_dominance_ && board_key && (v.abn == 0 || v.obn == 0)) {
     finals_.Store(board_key, lczero::Hand(attacker_hand), v.abn == 0);
   }
@@ -168,23 +208,97 @@ void MateBnsSolver::DropOverridesAtReturn(int ply) {
   if (erased) override_version_++;
 }
 
+void MateBnsSolver::OrderCheckingMoves(ShogiBoard& board, MoveList* moves) {
+  Move tmp[lczero::kMaxLegalMoves];
+  const int n = moves->size();
+  int w = 0;
+  for (int tier = 0; tier < 3 && w < n; tier++) {
+    for (int i = 0; i < n; i++) {
+      const Move m = (*moves)[i];
+      const int move_tier = m.is_drop() ? 2
+                            : !board.piece_on(m.to()).IsNone() ? 0
+                                                               : 1;
+      if (move_tier == tier) tmp[w++] = m;
+    }
+  }
+  moves->assign(tmp, n);
+}
+
+bool MateBnsSolver::RunNewNodeBlock(
+    ShogiBoard& board, Frame& f, int ply, uint64_t hash, int kply,
+    uint64_t bkey, uint32_t ahand, BnsTTEntry* own_entry) {
+  const int n = f.moves.size();
+  const int cply = paper_ghi_mode_ ? 0 : ply + 1;
+  const int gply = paper_ghi_mode_ ? 0 : ply + 2;
+  for (int i = 0; i < n; i++) {
+    const Move m = f.moves[i];
+    const uint64_t child_bkey = use_dominance_ ? f.child_bkey[i] : 0;
+    const uint32_t child_ahand = use_dominance_ ? f.child_ahand[i] : 0;
+    UndoInfo u1 = board.DoMove(m, /*gives_check=*/true);
+    MoveList ev = board.GenerateEvasionMoves();
+    if (ev.empty()) {
+      board.UndoMove(m, u1);
+      RecordVerdict(f.child_hash[i], cply, bns::MateView(), false, 0,
+                    TaintKind::kPath, child_bkey, child_ahand);
+      RecordVerdict(hash, kply, bns::MateView(), false, 0, TaintKind::kPath,
+                    bkey, ahand, own_entry);
+      stats_.mate3_hits++;
+      return true;
+    }
+    bool child_all_mated = true;
+    for (const Move& m2 : ev) {
+      UndoInfo u2 = board.DoMove(m2);
+      Move m3 = board.InCheck() ? Move() : board.FindMateInOneApprox();
+      if (!m3.is_null()) {
+        RecordVerdict(board.Hash(), gply, bns::MateView(), false, 0,
+                      TaintKind::kPath, 0, 0);
+        board.UndoMove(m2, u2);
+      } else {
+        board.UndoMove(m2, u2);
+        child_all_mated = false;
+        break;
+      }
+    }
+    board.UndoMove(m, u1);
+    if (child_all_mated) {
+      RecordVerdict(f.child_hash[i], cply, bns::MateView(), false, 0,
+                    TaintKind::kPath, child_bkey, child_ahand);
+      RecordVerdict(hash, kply, bns::MateView(), false, 0, TaintKind::kPath,
+                    bkey, ahand, own_entry);
+      stats_.mate3_hits++;
+      return true;
+    }
+    BnsTTEntry* ce = tt_.Store(f.child_hash[i], cply);
+    if (tt_.effort(ce) == 0 && ce->abn == 1 && ce->obn == 1) {
+      ce->abn = static_cast<uint32_t>(ev.size());
+      ce->obn = 1;
+    }
+  }
+  return false;
+}
+
 // =====================================================================
 // Core search
 // =====================================================================
 
-template <bool kOrNode, bool kPnDn>
+template <bool kOrNode, bool kPnDn, bool kPaperGhi>
 void MateBnsSolver::SearchImpl(ShogiBoard& board, uint32_t abn_th,
                                uint32_t obn_th, int ply) {
   stats_.node_entries++;
   if (ply > stats_.max_ply) stats_.max_ply = ply;
 
   const uint64_t hash = board.Hash();
-  const int kply = paper_ghi_mode_ ? 0 : ply;
-  const bool first_visit = tt_.Probe(hash, kply) == nullptr;
+  const int kply = kPaperGhi ? 0 : ply;
+  bool first_visit = false;
+  BnsTTEntry* own_entry = tt_.ProbeOrStore(hash, kply, &first_visit);
+  const uint64_t own_tag = own_entry->tag;
   if (first_visit) stats_.first_visits++;
   const uint64_t bkey = use_dominance_ ? board.BoardKey() : 0;
   const uint32_t ahand =
-      board.hand(kOrNode ? board.side_to_move() : ~board.side_to_move()).raw();
+      use_dominance_
+          ? board.hand(kOrNode ? board.side_to_move() : ~board.side_to_move())
+                .raw()
+          : 0;
 
   Frame& f = frames_[ply];
 
@@ -201,7 +315,7 @@ void MateBnsSolver::SearchImpl(ShogiBoard& board, uint32_t abn_th,
       f.moves.assign(mslot->moves, n);
       for (int i = 0; i < n; i++) {
         f.child_hash[i] = mslot->child_hash[i];
-        tt_.Prefetch(f.child_hash[i], paper_ghi_mode_ ? 0 : ply + 1);
+        tt_.Prefetch(f.child_hash[i], kPaperGhi ? 0 : ply + 1);
       }
       if (use_dominance_) {
         const lczero::Hand own_hand2 = board.hand(board.side_to_move());
@@ -221,11 +335,6 @@ void MateBnsSolver::SearchImpl(ShogiBoard& board, uint32_t abn_th,
             f.child_ahand[i] = ahand;
           }
         }
-      } else {
-        for (int i = 0; i < n; i++) {
-          f.child_bkey[i] = 0;
-          f.child_ahand[i] = 0;
-        }
       }
       goto have_moves;
     }
@@ -240,7 +349,7 @@ void MateBnsSolver::SearchImpl(ShogiBoard& board, uint32_t abn_th,
       if (!m1.is_null()) {
         stats_.mate1_hits++;
         RecordVerdict(hash, kply, bns::MateView(), false, 0, TaintKind::kPath,
-                      m1.raw(), bkey, ahand);
+                      bkey, ahand, own_entry);
         return;
       }
       // dlshogi-style fixed-depth probe at fresh nodes: resolving the
@@ -253,52 +362,43 @@ void MateBnsSolver::SearchImpl(ShogiBoard& board, uint32_t abn_th,
       if (m3) {
         stats_.mate3_hits++;
         RecordVerdict(hash, kply, bns::MateView(), false, 0, TaintKind::kPath,
-                      0, bkey, ahand);
+                      bkey, ahand, own_entry);
         return;
       }
     }
-    f.moves = board.GenerateCheckingMoves();
+    if (ply == 0 && root_probe_moves_ready_) {
+      root_probe_moves_ready_ = false;
+    } else {
+      board.GenerateCheckingMoves(&f.moves);
+    }
     if (move_ordering_ && f.moves.size() > 2) {
-      // Stable three-tier partition: captures, quiet board moves, drops.
-      Move tmp[lczero::kMaxLegalMoves];
-      const int nm = f.moves.size();
-      int w = 0;
-      for (int tier = 0; tier < 3 && w < nm; tier++) {
-        for (int i = 0; i < nm; i++) {
-          const Move m = f.moves[i];
-          const int t = m.is_drop() ? 2
-                        : !board.piece_on(m.to()).IsNone() ? 0
-                                                           : 1;
-          if (t == tier) tmp[w++] = m;
-        }
-      }
-      for (int i = 0; i < nm; i++) f.moves[i] = tmp[i];
+      OrderCheckingMoves(board, &f.moves);
     }
     if (f.moves.empty()) {
       RecordVerdict(hash, kply, bns::NoMateView(), false, 0, TaintKind::kPath,
-                    0, bkey, ahand);
+                    bkey, ahand, own_entry);
       return;
     }
   } else {
     assert(board.InCheck());
-    f.moves = board.GenerateEvasionMoves();
+    board.GenerateEvasionMoves(&f.moves);
     if (f.moves.empty()) {
       // No legal evasion: checkmate. Illegal pawn-drop mates cannot
       // reach here — GenerateCheckingMoves() never emits them.
       RecordVerdict(hash, kply, bns::MateView(), false, 0, TaintKind::kPath,
-                    0, bkey, ahand);
+                    bkey, ahand, own_entry);
       return;
     }
   }
 
   {
   const int n = f.moves.size();
-  const lczero::Hand own_hand = board.hand(board.side_to_move());
-  for (int i = 0; i < n; i++) {
-    const Move m = f.moves[i];
-    f.child_hash[i] = board.HashAfter(m);
-    tt_.Prefetch(f.child_hash[i], paper_ghi_mode_ ? 0 : ply + 1);
-    if (use_dominance_) {
+  if (use_dominance_) {
+    const lczero::Hand own_hand = board.hand(board.side_to_move());
+    for (int i = 0; i < n; i++) {
+      const Move m = f.moves[i];
+      f.child_hash[i] = board.HashAfter(m);
+      tt_.Prefetch(f.child_hash[i], kPaperGhi ? 0 : ply + 1);
       f.child_bkey[i] = board.BoardKeyAfter(m);
       if (kOrNode) {
         lczero::Hand h = own_hand;
@@ -312,9 +412,11 @@ void MateBnsSolver::SearchImpl(ShogiBoard& board, uint32_t abn_th,
       } else {
         f.child_ahand[i] = ahand;
       }
-    } else {
-      f.child_bkey[i] = 0;
-      f.child_ahand[i] = 0;
+    }
+  } else {
+    for (int i = 0; i < n; i++) {
+      f.child_hash[i] = board.HashAfter(f.moves[i]);
+      tt_.Prefetch(f.child_hash[i], kPaperGhi ? 0 : ply + 1);
     }
   }
   if (mslot && n <= kMoveCacheMaxMoves) {
@@ -332,54 +434,10 @@ void MateBnsSolver::SearchImpl(ShogiBoard& board, uint32_t abn_th,
 have_moves:;
   const int n = f.moves.size();
 
-  if (kOrNode && first_visit && use_new_node_block_) {
-    // Every fact written here is position-intrinsic (movegen counts and
-    // mate-in-1 proofs), so plain untainted stores are sound.
-    const int cply = paper_ghi_mode_ ? 0 : ply + 1;
-    const int gply = paper_ghi_mode_ ? 0 : ply + 2;
-    for (int i = 0; i < n; i++) {
-      const Move m = f.moves[i];
-      UndoInfo u1 = board.DoMove(m, /*gives_check=*/true);
-      MoveList ev = board.GenerateEvasionMoves();
-      if (ev.empty()) {
-        board.UndoMove(m, u1);
-        RecordVerdict(f.child_hash[i], cply, bns::MateView(), false, 0,
-                      TaintKind::kPath, 0, f.child_bkey[i], f.child_ahand[i]);
-        RecordVerdict(hash, kply, bns::MateView(), false, 0, TaintKind::kPath,
-                      m.raw(), bkey, ahand);
-        stats_.mate3_hits++;
-        return;
-      }
-      bool child_all_mated = true;
-      for (const Move& m2 : ev) {
-        UndoInfo u2 = board.DoMove(m2);
-        Move m3 = board.InCheck() ? Move() : board.FindMateInOneApprox();
-        if (!m3.is_null()) {
-          RecordVerdict(board.Hash(), gply, bns::MateView(), false, 0,
-                        TaintKind::kPath, m3.raw(), 0, 0);
-          board.UndoMove(m2, u2);
-        } else {
-          board.UndoMove(m2, u2);
-          child_all_mated = false;
-          break;
-        }
-      }
-      board.UndoMove(m, u1);
-      if (child_all_mated) {
-        RecordVerdict(f.child_hash[i], cply, bns::MateView(), false, 0,
-                      TaintKind::kPath, 0, f.child_bkey[i], f.child_ahand[i]);
-        RecordVerdict(hash, kply, bns::MateView(), false, 0, TaintKind::kPath,
-                      m.raw(), bkey, ahand);
-        stats_.mate3_hits++;
-        return;
-      }
-      // Initialize the fresh child AND entry from its defense count: a
-      // safe finite estimate (real summaries overwrite it on visit).
-      BnsTTEntry* ce = tt_.Store(f.child_hash[i], cply);
-      if (ce->effort == 0 && ce->abn == 1 && ce->obn == 1) {
-        ce->abn = static_cast<uint32_t>(ev.size());
-        ce->obn = 1;
-      }
+  if constexpr (kOrNode) {
+    if (first_visit && use_new_node_block_ &&
+        RunNewNodeBlock(board, f, ply, hash, kply, bkey, ahand, own_entry)) {
+      return;
     }
   }
 
@@ -394,22 +452,47 @@ have_moves:;
   for (;;) {
     // ---- Summarize current child views ----
     stats_.summaries++;
-    const bool full_refresh = refresh_only < 0 || paper_ghi_mode_ ||
+    const bool full_refresh = refresh_only < 0 || kPaperGhi ||
                               seen_override_version != override_version_;
     const int lo = full_refresh ? 0 : refresh_only;
     const int hi = full_refresh ? n : refresh_only + 1;
-    for (int i = lo; i < hi; i++) {
-      SourcedView sv = LookupChild(f.child_hash[i], paper_ghi_mode_ ? 0 : ply + 1,
-                                   f.child_bkey[i], f.child_ahand[i]);
-      f.views[i] = sv.view;
-      f.tainted[i] = sv.tainted;
-      f.anchor[i] = static_cast<int16_t>(sv.anchor_ply);
-      f.kind[i] = static_cast<uint8_t>(sv.kind);
+    if (!use_dominance_ && overrides_.empty()) {
+      // Normal route-independent fast path: one TT probe and one taint byte
+      // per refreshed child. Avoid constructing the richer sourced view and
+      // testing optional dominance for every child of every summary.
+      for (int i = lo; i < hi; i++) {
+        if (BnsTTEntry* e =
+                tt_.Probe(f.child_hash[i], kPaperGhi ? 0 : ply + 1)) {
+          f.views[i] = {e->abn, e->obn};
+        } else {
+          f.views[i] = {1, 1};
+        }
+        f.tainted[i] = false;
+      }
+    } else {
+      for (int i = lo; i < hi; i++) {
+        SourcedView sv =
+            use_dominance_
+                ? LookupChild(f.child_hash[i], kPaperGhi ? 0 : ply + 1,
+                              f.child_bkey[i], f.child_ahand[i])
+                : LookupChild(f.child_hash[i], kPaperGhi ? 0 : ply + 1, 0, 0);
+        f.views[i] = sv.view;
+        f.tainted[i] = sv.tainted;
+        if (sv.tainted) {
+          f.anchor[i] = static_cast<int16_t>(sv.anchor_ply);
+          f.kind[i] = static_cast<uint8_t>(sv.kind);
+        }
+      }
     }
     seen_override_version = override_version_;
     const bns::Summary s = bns::Summarize<kOrNode, kPnDn>(f.views, n);
 
     if (s.terminal()) {
+      if (overrides_.empty()) {
+        RecordVerdict(hash, kply, {s.abn, s.obn}, false, 0,
+                      TaintKind::kPath, bkey, ahand, own_entry);
+        return;
+      }
       // Taint bookkeeping: a verdict determined by route-dependent child
       // verdicts is itself route-dependent and must stay out of the TT —
       // EXCEPT dependencies anchored at this very node. A cycle back to
@@ -420,7 +503,6 @@ have_moves:;
       bool tainted = false;
       int anchor = 0;
       bool resource = false;
-      uint16_t best_move = 0;
       auto absorb = [&](int i) {
         if (!f.tainted[i]) return;
         const TaintKind k = static_cast<TaintKind>(f.kind[i]);
@@ -439,7 +521,6 @@ have_moves:;
         // Decided by a single child (OR: proving child, AND: escaping
         // child).
         absorb(s.best);
-        best_move = f.moves[s.best].raw();
       } else {
         // Decided by all children jointly. The combined verdict dies as
         // soon as any contributing override dies: anchor = max.
@@ -447,17 +528,22 @@ have_moves:;
       }
       RecordVerdict(hash, kply, {s.abn, s.obn}, tainted, anchor,
                     resource ? TaintKind::kResource : TaintKind::kPath,
-                    best_move, bkey, ahand);
+                    bkey, ahand, own_entry);
       return;
     }
 
     // ---- Store unresolved node values ----
     {
-      BnsTTEntry* e = tt_.Store(hash, kply);
+      // Recursive descendants can evict this slot under real table
+      // pressure. In the normal no-pressure case retain YaneuraOu-like
+      // direct node access instead of rescanning the cluster every pass.
+      if (own_entry->tag != own_tag) own_entry = tt_.Store(hash, kply);
+      BnsTTEntry* e = own_entry;
       e->abn = s.abn;
       e->obn = s.obn;
-      e->best_move = f.moves[s.best].raw();
-      if (e->effort != UINT32_MAX) e->effort++;
+      // Effort is used only by the experimental paper-GHI escape. Keeping it
+      // in a cold sidecar avoids a second random write per summary.
+      if constexpr (kPaperGhi) tt_.increment_effort(e);
     }
 
     if (abn_th <= s.abn || obn_th <= s.obn) return;
@@ -472,12 +558,12 @@ have_moves:;
     bns::ChildThresholds<kOrNode>(s, f.views[s.best], abn_th, obn_th,
                                   &child_abn_th, &child_obn_th);
 
-    if (paper_ghi_mode_) {
+    if constexpr (kPaperGhi) {
       // Figure-4-style escape: a hammered entry signals an
       // expansion-history loop; widen the child window to the parent's
       // (sequential expansion) so the loop cannot re-trigger.
       if (BnsTTEntry* e = tt_.Probe(hash, 0)) {
-        if (e->effort > ghi_escape_effort_) {
+        if (tt_.effort(e) > ghi_escape_effort_) {
           child_abn_th = abn_th;
           child_obn_th = obn_th;
         }
@@ -507,8 +593,8 @@ have_moves:;
     if (ply + 1 >= max_ply_) {
       stats_.depth_hits++;
       resource_taint_seen_ = true;
-      RecordVerdict(chash, paper_ghi_mode_ ? 0 : ply + 1, bns::NoMateView(),
-                    true, ply, TaintKind::kResource, 0, 0, 0);
+      RecordVerdict(chash, kPaperGhi ? 0 : ply + 1, bns::NoMateView(),
+                    true, ply, TaintKind::kResource, 0, 0);
       handled = true;
     }
 
@@ -527,27 +613,31 @@ have_moves:;
         if (anchor < 0) {
           // Matched pre-root game history: unconditional for this
           // problem instance.
-          RecordVerdict(chash, paper_ghi_mode_ ? 0 : ply + 1, v, false, 0,
-                        TaintKind::kPath, 0, 0, 0);
+          RecordVerdict(chash, kPaperGhi ? 0 : ply + 1, v, false, 0,
+                        TaintKind::kPath, 0, 0);
         } else {
-          RecordVerdict(chash, paper_ghi_mode_ ? 0 : ply + 1, v, true, anchor,
-                        TaintKind::kPath, 0, 0, 0);
+          RecordVerdict(chash, kPaperGhi ? 0 : ply + 1, v, true, anchor,
+                        TaintKind::kPath, 0, 0);
         }
         handled = true;
       }
     }
 
     if (!handled && !disable_path_scan_) {
-      for (int idx = static_cast<int>(path_hashes_.size()) - 1; idx >= 0;
-           idx--) {
+      // CheckRepetition() already covered every same-position candidate in
+      // its 16-ply window. The hash-only scan is solely the fallback for
+      // longer cycles; do not rescan the hot, shallow part of every path.
+      const int first_unchecked =
+          static_cast<int>(path_hashes_.size()) - 1 -
+          (disable_rule_repetition_ ? 0 : kRepetitionLookbackPly);
+      for (int idx = first_unchecked; idx >= 0; idx--) {
         if (path_hashes_[idx] == chash) {
           // A cycle in a checking/evasion tree cannot establish mate;
           // the conservative verdict for this route is no-mate (as in
           // MateDfpnSolver's path guard).
           stats_.rep_hits++;
-          RecordVerdict(chash, paper_ghi_mode_ ? 0 : ply + 1,
-                        bns::NoMateView(), true, idx, TaintKind::kPath, 0, 0,
-                        0);
+          RecordVerdict(chash, kPaperGhi ? 0 : ply + 1,
+                        bns::NoMateView(), true, idx, TaintKind::kPath, 0, 0);
           handled = true;
           break;
         }
@@ -561,7 +651,8 @@ have_moves:;
     }
 
     path_hashes_.push_back(chash);
-    SearchImpl<!kOrNode, kPnDn>(board, child_abn_th, child_obn_th, ply + 1);
+    SearchImpl<!kOrNode, kPnDn, kPaperGhi>(
+        board, child_abn_th, child_obn_th, ply + 1);
     path_hashes_.pop_back();
     board.UndoMove(bm, undo);
     DropOverridesAtReturn(ply + 1);
@@ -578,10 +669,22 @@ have_moves:;
 // Rebuild the mating line of a node proved by the 3-ply probe (whose
 // children were never stored). Appends 1 or 3 plies; returns the number
 // of plies appended, or 0 if no 3-ply mate exists here.
-static int Extract3PlyLine(ShogiBoard& board, std::vector<Move>* pv) {
-  MoveList checks = board.GenerateCheckingMoves();
-  for (const Move& m1 : checks) {
+static int Extract3PlyLine(ShogiBoard& board, std::vector<Move>* pv,
+                           int max_checks, MoveList* generated_checks) {
+  const bool use_approx_mate1 = generated_checks != nullptr;
+  MoveList local_checks;
+  MoveList* checks = generated_checks ? generated_checks : &local_checks;
+  board.GenerateCheckingMoves(checks);
+  const int count = max_checks < 0 ? checks->size()
+                                   : std::min(checks->size(), max_checks);
+  for (int i = 0; i < count; i++) {
+    const Move m1 = (*checks)[i];
     UndoInfo u1 = board.DoMove(m1, true);
+    if (board.CheckRepetition(MateBnsSolver::kRepetitionLookbackPly) !=
+        RepetitionResult::kNone) {
+      board.UndoMove(m1, u1);
+      continue;
+    }
     MoveList ev = board.GenerateEvasionMoves();
     if (ev.empty()) {
       board.UndoMove(m1, u1);
@@ -592,7 +695,13 @@ static int Extract3PlyLine(ShogiBoard& board, std::vector<Move>* pv) {
     bool all_mated = true;
     for (const Move& m2 : ev) {
       UndoInfo u2 = board.DoMove(m2);
-      Move m3 = board.FindMateInOne();
+      Move m3;
+      if (board.CheckRepetition(MateBnsSolver::kRepetitionLookbackPly) ==
+          RepetitionResult::kNone) {
+        m3 = board.InCheck() || !use_approx_mate1
+                 ? board.FindMateInOne()
+                 : board.FindMateInOneApprox();
+      }
       if (m3.is_null()) {
         all_mated = false;
       } else {
@@ -629,7 +738,12 @@ int MateBnsSolver::ExtractPvInner(ShogiBoard& board, std::vector<Move>* pv,
       pv->push_back(m1);
       return 1;
     }
-    if (int d3 = Extract3PlyLine(board, pv)) return d3;
+    // The normal solver materializes every non-mate-in-1 proof in the TT.
+    // Re-running a complete 3-ply search at every PV OR node is useful only
+    // when one of the optional frontier probes was enabled during search.
+    if ((use_mate3_probe_ || use_new_node_block_)) {
+      if (int d3 = Extract3PlyLine(board, pv)) return d3;
+    }
     for (int attempt = 0; attempt < 2; attempt++) {
       MoveList moves = board.GenerateCheckingMoves();
       int best_depth = -1;
@@ -693,9 +807,15 @@ int MateBnsSolver::ExtractPvInner(ShogiBoard& board, std::vector<Move>* pv,
         // concrete children materialize in the main table.
         in_extraction_research_ = true;
         if (arith_ == Arith::kBns) {
-          SearchImpl<true, false>(board, bns::kInf, bns::kInf, ply);
+          if (paper_ghi_mode_)
+            SearchImpl<true, false, true>(board, bns::kInf, bns::kInf, ply);
+          else
+            SearchImpl<true, false, false>(board, bns::kInf, bns::kInf, ply);
         } else {
-          SearchImpl<true, true>(board, bns::kInf, bns::kInf, ply);
+          if (paper_ghi_mode_)
+            SearchImpl<true, true, true>(board, bns::kInf, bns::kInf, ply);
+          else
+            SearchImpl<true, true, false>(board, bns::kInf, bns::kInf, ply);
         }
         in_extraction_research_ = false;
       }
@@ -743,13 +863,17 @@ void MateBnsSolver::ExtractPV(ShogiBoard& board) {
 }
 
 // Explicit instantiations.
-template void MateBnsSolver::SearchImpl<true, false>(ShogiBoard&, uint32_t,
-                                                     uint32_t, int);
-template void MateBnsSolver::SearchImpl<false, false>(ShogiBoard&, uint32_t,
-                                                      uint32_t, int);
-template void MateBnsSolver::SearchImpl<true, true>(ShogiBoard&, uint32_t,
-                                                    uint32_t, int);
-template void MateBnsSolver::SearchImpl<false, true>(ShogiBoard&, uint32_t,
-                                                     uint32_t, int);
+#define INSTANTIATE_SEARCH(OR_NODE, PN_DN, PAPER_GHI)                         \
+  template void MateBnsSolver::SearchImpl<OR_NODE, PN_DN, PAPER_GHI>(        \
+      ShogiBoard&, uint32_t, uint32_t, int)
+INSTANTIATE_SEARCH(true, false, false);
+INSTANTIATE_SEARCH(false, false, false);
+INSTANTIATE_SEARCH(true, true, false);
+INSTANTIATE_SEARCH(false, true, false);
+INSTANTIATE_SEARCH(true, false, true);
+INSTANTIATE_SEARCH(false, false, true);
+INSTANTIATE_SEARCH(true, true, true);
+INSTANTIATE_SEARCH(false, true, true);
+#undef INSTANTIATE_SEARCH
 
 }  // namespace jhbr2

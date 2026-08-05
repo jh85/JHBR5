@@ -11,7 +11,9 @@
                        [--skip=N]         problems to skip      (default 0)
                        [--nodes=N]        node budget/problem   (default 500000)
                        [--time-ms=N]      time budget/problem   (default 10000)
-                       [--hash-mb=N]      BNS TT size           (default 256)
+                       [--hash-mb=N]      BNS TT size           (default 4)
+                       [--mcache=N]       move cache MiB        (default 2)
+                       [--root-mate3=N]   root checks to probe  (default 12)
                        [--max-ply=N]      BNS depth cap         (default 129)
                        [--validate=0|1]   validate mate PVs     (default 1)
                        [--csv=file]       per-problem CSV output
@@ -62,13 +64,14 @@ struct Options {
   long skip = 0;
   size_t nodes = 500000;
   long time_ms = 10000;
-  size_t hash_mb = 256;
+  size_t hash_mb = 4;
   int max_ply = 129;
   long mate3 = 0;
+  long root_mate3 = 12;
   long nnb = 0;
   long dom = 0;
   long order = 0;
-  long mcache = 64;
+  long mcache = 2;
   long paper_ghi = 0;
   long naive_tt = 0;
   bool validate = true;
@@ -94,6 +97,7 @@ bool ParseArgs(int argc, char** argv, Options* o) {
     else if ((v = val("--hash-mb="))) o->hash_mb = (size_t)ArgLong(v);
     else if ((v = val("--max-ply="))) o->max_ply = (int)ArgLong(v);
     else if ((v = val("--mate3="))) o->mate3 = ArgLong(v);
+    else if ((v = val("--root-mate3="))) o->root_mate3 = ArgLong(v);
     else if ((v = val("--nnb="))) o->nnb = ArgLong(v);
     else if ((v = val("--dom="))) o->dom = ArgLong(v);
     else if ((v = val("--order="))) o->order = ArgLong(v);
@@ -169,6 +173,7 @@ int main(int argc, char** argv) {
   if (opt.solver == "bns") bns.set_arith(MateBnsSolver::Arith::kBns);
   if (opt.solver == "bns-pndn") bns.set_arith(MateBnsSolver::Arith::kPnDn);
   bns.set_use_mate3_probe(opt.mate3 != 0);
+  bns.set_root_mate3_checks(static_cast<int>(opt.root_mate3));
   bns.set_use_new_node_block(opt.nnb != 0);
   bns.set_use_dominance(opt.dom != 0);
   bns.set_move_ordering(opt.order != 0);
@@ -181,7 +186,10 @@ int main(int argc, char** argv) {
 
   long solved = 0, nomate = 0, unsolved = 0, invalid_pv = 0;
   double total_ms = 0;
-  unsigned long long total_nodes = 0, total_first_visits = 0;
+  unsigned long long total_nodes = 0, total_first_visits = 0,
+                     total_mcache_probes = 0, total_mcache_hits = 0,
+                     total_tt_probes = 0, total_tt_hits = 0,
+                     total_summaries = 0, total_mate1_hits = 0;
   std::vector<double> times_ms;
   times_ms.reserve(problems.size());
 
@@ -230,6 +238,12 @@ int main(int argc, char** argv) {
       max_ply_seen = st.max_ply;
       mate_ply = bns.get_mate_ply();
       pv = bns.get_pv();
+      total_mcache_probes += st.mcache_probes;
+      total_mcache_hits += st.mcache_hits;
+      total_tt_probes += st.tt_probes;
+      total_tt_hits += st.tt_hits;
+      total_summaries += st.summaries;
+      total_mate1_hits += st.mate1_hits;
     }
 
     const bool is_nomate = MateBnsSolver::IsNoMate(result);
@@ -288,6 +302,16 @@ int main(int argc, char** argv) {
     printf("  first_visits %llu (%.1f%% of node entries)\n",
            total_first_visits,
            total_nodes ? 100.0 * total_first_visits / total_nodes : 0.0);
+    printf("  tt_hits      %llu/%llu (%.1f%%)\n", total_tt_hits,
+           total_tt_probes,
+           total_tt_probes ? 100.0 * total_tt_hits / total_tt_probes : 0.0);
+    printf("  mcache_hits  %llu/%llu (%.1f%%)\n", total_mcache_hits,
+           total_mcache_probes,
+           total_mcache_probes
+               ? 100.0 * total_mcache_hits / total_mcache_probes
+               : 0.0);
+    printf("  summaries    %llu\n", total_summaries);
+    printf("  mate1_hits   %llu\n", total_mate1_hits);
   }
 
   if (csv) fclose(csv);

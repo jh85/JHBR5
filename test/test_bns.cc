@@ -59,13 +59,13 @@ static void TestSummarizeOr() {
     CHECK(s.second == 4, "second=%u", s.second);
   }
   {
-    // Tie on abn: prefer the smaller obn (paper 5.1); second equals the
-    // tied value (multiset semantics).
+    // Tie on abn: preserve generator order; second equals the tied value
+    // (multiset semantics).
     ChildView c[3] = {{2, 9}, {2, 3}, {6, 1}};
     Summary s = Summarize<true, false>(c, 3);
-    CHECK(s.best == 1, "tie best=%d", s.best);
+    CHECK(s.best == 0, "tie best=%d", s.best);
     CHECK(s.second == 2, "tie second=%u", s.second);
-    CHECK(s.obn == 3 + 2, "tie obn=%u", s.obn);
+    CHECK(s.obn == 9 + 2, "tie obn=%u", s.obn);
   }
   {
     // A proved child proves the OR node.
@@ -108,6 +108,14 @@ static void TestSummarizeAnd() {
     CHECK(s.best == 1, "best=%d", s.best);
     CHECK(s.obn == 2 && s.abn == 7 + 2, "abn=%u obn=%u", s.abn, s.obn);
     CHECK(s.second == 4, "second=%u", s.second);
+  }
+  {
+    // The stable tie rule is symmetric at AND nodes.
+    ChildView c[3] = {{9, 2}, {3, 2}, {1, 6}};
+    Summary s = Summarize<false, false>(c, 3);
+    CHECK(s.best == 0, "tie best=%d", s.best);
+    CHECK(s.second == 2, "tie second=%u", s.second);
+    CHECK(s.abn == 9 + 2, "tie abn=%u", s.abn);
   }
   {
     // A disproved child (obn=0) disproves the AND node.

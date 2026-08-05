@@ -14,9 +14,9 @@ sums a value over siblings, BNS counts unresolved siblings:
 unresolved leaf:  abn = 1,   obn = 1
 mate proved:      abn = 0,   obn = INF
 no-mate proved:   abn = INF, obn = 0
-OR  (attacker, k active children, best = min abn, tie: min obn):
+OR  (attacker, k active children, best = first min abn):
     abn = best.abn,   obn = best.obn + (k-1)
-AND (defender, k active children, best = min obn, tie: min abn):
+AND (defender, k active children, best = first min obn):
     obn = best.obn,   abn = best.abn + (k-1)
 child thresholds (c2 = second-smallest relevant number, multiset):
     OR:  ABN' = min(abn(c2)+1, ABN),  OBN' = OBN - k + 1
@@ -42,8 +42,11 @@ iterate summarize → store → threshold-check → descend.
 
 ### Transposition table
 
-Fixed-size 4-way clustered table, 24-byte entries, generation-based
-lazy clearing, keyed by **(position hash, ply from root)**.
+Fixed-size 2-way clustered table with 16-byte hot entries and
+generation-based lazy clearing, keyed by **(position hash, ply from
+root)**. Each entry is a 64-bit mixed fingerprint/generation tag plus
+the two 32-bit search numbers. The experimental paper-GHI effort value
+lives in a cold sidecar and is not written by the normal solver.
 
 The ply in the key is essential, not cosmetic. With hash-only keying the
 search **livelocks**: a position's entry written deep inside its own
@@ -115,12 +118,10 @@ Negative results (implemented, measured, default **off**):
   no-mate for dominated) — +15-20% time on these sets; the per-child
   probe overhead exceeds the reuse. Sound (uses the new
   `Hand::Dominates`, `ShogiBoard::BoardKey/BoardKeyAfter`).
-- TT victim policy (Small-Tree-GC-style effort priority vs naive
-  replacement): no measurable difference at any table size; in a fixed
-  clustered table the eviction decision barely matters — table *size*
-  is what matters. OSL/cshogi's sweep GC targets unbounded tables and
-  much longer searches; a sweep has no role in a fixed table, so GC
-  here reduces to the replacement policy (documented negative result).
+- TT victim policy (Small-Tree-GC-style effort priority vs first-slot
+  replacement): effort retention was slower under the final small-table
+  configuration, so first-slot replacement is the normal default. The
+  effort policy remains available for paper-GHI experiments.
 
 These knobs remain available for longer/composed problems, where the
 trade-offs may reverse.
@@ -189,12 +190,12 @@ as-is on AVX-512 hardware).
 - **pn/dn is the class default arithmetic** (`Arith::kPnDn`): measured
   consistently faster on these sets; `kBns` remains the paper mode and
   is what benchmark label `bns` runs explicitly.
-- **Move cache** (`set_move_cache_mb`, default 64): memoizes
+- **Move cache** (`set_move_cache_mb`, default 2): memoizes
   (moves, child hashes) per (position, ply) — movegen output is
   position-pure, so reuse across visits is exact. 24-move slots,
-  direct-mapped, generation-stamped. Helps the pn/dn config ~4-5% on
-  deep sets; roughly neutral-to-slightly-negative for the paper mode,
-  whose benchmark rows therefore run with `--mcache=0`.
+  direct-mapped, generation-stamped. It helps the pn/dn configuration
+  ~4-5% on deep sets and remains a smaller net win for the final strict
+  BNS configuration.
 - **Check generator v2**: the slider-symmetry trick extended to board
   moves — per source piece, direct-check destinations are the slider
   effect cast from the king over source-vacated occupancy (exact; see
@@ -206,6 +207,53 @@ as-is on AVX-512 hardware).
   than their plain one on these sets; the evasion king-move x-ray
   pre-ban cost ~1% at solver level (checker-loop overhead exceeds the
   saved attack queries on real position mixes).
+
+### YaneuraOu comparison round (stage 6, 2026-08-04)
+
+Reviewing current YaneuraOu `mate_dfpn.hpp` showed that its fastest
+matebench mode uses compact 16-byte `Node<u32, false>` records in a
+contiguous tree arena. Generated children remain attached to the node,
+so revisits use direct child access instead of regenerating moves or
+probing a transposition table. JHBR3 retains its merged-graph design but
+now follows the same cache-locality lesson:
+
+- the TT hot record is 24→16 bytes; unused stored best moves were removed;
+- first lookup/insertion is fused, stale clusters terminate scans early,
+  and the default table is 2-way;
+- checking/evasion generators can fill the per-ply `MoveList` in place,
+  removing a 1192-byte result copy from each cache miss;
+- optional move ordering/new-node scratch was moved out of the recursive
+  hot frame, and normal route-independent child refresh bypasses the
+  dominance/override bookkeeping;
+- PV extraction no longer repeats an exhaustive 3-ply search at every OR
+  node unless a frontier option actually created such a proof;
+- an approximate but sound root mate-in-3 probe checks the first 12 root
+  checks and reuses its generated move list on failure;
+- cache sweeps selected a 4 MiB TT and 2 MiB move cache. Larger tables
+  lose locality on this host and were consistently slower.
+
+One controlled pass over the report's identical subsets (5M nodes, 10 s,
+single pinned core, all PVs replayed) compared the production pn/dn
+configuration with the current local YaneuraOu Node32/no-ordering mode:
+
+| set | JHBR3 BNS-family | YaneuraOu | faster |
+|---|---:|---:|---|
+| mate3 (10k) | 0.11 s | 0.35 s | JHBR3 |
+| mate5 (10k) | 1.61 s | 1.34 s | YaneuraOu |
+| mate7 (5k) | 2.70 s | 2.37 s | YaneuraOu |
+| mate9 (3k) | 4.77 s | 4.88 s | JHBR3 |
+| mate11 (2k) | 7.60 s | 7.94 s | JHBR3 |
+| **aggregate** | **16.79 s** | **16.88 s** | **JHBR3 (0.6%)** |
+
+The aggregate edge is within run-to-run noise, so this is not a claim
+that JHBR3 is universally faster. The mate9/mate11 lead is repeatable;
+mate5/mate7 still expose a search-order/node-count deficit. The literal
+paper branch-number arithmetic also remains slower than the production
+pn/dn arithmetic on these short generated problems. For that mode,
+keeping generator order when branch numbers tie (rather than using the
+opposite number as a secondary key) reduced the mate11 run from 21.57M
+nodes / 10.15 s to 20.08M nodes / 9.45 s; asymmetric and reverse tie
+policies all exposed worse hard-tail positions.
 
 ## Host additions
 
@@ -227,7 +275,7 @@ in `bench_results/` for current numbers.
 
 The engine's root mate thread selects its solver via the USI option
 `RootMateSolver` (combo, default `bns`, var `dfpn`): `MateBnsSolver` in
-its pn/dn configuration (64 MB lazy-allocated table, 16 MB move cache)
+its pn/dn configuration (4 MB lazy-allocated table, 2 MB move cache)
 or the original tree df-pn. Result handling, the repetition boundary
 check, and info output are unchanged; both solvers share the same
 interface by construction.

@@ -458,6 +458,7 @@ class MoveList {
     for (int i = 0; i < n; i++) moves_[i] = src[i];
     count_ = n;
   }
+  void clear() { count_ = 0; }
   int size() const { return count_; }
   bool empty() const { return count_ == 0; }
   Move& operator[](int i) { return moves_[i]; }

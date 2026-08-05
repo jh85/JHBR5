@@ -96,8 +96,8 @@ struct Summary {
 // else in the solver is shared.
 //
 // The "relevant" number is abn at OR nodes and obn at AND nodes; the
-// selected child minimizes it (ties broken toward the smaller opposite
-// number, following the paper's section 5.1).
+// selected child minimizes it.  PN/DN mode uses the smaller opposite number
+// as its secondary key; branch-number mode keeps generator order on ties.
 template <bool kOrNode, bool kPnDn>
 inline Summary Summarize(const ChildView* c, int n) {
   Summary s;
@@ -130,7 +130,8 @@ inline Summary Summarize(const ChildView* c, int n) {
     if (rel >= kInf) continue;
 
     k++;
-    if (rel < best_rel || (rel == best_rel && opp < best_opp)) {
+    if (rel < best_rel ||
+        (kPnDn && rel == best_rel && opp < best_opp)) {
       second = best_rel;
       best_rel = rel;
       best_opp = opp;
@@ -206,7 +207,7 @@ constexpr ChildView NoMateView() { return ChildView{kInf, 0}; }
 // Transposition table
 // =====================================================================
 
-// Fixed-size, 4-way clustered table keyed by (position hash, ply from
+// Fixed-size, 2-way clustered table keyed by (position hash, ply from
 // root). Generation-based lazy clearing.
 //
 // The ply is part of the key (as in cshogi/dlshogi): it layers the
@@ -217,18 +218,17 @@ constexpr ChildView NoMateView() { return ChildView{kInf, 0}; }
 // The price is that transpositions are only shared at equal depth.
 // Route-dependent results are never stored here (see PathOverride).
 struct BnsTTEntry {
-  uint32_t key32 = 0;   // upper 32 bits of the position hash
+  // Upper 48 bits: fingerprint of (position hash, ply). Lower 16 bits:
+  // search generation. Mixing ply into the fingerprint as well as the
+  // cluster index avoids storing it separately. Two complete clusters fit in
+  // one 64-byte cache line.
+  uint64_t tag = 0;
   uint32_t abn = 1;
   uint32_t obn = 1;
-  uint32_t effort = 0;  // node entries below this position (GC / victim)
-  uint16_t best_move = 0;
-  uint16_t ply = 0;     // distance from the search root (part of the key)
-  uint16_t gen = 0;     // 0 = never used
-  uint16_t key16 = 0;   // hash bits 16..31 (extra verification)
 
   bool final_result() const { return abn == 0 || obn == 0; }
 };
-static_assert(sizeof(BnsTTEntry) == 24, "BnsTTEntry should stay compact");
+static_assert(sizeof(BnsTTEntry) == 16, "BnsTTEntry should stay compact");
 
 // Deleter for calloc-backed tables (lazy zero pages from the OS, so
 // allocating a large table costs no page-touching until use).
@@ -238,25 +238,31 @@ struct BnsFreeDeleter {
 
 class BnsTT {
  public:
-  static constexpr int kClusterSize = 4;
+  static constexpr int kClusterSize = 2;
 
   // Entry-retention policy under pressure (adapted from cshogi/OSL's
   // Small-Tree GC: in a fixed clustered table the eviction decision is
   // made at replacement time instead of by a sweep).
   enum class VictimPolicy {
     kEffortPriority,  // keep final results and high-effort subtrees
-    kAlwaysFirst,     // naive: overwrite the first live slot
+    kAlwaysFirst,     // overwrite first; measured fastest in normal mode
   };
-  void set_victim_policy(VictimPolicy p) { victim_policy_ = p; }
-
+  void set_victim_policy(VictimPolicy p) {
+    victim_policy_ = p;
+    if (p == VictimPolicy::kEffortPriority) use_effort_ = true;
+  }
+  void set_use_effort(bool v) {
+    use_effort_ = v || victim_policy_ == VictimPolicy::kEffortPriority;
+  }
   void Resize(size_t mb) {
     size_t bytes = mb << 20;
-    size_t want = bytes / sizeof(BnsTTEntry);
+    const size_t want = bytes / (sizeof(BnsTTEntry) + sizeof(uint32_t));
     size_t n = size_t{1} << 12;
     while (n * 2 <= want) n *= 2;
     if (n != num_entries_) {
       table_.reset(
           static_cast<BnsTTEntry*>(std::calloc(n, sizeof(BnsTTEntry))));
+      effort_.reset(static_cast<uint32_t*>(std::calloc(n, sizeof(uint32_t))));
       num_entries_ = n;
       mask_ = (n - 1) & ~static_cast<size_t>(kClusterSize - 1);
       gen_ = 0;
@@ -264,7 +270,7 @@ class BnsTT {
   }
 
   void NewSearch() {
-    if (!table_) Resize(256);
+    if (!table_) Resize(4);
     if (++gen_ == 0) {  // uint16 wrap: hard-clear once every 65535 searches
       std::memset(table_.get(), 0, num_entries_ * sizeof(BnsTTEntry));
       gen_ = 1;
@@ -275,61 +281,117 @@ class BnsTT {
   // Returns the matching live entry, or nullptr.
   BnsTTEntry* Probe(uint64_t hash, int ply) {
     probes_++;
-    BnsTTEntry* c = &table_[IndexOf(hash, ply)];
-    const uint32_t key = static_cast<uint32_t>(hash >> 32);
-    const uint16_t keyb = static_cast<uint16_t>(hash >> 16);
+    const uint64_t mixed = Mix(hash, ply);
+    BnsTTEntry* c = &table_[IndexOf(mixed)];
+    const uint64_t tag = TagOf(mixed);
     for (int i = 0; i < kClusterSize; i++) {
-      if (c[i].gen == gen_ && c[i].key32 == key && c[i].ply == ply &&
-          c[i].key16 == keyb) {
+      if (c[i].tag == tag) {
         hits_++;
         return &c[i];
       }
+      // Stores fill a cluster from the first stale slot and entries are never
+      // deleted within a generation. Therefore a stale slot also terminates
+      // the lookup; no later slot can hold a live match.
+      if (GenerationOf(c[i]) != gen_) return nullptr;
     }
     return nullptr;
   }
 
+  // Combined lookup/insertion for the node being searched. This avoids a
+  // second cluster scan on the dominant first-visit path.
+  BnsTTEntry* ProbeOrStore(uint64_t hash, int ply, bool* inserted) {
+    probes_++;
+    const uint64_t mixed = Mix(hash, ply);
+    BnsTTEntry* c = &table_[IndexOf(mixed)];
+    const uint64_t tag = TagOf(mixed);
+    BnsTTEntry* victim = nullptr;
+    for (int i = 0; i < kClusterSize; i++) {
+      if (c[i].tag == tag) {
+        hits_++;
+        *inserted = false;
+        return &c[i];
+      }
+      if (GenerationOf(c[i]) != gen_) {
+        stores_++;
+        c[i].tag = tag;
+        c[i].abn = 1;
+        c[i].obn = 1;
+        ResetEffort(&c[i]);
+        *inserted = true;
+        return &c[i];
+      }
+      if (!victim) {
+        victim = &c[i];
+        continue;
+      }
+      if (victim_policy_ == VictimPolicy::kAlwaysFirst) continue;
+      const bool v_better = (victim->final_result() && !c[i].final_result()) ||
+                            (victim->final_result() == c[i].final_result() &&
+                             Effort(&c[i]) < Effort(victim));
+      if (v_better) victim = &c[i];
+    }
+    stores_++;
+    if (!victim) victim = c;
+    if (GenerationOf(*victim) == gen_) evictions_++;
+    victim->tag = tag;
+    victim->abn = 1;
+    victim->obn = 1;
+    ResetEffort(victim);
+    *inserted = true;
+    return victim;
+  }
+
   void Prefetch(uint64_t hash, int ply) const {
-    __builtin_prefetch(&table_[IndexOf(hash, ply)]);
+    __builtin_prefetch(&table_[IndexOf(Mix(hash, ply))]);
   }
 
   // Returns an entry to write for this key: the live match if present,
   // else a victim (empty/stale first, then lowest effort preferring to
   // keep final results).
-  BnsTTEntry* Store(uint64_t hash, int ply) {
+  BnsTTEntry* Store(uint64_t hash, int ply,
+                    BnsTTEntry* cached = nullptr) {
     stores_++;
-    BnsTTEntry* c = &table_[IndexOf(hash, ply)];
-    const uint32_t key = static_cast<uint32_t>(hash >> 32);
-    const uint16_t keyb = static_cast<uint16_t>(hash >> 16);
+    const uint64_t mixed = Mix(hash, ply);
+    const uint64_t tag = TagOf(mixed);
+    if (cached && cached->tag == tag) return cached;
+    BnsTTEntry* c = &table_[IndexOf(mixed)];
     BnsTTEntry* victim = nullptr;
     for (int i = 0; i < kClusterSize; i++) {
-      if (c[i].gen == gen_ && c[i].key32 == key && c[i].ply == ply &&
-          c[i].key16 == keyb)
+      if (c[i].tag == tag) return &c[i];
+      if (GenerationOf(c[i]) != gen_) {
+        c[i].tag = tag;
+        c[i].abn = 1;
+        c[i].obn = 1;
+        ResetEffort(&c[i]);
         return &c[i];
-      if (c[i].gen != gen_) {
-        if (!victim || victim->gen == gen_) victim = &c[i];
+      }
+      if (!victim) {
+        victim = &c[i];
         continue;
       }
-      if (!victim || victim->gen != gen_) continue;
       if (victim_policy_ == VictimPolicy::kAlwaysFirst) continue;
       // Prefer evicting non-final, low-effort entries.
       const bool v_better = (victim->final_result() && !c[i].final_result()) ||
                             (victim->final_result() == c[i].final_result() &&
-                             c[i].effort < victim->effort);
+                             Effort(&c[i]) < Effort(victim));
       if (v_better) victim = &c[i];
     }
     if (!victim) victim = c;
-    if (victim->gen == gen_) evictions_++;
-    victim->key32 = key;
-    victim->key16 = keyb;
+    if (GenerationOf(*victim) == gen_) evictions_++;
+    victim->tag = tag;
     victim->abn = 1;
     victim->obn = 1;
-    victim->effort = 0;
-    victim->best_move = 0;
-    victim->ply = static_cast<uint16_t>(ply);
-    victim->gen = gen_;
+    ResetEffort(victim);
     return victim;
   }
 
+  uint32_t effort(const BnsTTEntry* entry) const {
+    return use_effort_ ? Effort(entry) : 0;
+  }
+  void increment_effort(BnsTTEntry* entry) {
+    uint32_t& value = Effort(entry);
+    if (value != UINT32_MAX) value++;
+  }
   size_t num_entries() const { return num_entries_; }
   uint64_t probes() const { return probes_; }
   uint64_t hits() const { return hits_; }
@@ -337,17 +399,33 @@ class BnsTT {
   uint64_t evictions() const { return evictions_; }
 
  private:
-  size_t IndexOf(uint64_t hash, int ply) const {
-    // Mix the ply into the cluster index so equal positions at different
-    // depths spread across the table instead of fighting one cluster.
-    return (hash + static_cast<uint64_t>(ply) * 0x9E3779B97F4A7C15ull) & mask_;
+  static uint64_t Mix(uint64_t hash, int ply) {
+    return hash + static_cast<uint64_t>(ply) * 0x9E3779B97F4A7C15ull;
+  }
+  size_t IndexOf(uint64_t mixed) const { return mixed & mask_; }
+  uint64_t TagOf(uint64_t mixed) const {
+    return (mixed & 0xffffffffffff0000ull) | gen_;
+  }
+  static uint16_t GenerationOf(const BnsTTEntry& entry) {
+    return static_cast<uint16_t>(entry.tag);
+  }
+  uint32_t& Effort(BnsTTEntry* entry) {
+    return effort_[static_cast<size_t>(entry - table_.get())];
+  }
+  const uint32_t& Effort(const BnsTTEntry* entry) const {
+    return effort_[static_cast<size_t>(entry - table_.get())];
+  }
+  void ResetEffort(BnsTTEntry* entry) {
+    if (use_effort_) Effort(entry) = 0;
   }
 
   std::unique_ptr<BnsTTEntry[], BnsFreeDeleter> table_;
+  std::unique_ptr<uint32_t[], BnsFreeDeleter> effort_;
   size_t num_entries_ = 0;
   size_t mask_ = 0;
   uint16_t gen_ = 0;
-  VictimPolicy victim_policy_ = VictimPolicy::kEffortPriority;
+  VictimPolicy victim_policy_ = VictimPolicy::kAlwaysFirst;
+  bool use_effort_ = false;
   uint64_t probes_ = 0, hits_ = 0, stores_ = 0, evictions_ = 0;
 };
 
@@ -500,7 +578,7 @@ class MateBnsSolver {
     uint64_t mcache_probes = 0, mcache_hits = 0;
   };
 
-  explicit MateBnsSolver(size_t tt_mb = 256, size_t default_nodes_limit = 100000)
+  explicit MateBnsSolver(size_t tt_mb = 4, size_t default_nodes_limit = 100000)
       : default_nodes_limit_(default_nodes_limit), tt_mb_(tt_mb) {}
 
   // Search for a forced checkmate; side to move is the attacker.
@@ -520,12 +598,15 @@ class MateBnsSolver {
   std::vector<Move> get_pv() const { return pv_; }
   size_t get_nodes_searched() const { return stats_.node_entries; }
   const Stats& stats() const { return stats_; }
-
   void set_arith(Arith a) { arith_ = a; }
   void set_max_ply(int p) { max_ply_ = p; }
 
   // Probe fresh OR nodes with the shallow 3-ply mate routine.
   void set_use_mate3_probe(bool v) { use_mate3_probe_ = v; }
+
+  // Try up to N root checking moves with a sound, incomplete 3-ply search
+  // before entering the general solver. Zero disables the bounded probe.
+  void set_root_mate3_checks(int n) { root_mate3_checks_ = n; }
 
   // Order checking moves at OR nodes: captures, board moves, drops.
   void set_move_ordering(bool v) { move_ordering_ = v; }
@@ -547,7 +628,10 @@ class MateBnsSolver {
   // escape that widens thresholds for nodes whose entries are being
   // hammered (effort above the bound) to break expansion-history loops.
   // The rule-aware repetition handling and path overrides stay active.
-  void set_paper_ghi_mode(bool v) { paper_ghi_mode_ = v; }
+  void set_paper_ghi_mode(bool v) {
+    paper_ghi_mode_ = v;
+    tt_.set_use_effort(v);
+  }
   void set_ghi_escape_effort(uint32_t v) { ghi_escape_effort_ = v; }
 
   void set_victim_policy(BnsTT::VictimPolicy p) { tt_.set_victim_policy(p); }
@@ -618,9 +702,15 @@ class MateBnsSolver {
     uint8_t kind[lczero::kMaxLegalMoves];
   };
 
+  [[gnu::noinline]] static void OrderCheckingMoves(ShogiBoard& board,
+                                                   MoveList* moves);
+  [[gnu::noinline]] bool RunNewNodeBlock(
+      ShogiBoard& board, Frame& frame, int ply, uint64_t hash, int key_ply,
+      uint64_t board_key, uint32_t attacker_hand, BnsTTEntry* own_entry);
+
   bool ShouldStop();
 
-  template <bool kOrNode, bool kPnDn>
+  template <bool kOrNode, bool kPnDn, bool kPaperGhi>
   void SearchImpl(ShogiBoard& board, uint32_t abn_th, uint32_t obn_th,
                   int ply);
 
@@ -656,8 +746,9 @@ class MateBnsSolver {
   }
 
   void RecordVerdict(uint64_t hash, int ply, bns::ChildView v, bool tainted,
-                     int anchor_ply, TaintKind kind, uint16_t best_move,
-                     uint64_t board_key, uint32_t attacker_hand);
+                     int anchor_ply, TaintKind kind, uint64_t board_key,
+                     uint32_t attacker_hand,
+                     BnsTTEntry* cached_entry = nullptr);
   void DropOverridesAtReturn(int ply);
 
   // PV extraction by TT walk (attacker: any proved child; defender:
@@ -677,8 +768,10 @@ class MateBnsSolver {
   Arith arith_ = Arith::kPnDn;
   int max_ply_ = 129;
   bool use_mate3_probe_ = false;
+  int root_mate3_checks_ = 12;
+  bool root_probe_moves_ready_ = false;
   bool move_ordering_ = false;
-  size_t move_cache_mb_ = 64;
+  size_t move_cache_mb_ = 2;
   std::unique_ptr<MoveCacheSlot[], BnsFreeDeleter> move_cache_;
   size_t move_cache_mask_ = 0;
   uint16_t move_cache_gen_ = 0;
@@ -703,7 +796,6 @@ class MateBnsSolver {
   uint64_t stop_check_counter_ = 0;
   bool limit_hit_ = false;
   bool resource_taint_seen_ = false;
-
   std::unique_ptr<Frame[]> frames_;
   size_t frames_size_ = 0;
 

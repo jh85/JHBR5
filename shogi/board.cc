@@ -186,6 +186,35 @@ Bitboard ShogiBoard::AttackersTo(Square sq, const Bitboard& occ) const {
   return attackers;
 }
 
+Bitboard ShogiBoard::AttackersTo(Square sq, const Bitboard& occ,
+                                 Color attacker) const {
+  const int i = sq.as_idx();
+  Bitboard attackers =
+      (ShogiTables::PawnEffectBB[i][~attacker] &
+       pieces(attacker, kPawn)) |
+      (ShogiTables::KnightEffectBB[i][~attacker] &
+       pieces(attacker, kKnight)) |
+      (ShogiTables::SilverEffectBB[i][~attacker] &
+       pieces(attacker, kSilver)) |
+      (ShogiTables::GoldEffectBB[i][~attacker] &
+       (pieces(attacker, kGold) | pieces(attacker, kProPawn) |
+        pieces(attacker, kProLance) | pieces(attacker, kProKnight) |
+        pieces(attacker, kProSilver))) |
+      (ShogiTables::LanceEffect(~attacker, sq, occ) &
+       pieces(attacker, kLance)) |
+      (ShogiTables::KingEffectBB[i] & pieces(attacker, kKing));
+
+  const Bitboard rook_like =
+      pieces(attacker, kRook) | pieces(attacker, kDragon);
+  const Bitboard bishop_like =
+      pieces(attacker, kBishop) | pieces(attacker, kHorse);
+  attackers |= ShogiTables::RookEffect(sq, occ) & rook_like;
+  attackers |= ShogiTables::BishopEffect(sq, occ) & bishop_like;
+  attackers |= ShogiTables::HorseStepBB[i] & pieces(attacker, kHorse);
+  attackers |= ShogiTables::DragonStepBB[i] & pieces(attacker, kDragon);
+  return attackers;
+}
+
 bool ShogiBoard::InCheck(Color c) const {
   return IsSquareAttacked(king_sq_[c], occupied(), ~c);
 }
@@ -718,21 +747,31 @@ MoveList ShogiBoard::GenerateLegalMoves() {
 }
 
 MoveList ShogiBoard::GenerateEvasionMoves() {
-  return GenerateEvasionMovesImpl(false);
+  MoveList result;
+  GenerateEvasionMoves(&result);
+  return result;
+}
+
+void ShogiBoard::GenerateEvasionMoves(MoveList* result) {
+  GenerateEvasionMovesImpl(false, result);
 }
 
 bool ShogiBoard::HasLegalEvasion() {
-  return !GenerateEvasionMovesImpl(true).empty();
+  MoveList result;
+  GenerateEvasionMovesImpl(true, &result);
+  return !result.empty();
 }
 
-MoveList ShogiBoard::GenerateEvasionMovesImpl(bool stop_after_one) {
+void ShogiBoard::GenerateEvasionMovesImpl(bool stop_after_one,
+                                          MoveList* result) {
   Color us = side_to_move_;
   Color them = ~us;
   Square ksq = king_sq_[us];
   Bitboard occ = occupied();
   Bitboard our = pieces(us);
-  Bitboard checkers = AttackersTo(ksq, occ) & pieces(them);
-  MoveList legal;
+  Bitboard checkers = AttackersTo(ksq, occ, them);
+  MoveList& legal = *result;
+  legal.clear();
 
   // A double check can only be evaded by moving the king.
   Bitboard king_targets =
@@ -743,11 +782,11 @@ MoveList ShogiBoard::GenerateEvasionMovesImpl(bool stop_after_one) {
     Square to = king_targets.Pop();
     if (!IsSquareAttacked(to, occ_without_king, them)) {
       legal.push_back(Move::Normal(ksq, to));
-      if (stop_after_one) return legal;
+      if (stop_after_one) return;
     }
   }
 
-  if (checkers.MoreThanOne()) return legal;
+  if (checkers.MoreThanOne()) return;
   assert(checkers.Any());
 
   Square checker = checkers.Pop();
@@ -764,7 +803,7 @@ MoveList ShogiBoard::GenerateEvasionMovesImpl(bool stop_after_one) {
   // one attack computation per own piece).
   while (evasion_targets.Any()) {
     Square to = evasion_targets.Pop();
-    Bitboard froms = AttackersTo(to, occ) & our;
+    Bitboard froms = AttackersTo(to, occ, us);
     froms.Clear(ksq);
     while (froms.Any()) {
       Square from = froms.Pop();
@@ -787,11 +826,11 @@ MoveList ShogiBoard::GenerateEvasionMovesImpl(bool stop_after_one) {
 
       if (can_promote) {
         legal.push_back(Move::Promotion(from, to));
-        if (stop_after_one) return legal;
+        if (stop_after_one) return;
       }
       if (!must_promote) {
         legal.push_back(Move::Normal(from, to));
-        if (stop_after_one) return legal;
+        if (stop_after_one) return;
       }
     }
   }
@@ -833,12 +872,11 @@ MoveList ShogiBoard::GenerateEvasionMovesImpl(bool stop_after_one) {
       // pawn-drop-mate rule in that case.
       if (pt != kPawn || IsLegal(move, pinned)) {
         legal.push_back(move);
-        if (stop_after_one) return legal;
+        if (stop_after_one) return;
       }
     }
   }
 
-  return legal;
 }
 
 // =====================================================================
@@ -905,15 +943,28 @@ MoveList ShogiBoard::GenerateCheckingMovesViaFilter() {
 // moves, so we avoid the per-move PieceAttacks classification call.
 //
 MoveList ShogiBoard::GenerateCheckingMoves() {
+  MoveList result;
+  GenerateCheckingMoves(&result);
+  return result;
+}
+
+void ShogiBoard::GenerateCheckingMoves(MoveList* result) {
   Color us = side_to_move_;
 
   if (InCheck(us)) {
-    return GenerateCheckingMovesViaFilter();
+    *result = GenerateCheckingMovesViaFilter();
+    return;
   }
-  return GenerateCheckingMovesNonCheck();
+  GenerateCheckingMovesNonCheck(result);
 }
 
 MoveList ShogiBoard::GenerateCheckingMovesNonCheck() {
+  MoveList result;
+  GenerateCheckingMovesNonCheck(&result);
+  return result;
+}
+
+void ShogiBoard::GenerateCheckingMovesNonCheck(MoveList* output) {
   Color us = side_to_move_;
   Color them = ~us;
   Square king_sq = king_sq_[them];
@@ -942,7 +993,8 @@ MoveList ShogiBoard::GenerateCheckingMovesNonCheck() {
       (pieces(us, kHorse)  & ShogiTables::HorseMoveCheckBB[ksq_idx])      |
       pieces(us, kRook) | pieces(us, kDragon);
 
-  MoveList result;
+  MoveList& result = *output;
+  result.clear();
 
   // Per-type direct-check destination zones by const reference — the
   // dragon union is the only one without a precomputed table.
@@ -1174,7 +1226,6 @@ MoveList ShogiBoard::GenerateCheckingMovesNonCheck() {
   if (h.Has(kRook))
     add_drop_checks(kRook, ShogiTables::RookEffect(king_sq, occ));
 
-  return result;
 }
 
 // =====================================================================
@@ -1274,8 +1325,7 @@ bool ShogiBoard::CanKingEscapeAfterMateProbe(
 bool ShogiBoard::CanDefenderCaptureMateChecker(
     Color defender, Square checker_square,
     const Bitboard& occupied_after) const {
-  Bitboard candidates =
-      AttackersTo(checker_square, occupied_after) & pieces(defender);
+  Bitboard candidates = AttackersTo(checker_square, occupied_after, defender);
   candidates.Clear(king_sq_[defender]);
   if (candidates.Empty()) return false;
 
@@ -1372,8 +1422,7 @@ bool ShogiBoard::IsMateAfterMateProbe(PieceType moved_type,
 
   // The moved checker is deliberately absent from the persistent
   // bitboards. Any attacker found here is a discovered checker.
-  Bitboard discovered_checkers =
-      AttackersTo(king_square, occupied_after) & pieces(Us);
+  Bitboard discovered_checkers = AttackersTo(king_square, occupied_after, Us);
   if (!direct_check && discovered_checkers.Empty()) return false;
 
   if (CanKingEscapeAfterMateProbe(
@@ -1572,7 +1621,7 @@ bool ShogiBoard::IsLegal(Move m, const Bitboard& pinned) {
   if (from == ksq) {
     // Remove king from occupancy to detect X-ray attacks through king's source.
     Bitboard occ_without_king = occupied() ^ ShogiTables::SquareBB[ksq.as_idx()];
-    return (AttackersTo(to, occ_without_king) & pieces(~us)).Empty();
+    return AttackersTo(to, occ_without_king, ~us).Empty();
   }
 
   // Non-king moves: legal unless the piece is pinned and moves off the pin line.

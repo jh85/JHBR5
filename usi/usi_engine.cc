@@ -754,8 +754,11 @@ void USIEngine::CmdGo(const std::vector<std::string>& parts) {
         // per-move solver costs nothing up front. Sticky stop()
         // semantics make solver reuse across moves unsafe, exactly as
         // with MateDfpnSolver.
-        bns = std::make_unique<MateBnsSolver>(/*tt_mb=*/64, nodes);
-        bns->set_move_cache_mb(16);
+        // Keep the two hot search tables inside the local cache slice. The
+        // mate-suite sweep is faster at 4 MiB TT / 2 MiB move cache than with
+        // the former 64 MiB / 16 MiB configuration.
+        bns = std::make_unique<MateBnsSolver>(/*tt_mb=*/4, nodes);
+        bns->set_move_cache_mb(2);
       } else {
         tree = std::make_unique<MateDfpnSolver>(nodes);
       }

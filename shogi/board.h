@@ -122,6 +122,8 @@ class ShogiBoard {
 
   // Bitboard of pieces attacking a given square.
   Bitboard AttackersTo(Square sq, const Bitboard& occ) const;
+  Bitboard AttackersTo(Square sq, const Bitboard& occ,
+                       Color attacker) const;
   Bitboard AttackersTo(Square sq) const { return AttackersTo(sq, occupied()); }
 
   // --- Pin detection ---
@@ -140,6 +142,7 @@ class ShogiBoard {
   // The caller must guarantee InCheck(). This avoids generating and
   // testing unrelated moves at shallow-mate AND nodes.
   MoveList GenerateEvasionMoves();
+  void GenerateEvasionMoves(MoveList* result);
 
   // Return as soon as one legal evasion is found. The caller must
   // guarantee InCheck().
@@ -171,7 +174,9 @@ class ShogiBoard {
   // Used by mate/shallow_mate.h. See docs/port_5ply_mate_check_plan.md
   // (Phase 6) and docs/port_yaneuraou_check_generator_plan.md (Phase 7).
   MoveList GenerateCheckingMoves();
+  void GenerateCheckingMoves(MoveList* result);
   MoveList GenerateCheckingMovesNonCheck();  // caller guarantees !InCheck()
+  void GenerateCheckingMovesNonCheck(MoveList* result);
   MoveList GenerateCheckingMovesViaFilter();  // oracle; slower but obviously correct
 
   // Is the given move legal in the current position?
@@ -378,7 +383,7 @@ class ShogiBoard {
       Color defender, const Bitboard& between,
       const Bitboard& occupied_after) const;
 
-  MoveList GenerateEvasionMovesImpl(bool stop_after_one);
+  void GenerateEvasionMovesImpl(bool stop_after_one, MoveList* result);
 
   // Generate pseudo-legal board moves (non-drop).
   void GenerateBoardMoves(MoveList& moves) const;
