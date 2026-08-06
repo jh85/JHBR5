@@ -191,7 +191,7 @@ void ApplyEvaluation(batch_element_t& elem, float value, float moves_left,
   // No child can be selected before SetEvaled() below. From this point on,
   // SelectPuctChild() accumulates the selected priors exactly as dlshogi does.
   elem.node->visited_nnrate.store(0.0f, std::memory_order_release);
-  elem.node->eval_m = moves_left;
+  elem.node->SetMovesLeftEvaluation(moves_left);
   if (elem.value_win) *elem.value_win = (value + 1.0f) * 0.5f;
   if (elem.value_m) *elem.value_m = moves_left;
   elem.node->SetEvaled();
@@ -273,6 +273,11 @@ Search::Search(std::vector<jhbr2::NNEvaluator*> evaluators,
     : config_(config),
       evaluators_(std::move(evaluators)),
       nn_cache_(config.nn_cache_size) {
+  moves_left_supported_ = !evaluators_.empty() &&
+      std::all_of(evaluators_.begin(), evaluators_.end(),
+                  [](const jhbr2::NNEvaluator* evaluator) {
+                    return evaluator && evaluator->has_moves_left();
+                  });
   in_flight_playouts_ =
       static_cast<int>(evaluators_.size()) * config_.workers_per_gpu *
       config_.minibatch_size;
@@ -520,9 +525,9 @@ unsigned UCTSearcher::SelectMaxUcbChild(child_node_t* parent,
   params.c_base = is_root ? cfg.c_base_root : cfg.c_base;
   params.fpu_reduction =
       is_root ? cfg.c_fpu_reduction_root : cfg.c_fpu_reduction;
-  params.moves_left_weight = cfg.moves_left_weight;
-  params.moves_left_threshold = cfg.moves_left_threshold;
-  params.moves_left_cap = cfg.moves_left_cap;
+  params.moves_left = cfg.moves_left;
+  params.moves_left.enabled =
+      params.moves_left.enabled && grp_->owner->moves_left_supported_;
   return SelectPuctChild(parent, current, params);
 }
 

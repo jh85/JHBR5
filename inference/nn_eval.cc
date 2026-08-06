@@ -56,6 +56,9 @@ struct NNEvaluator::Impl {
   std::vector<const char*> output_names;
 
   int input_channels = 0;
+  size_t policy_output = 0;
+  size_t wdl_output = 1;
+  int moves_left_output = -1;
 };
 
 namespace {
@@ -147,6 +150,17 @@ NNEvaluator::NNEvaluator(const std::string& onnx_path, bool use_gpu,
     impl_->output_names.push_back(name.c_str());
   }
 
+  // Exported JHBR3 models use these stable names. Keep the historical
+  // policy/WDL positional fallback for older two-output models, but MLH must
+  // be positively identified so an unrelated third output is never treated
+  // as a plies-to-end estimate.
+  for (size_t i = 0; i < impl_->output_names_str.size(); ++i) {
+    const auto& name = impl_->output_names_str[i];
+    if (name == "policy") impl_->policy_output = i;
+    if (name == "wdl") impl_->wdl_output = i;
+    if (name == "mlh") impl_->moves_left_output = static_cast<int>(i);
+  }
+
   const auto input_shape = impl_->session->GetInputTypeInfo(0)
       .GetTensorTypeAndShapeInfo().GetShape();
   if (input_shape.size() != 4 || input_shape[1] <= 0 ||
@@ -172,6 +186,10 @@ NNEvaluator::NNEvaluator(const std::string& onnx_path, bool use_gpu,
 }
 
 NNEvaluator::~NNEvaluator() = default;
+
+bool NNEvaluator::has_moves_left() const {
+  return impl_ && impl_->moves_left_output >= 0;
+}
 
 NNOutput NNEvaluator::Evaluate(const ShogiBoard& board,
                                 const MoveList& legal_moves) {
@@ -220,11 +238,16 @@ std::vector<NNOutput> NNEvaluator::EvaluateBatch(
     throw;
   }
 
-  float* policy_data = outputs[0].GetTensorMutableData<float>();
-  float* wdl_data = outputs[1].GetTensorMutableData<float>();
+  float* policy_data =
+      outputs[impl_->policy_output].GetTensorMutableData<float>();
+  float* wdl_data = outputs[impl_->wdl_output].GetTensorMutableData<float>();
+  float* moves_left_data =
+      impl_->moves_left_output >= 0
+          ? outputs[impl_->moves_left_output].GetTensorMutableData<float>()
+          : nullptr;
 
   const auto policy_shape =
-      outputs[0].GetTensorTypeAndShapeInfo().GetShape();
+      outputs[impl_->policy_output].GetTensorTypeAndShapeInfo().GetShape();
   const int policy_size = static_cast<int>(policy_shape.back());
 
   std::vector<NNOutput> results(batch_size);
@@ -242,6 +265,7 @@ std::vector<NNOutput> NNEvaluator::EvaluateBatch(
     result.wdl[2] = wdl[2];
     result.value = wdl[0] - wdl[2];
     result.draw = wdl[1];
+    result.moves_left = moves_left_data ? moves_left_data[b] : 0.0f;
 
     float* logits = policy_data + b * policy_size;
     const bool is_white = (board.side_to_move() == lczero::WHITE);
@@ -286,6 +310,8 @@ NNEvaluator::NNEvaluator(const std::string&, bool, int, int, ModelFormat)
 }
 
 NNEvaluator::~NNEvaluator() = default;
+
+bool NNEvaluator::has_moves_left() const { return false; }
 
 NNOutput NNEvaluator::Evaluate(const ShogiBoard&, const MoveList&) {
   throw std::logic_error("neural-network backend is unavailable");

@@ -178,7 +178,9 @@ Custom continuous parameters use:
 ```
 
 For example,
-`--parameter MovesLeftWeight=0.01:0.0:0.05:linear:float`.
+Start by testing `UseMovesLeft=true` against the default `false`. If that is
+positive, tune one lc0-style continuous parameter at a time, for example
+`--parameter MovesLeftSlope=0.0027:0.0:0.01:linear:float`.
 Integer/discrete parameters are accepted for controlled experiments, but SPSA
 is normally a poor optimizer for mate depths, worker counts, and minibatch
 sizes. Use grids for those.

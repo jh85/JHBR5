@@ -12,15 +12,30 @@ struct trajectory_t {
   unsigned child_idx = 0;
 };
 
+// Lc0-style moves-left utility. Q values used by JHBR3's PUCT are win
+// probabilities in [0,1], so ComputeMovesLeftUtility converts to lc0's
+// [-1,1] Q convention and converts the resulting utility back again.
+struct MovesLeftParameters {
+  bool enabled = false;
+  float max_effect = 0.0345f;
+  float threshold = 0.8f;
+  float slope = 0.0027f;
+  float constant_factor = 0.0f;
+  float scaled_factor = 1.6521f;
+  float quadratic_factor = -0.6521f;
+};
+
+float ComputeMovesLeftUtility(const MovesLeftParameters& params,
+                              float parent_q_win, float parent_m,
+                              float child_q_win, float child_m);
+
 // Parameters needed by dlshogi's PUCT/FPU selection rule. Root and non-root
 // constants are selected by the caller before invoking SelectPuctChild().
 struct PuctParameters {
   float c_init = 1.25f;
   float c_base = 19652.0f;
   float fpu_reduction = 0.0f;
-  float moves_left_weight = 0.0f;
-  float moves_left_threshold = 0.0f;
-  float moves_left_cap = 20.0f;
+  MovesLeftParameters moves_left;
 };
 
 // Outcome from the perspective of the player who traversed an edge. The

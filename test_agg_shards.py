@@ -161,9 +161,9 @@ def test_synthetic(tmp):
     check("wdl = mean blended target",
           np.allclose(data["wdl"][i].astype(np.float64), wdl_expect,
                       atol=2e-3), f"{data['wdl'][i]} vs {wdl_expect}")
-    # mlh: 2-ply games, startpos at i=0 -> n_moves - i - 1 = 1 in each game
-    check("mlh = mean remaining plies (1.0)",
-          abs(float(data["mlh"][i]) - 1.0) < 1e-3, data["mlh"][i])
+    # mlh: 2-ply games, startpos at i=0 -> n_moves - i = 2 in each game
+    check("mlh = mean remaining plies (2.0)",
+          abs(float(data["mlh"][i]) - 2.0) < 1e-3, data["mlh"][i])
 
     # count method on the same input
     out2 = os.path.join(tmp, "synth_out_count")
@@ -238,8 +238,8 @@ def verify_shard_semantics(data, label, expect_mlh):
           np.allclose(w.sum(axis=1), 1.0, atol=5e-3) and
           w.min() >= 0 and w.max() <= 1)
     if expect_mlh:
-        check("mlh present and >= 0 (pack has true game ends)",
-              float(data["mlh"].min()) >= 0)
+        check("mlh present and >= 1 (pack positions precede a move)",
+              float(data["mlh"].min()) >= 1)
     else:
         check("mlh masked to -1 (PSV without --psv-mlh)",
               np.all(data["mlh"] == -1.0))

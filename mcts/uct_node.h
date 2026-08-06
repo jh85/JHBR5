@@ -51,6 +51,7 @@ struct child_node_t {
         move_count(o.move_count.load(std::memory_order_relaxed)),
         win(o.win.load(std::memory_order_relaxed)),
         sum_m(o.sum_m.load(std::memory_order_relaxed)),
+        m_visits(o.m_visits.load(std::memory_order_relaxed)),
         flags(o.flags.load(std::memory_order_relaxed)) {}
 
   child_node_t& operator=(child_node_t&& o) noexcept {
@@ -61,6 +62,8 @@ struct child_node_t {
     win.store(o.win.load(std::memory_order_relaxed), std::memory_order_relaxed);
     sum_m.store(o.sum_m.load(std::memory_order_relaxed),
                 std::memory_order_relaxed);
+    m_visits.store(o.m_visits.load(std::memory_order_relaxed),
+                   std::memory_order_relaxed);
     flags.store(o.flags.load(std::memory_order_relaxed),
                 std::memory_order_relaxed);
     return *this;
@@ -81,6 +84,17 @@ struct child_node_t {
   std::atomic<int> move_count{0};
   std::atomic<float> win{0.0f};
   std::atomic<float> sum_m{0.0f};  // sum of subtree moves-left (for MLH M-effect)
+  // Completed M samples are counted separately from move_count, which also
+  // contains in-flight virtual visits.
+  std::atomic<int> m_visits{0};
+
+  float MeanMovesLeft() const {
+    const int visits = m_visits.load(std::memory_order_acquire);
+    return visits > 0
+               ? sum_m.load(std::memory_order_acquire) /
+                     static_cast<float>(visits)
+               : 0.0f;
+  }
 
  private:
   enum : uint8_t { kWin = 1, kLose = 2, kDraw = 4 };
@@ -104,10 +118,27 @@ struct uct_node_t {
   std::atomic<int> move_count{kNotExpanded};
   std::atomic<float> win{0.0f};
   std::atomic<float> visited_nnrate{0.0f};
-  float eval_m = 0.0f;  // this node's own NN moves-left (set once at eval)
+  // Unlike the old one-shot eval_m field, these statistics remain comparable
+  // to a child's searched M average as the tree grows. The NN evaluation is
+  // the first sample; completed descendant playouts add further samples.
+  std::atomic<float> sum_m{0.0f};
+  std::atomic<int> m_visits{0};
   short child_num = 0;
   std::unique_ptr<child_node_t[]> child;
   std::unique_ptr<child_node_slot_t[]> child_nodes;
+
+  void SetMovesLeftEvaluation(float moves_left) {
+    sum_m.store(moves_left, std::memory_order_relaxed);
+    m_visits.store(1, std::memory_order_release);
+  }
+
+  float MeanMovesLeft() const {
+    const int visits = m_visits.load(std::memory_order_acquire);
+    return visits > 0
+               ? sum_m.load(std::memory_order_acquire) /
+                     static_cast<float>(visits)
+               : 0.0f;
+  }
 };
 
 class NodeTree {

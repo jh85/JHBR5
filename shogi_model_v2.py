@@ -472,6 +472,8 @@ class ValueHead(nn.Module):
 
 
 class MovesLeftHead(nn.Module):
+    """Lc0-style V1 scalar head: plies from the current position to the end."""
+
     def __init__(self, cfg):
         super().__init__()
         d = cfg.embedding_size
@@ -484,6 +486,8 @@ class MovesLeftHead(nn.Module):
         h = self.act(self.embed(x))
         h = torch.flatten(h, 1)  # (B, 81, emb) -> (B, 81*emb)
         h = self.act(self.fc1(h))
+        # Lc0's MOVES_LEFT_V1 output is non-negative. Keeping the ReLU in the
+        # model also makes that contract explicit to ONNX/TensorRT consumers.
         return F.relu(self.fc2(h))
 
 

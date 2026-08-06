@@ -29,6 +29,8 @@ NNEvaluator::NNEvaluator(const std::string& onnx_path, bool use_gpu,
 
 NNEvaluator::~NNEvaluator() = default;
 
+bool NNEvaluator::has_moves_left() const { return true; }
+
 NNOutput NNEvaluator::Evaluate(const ShogiBoard& board,
                                const MoveList& legal_moves) {
   std::vector<std::pair<ShogiBoard, MoveList>> batch;

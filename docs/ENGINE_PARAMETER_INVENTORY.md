@@ -46,9 +46,13 @@ values.
 | `DrawValueWhite` | 0.5 | 0--1 | Tune/ruleset | Value backed up for a draw when White traversed the edge |
 | `ResignThreshold` | 0.01 | 0--0.5 | Tune/safety | Resign when the selected root move's win probability is below this |
 | `MaxMovesToDraw` | 100000 | 1--100000 | Rule/operational | Search returns a draw once `board.ply() > value`; no practical default cap |
-| `MovesLeftWeight` | 0.0 | 0--100 | Tune | Master strength of the MLH selection term; zero disables it |
-| `MovesLeftThreshold` | 0.0 | 0--0.5 | Tune | Apply MLH only when `abs(Q - 0.5)` exceeds this |
-| `MovesLeftCap` | 20.0 | 0--10000 | Tune | Clamp the child-minus-parent moves-left delta in plies |
+| `UseMovesLeft` | false | bool | Tune | Opt in to the MLH selection term; also requires MLH on every evaluator |
+| `MovesLeftMaxEffect` | 0.0345 | 0--1 | Tune | Cap the pre-scaling MLH utility in lc0 Q units |
+| `MovesLeftThreshold` | 0.8 | 0--1 | Tune | Parent `abs(Q)` must exceed this; the effect ramps smoothly above it |
+| `MovesLeftSlope` | 0.0027 | 0--1 | Tune | Multiply the child-minus-parent plies delta before capping |
+| `MovesLeftConstantFactor` | 0.0 | -1--1 | Tune | Constant multiplier for the capped MLH term |
+| `MovesLeftScaledFactor` | 1.6521 | -2--2 | Tune | Linear multiplier in normalized `abs(Q)` |
+| `MovesLeftQuadraticFactor` | -0.6521 | -1--1 | Tune | Quadratic multiplier in normalized `abs(Q)` |
 
 The parser also accepts dlshogi-compatible aliases `c_init`, `c_base`,
 `c_fpu_reduction`, `c_init_root`, `c_base_root`, and
@@ -71,7 +75,7 @@ object, so a new search cannot retain a tree built under different semantics.
 
 | USI option | Default | Advertised range | Class | Active effect |
 |---|---:|---:|---|---|
-| `MaxNodes` | 800 | 1--10,000,000 | Tune/test | Default playout limit when `go nodes` is absent |
+| `MaxNodes` | 800 | 1--1,000,000,000 | Tune/test | Default playout limit when `go nodes` is absent |
 | `NumGPUs` | 1 | 1--8 | Operational/tune | One evaluator and worker group per visible device index |
 | `WorkersPerGpu` | 2 | 1--64 | Tune | Search threads and TensorRT execution slots per GPU |
 | `Threads` | 2 | 1--64 | Compatibility | Exact alias of `WorkersPerGpu` |
@@ -141,7 +145,7 @@ These are command parameters rather than persistent options:
 | Input | Behavior | Class |
 |---|---|---|
 | `go nodes N` | Replaces `MaxNodes` for that search | Test/tune |
-| `go infinite` | Uses 10,000,000 nodes | Operational limitation |
+| `go infinite` | Uses the 1,000,000,000-node safety ceiling until `stop` | Operational |
 | `btime`, `wtime` | Selects remaining main time for the side to move | Operational |
 | `binc`, `winc` | Selects per-move increment for the side to move | Operational |
 | `byoyomi` | Shared per-move byoyomi | Operational |

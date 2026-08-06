@@ -70,6 +70,7 @@ class NNEvaluator {
       const std::vector<std::pair<ShogiBoard, MoveList>>& batch);
 
   int num_slots() const;
+  bool has_moves_left() const;
   bool using_gpu() const { return true; }
 
  private:

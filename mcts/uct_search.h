@@ -9,6 +9,7 @@
 #include <mutex>
 #include <vector>
 
+#include "mcts/search_primitives.h"
 #include "mcts/uct_node.h"
 #include "inference/nn_cache.h"
 #include "usi/time_manager.h"
@@ -54,12 +55,10 @@ struct SearchConfig {
   // affordable without paying for it at every MCTS leaf.
   int root_mate_depth = 7;
 
-  // Moves-left (MLH) effect in selection. Disabled by default (weight 0):
-  // when > 0, nudges selection toward shorter lines when winning / longer when
-  // losing. Needs a model trained with the MLH head; tune with real games.
-  float moves_left_weight = 0.0f;     // master switch / strength
-  float moves_left_threshold = 0.0f;  // only apply when |q-0.5| exceeds this
-  float moves_left_cap = 20.0f;       // clamp |child_M - parent_M| (plies)
+  // Lc0-style moves-left (MLH) effect in selection. Keep opt-in until the
+  // lc0-shaped defaults have been strength-tested for Shogi; enabling is also
+  // gated by every active evaluator actually exposing an MLH output.
+  MovesLeftParameters moves_left;
 
   size_t nn_cache_size = 0;
   int info_interval_ms = 1000;
@@ -157,6 +156,7 @@ class Search {
   std::atomic<bool> time_check_busy_{false};
   int in_flight_playouts_ = 0;
   bool root_mate_cancelled_ = false;
+  bool moves_left_supported_ = false;
   mutable std::mutex info_mutex_;
   int last_info_ms_ = 0;
 };

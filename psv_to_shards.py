@@ -110,6 +110,7 @@ def flush_shard(shard_id, output_dir, planes, policy, wdl, mlh):
         policy=np.asarray(policy, dtype=np.int32),
         wdl=np.asarray(wdl, dtype=np.float16),
         mlh=np.asarray(mlh, dtype=np.int16),
+        mlh_version=np.asarray([1], dtype=np.uint8),
     )
     return out_path
 
@@ -135,7 +136,11 @@ def emit_buffered_game(game_records, board, planes_buf, policy_buf,
     n_skipped = 0
     for rec in game_records:
         cur_ply = int(rec['gamePly'])
-        remaining = max(0, final_ply - cur_ply)
+        # PSV rows describe the position before their recorded move. Include
+        # that move so the final usable row has target 1, matching lc0's
+        # plies_left convention. The recorded end remains only an estimate of
+        # the true game end (see the module caveat above).
+        remaining = max(1, final_ply - cur_ply + 1)
 
         try:
             enc = encode_one_psv(board, rec, eval_coef)

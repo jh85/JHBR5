@@ -63,7 +63,9 @@ def make_synthetic_psv(path, games):
             rec = np.zeros(1, dtype=PSV_DTYPE)
             rec[0]['sfen'] = psfen[0]['sfen']
             rec[0]['score'] = 0
-            rec[0]['move'] = move16
+            # PSV stores YaneuraOu's Move16 bit layout, not cshogi's native
+            # layout used by Board.move_from_usi().
+            rec[0]['move'] = cshogi.move16_to_psv(move16)
             rec[0]['gamePly'] = cur_ply
             rec[0]['game_result'] = result
             records.append(rec[0].copy())
@@ -86,7 +88,7 @@ def test_synthetic():
     psv_path = os.path.join(tmp, "synth.bin")
 
     # Three games: 5 moves, 3 moves, 4 moves. Use the standard opening.
-    moves_g1 = ["7g7f", "3c3d", "8h2b+", "3a2b", "B*4e"]
+    moves_g1 = ["7g7f", "3c3d", "8h2b+", "8c8d", "B*4e"]
     moves_g2 = ["2g2f", "8c8d", "2f2e"]
     moves_g3 = ["2g2f", "3c3d", "2f2e", "8c8d"]
     init_sfen = "lnsgkgsnl/1r5b1/ppppppppp/9/9/9/PPPPPPPPP/1B5R1/LNSGKGSNL b - 1"
@@ -118,10 +120,9 @@ def test_synthetic():
     d = np.load(os.path.join(out_dir, shards[0]))
 
     # Verify MLH per game:
-    # Game 1: 5 records, MLH should be [4,3,2,1,0]
-    # Game 2: 3 records, MLH should be [2,1,0]
-    # Game 3: 4 records, MLH should be [3,2,1,0]
-    expected_mlh = [4,3,2,1,0,  2,1,0,  3,2,1,0]
+    # Positions precede their recorded move, so the final row has one ply.
+    # Game 1: [5,4,3,2,1], game 2: [3,2,1], game 3: [4,3,2,1].
+    expected_mlh = [5,4,3,2,1,  3,2,1,  4,3,2,1]
     actual_mlh = list(d['mlh'])
     if actual_mlh == expected_mlh:
         passed &= ok(f"MLH = {actual_mlh} matches expected")
@@ -152,10 +153,10 @@ def test_synthetic():
         passed &= fail(f"policy out of range: [{d['policy'].min()}, {d['policy'].max()}]")
 
     # Check planes shape
-    if d['planes'].shape == (12, 48, 9, 9):
+    if d['planes'].shape == (12, 148, 9, 9):
         passed &= ok(f"planes shape {d['planes'].shape}")
     else:
-        passed &= fail(f"planes shape {d['planes'].shape} != (12, 48, 9, 9)")
+        passed &= fail(f"planes shape {d['planes'].shape} != (12, 148, 9, 9)")
 
     shutil.rmtree(tmp)
     return passed
@@ -261,7 +262,7 @@ def test_real_psv_chunk():
     else:
         passed &= fail(f"total in shards ({total_in_shards}) != emit ({emit})")
 
-    passed &= ok(f"MLH range [{mlh_min}, {mlh_max}]") if mlh_min >= 0 else fail(f"negative MLH: {mlh_min}")
+    passed &= ok(f"MLH range [{mlh_min}, {mlh_max}]") if mlh_min >= 1 else fail(f"MLH below one: {mlh_min}")
     passed &= ok(f"policy range [{policy_min}, {policy_max}]") if 0 <= policy_min and policy_max < 2187 else fail(f"policy out of range")
     passed &= ok(f"WDL sum range [{wdl_sum_min:.4f}, {wdl_sum_max:.4f}]") if 0.99 < wdl_sum_min < 1.01 and 0.99 < wdl_sum_max < 1.01 else fail(f"WDL sums off: [{wdl_sum_min}, {wdl_sum_max}]")
 
@@ -286,7 +287,7 @@ def test_cross_script_consistency():
     planes = [np.zeros((48,9,9), dtype=np.float16)]
     policy = [0]
     wdl = [[1.0, 0.0, 0.0]]
-    mlh = [0]
+    mlh = [1]
     p1 = f_psv(0, tmp, planes, policy, wdl, mlh)
     p2 = f_pack(1, tmp, planes, policy, wdl, mlh)
     d1 = np.load(p1); d2 = np.load(p2)
@@ -335,7 +336,8 @@ def test_spot_check_decoding():
         # Compare to direct cshogi decoding
         board.set_psfen(np.ascontiguousarray(rec['sfen'], dtype=np.uint8))
         sfen = board.sfen()
-        move_usi = cshogi.move_to_usi(int(rec['move']))
+        move_usi = cshogi.move_to_usi(
+            cshogi.move16_from_psv(int(rec['move'])))
         flip = sfen.split()[1] == 'w'
         expected_idx = move_to_policy_index(move_usi, flip)
         if expected_idx != policy_idx:

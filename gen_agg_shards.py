@@ -207,7 +207,7 @@ def extract_pack_file(task):
                 if 0 <= policy_idx < POLICY_SIZE:
                     board.to_hcp(hcp_arr)
                     writer.add(hcp_arr.tobytes(), policy_idx, eval16,
-                               n_moves - i - 1,   # plies left after this move
+                               n_moves - i,  # plies left from this position
                                result_stm(game_result_abs, black_to_move))
                     stats["records"] += 1
                 else:
@@ -262,7 +262,7 @@ def extract_psv_file(task):
 
     if psv_mlh == "recorded-end":
         # Reconstruct games by gamePly continuity (see psv_to_shards.py) and
-        # use plies-to-last-RECORDED-position as an approximate MLH.
+        # use plies through the last RECORDED move as an approximate MLH.
         game = []
         prev_ply = None
         for i in range(n_records):
@@ -271,7 +271,7 @@ def extract_psv_file(task):
             if prev_ply is not None and ply != prev_ply + 1:
                 final = int(game[-1]["gamePly"])
                 for r in game:
-                    emit(r, max(0, final - int(r["gamePly"])))
+                    emit(r, max(1, final - int(r["gamePly"]) + 1))
                 stats["games"] += 1
                 game = []
             game.append(rec)
@@ -279,7 +279,7 @@ def extract_psv_file(task):
         if game:
             final = int(game[-1]["gamePly"])
             for r in game:
-                emit(r, max(0, final - int(r["gamePly"])))
+                emit(r, max(1, final - int(r["gamePly"]) + 1))
             stats["games"] += 1
     else:
         # True moves-left is not recoverable from PSV records: store -1 and
@@ -360,6 +360,7 @@ class ShardBuffer:
             policy_offsets=offsets,
             wdl=np.asarray(self.wdl, dtype=np.float16),
             mlh=np.asarray(self.mlh, dtype=np.float16),
+            mlh_version=np.asarray([1], dtype=np.uint8),
             count=np.asarray(self.count, dtype=np.uint32),
         )
         if self.store_key:

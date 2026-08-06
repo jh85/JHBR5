@@ -19,6 +19,7 @@ expects per-shard arrays:
 | `policy` | (N,) int32 | **single class index** in [0, 2187); −1 = no label (masked) |
 | `wdl` | (N, 3) float16 | soft (W, D, L) **from the side to move's perspective**, trained with soft cross-entropy |
 | `mlh` | (N,) int16 | remaining plies; **< 0 = masked**; clipped to `--mlh-clip` (80) at train time; Huber (smooth-L1) loss |
+| `mlh_version` | (1,) uint8 | 1 = lc0 current-position convention; absent = legacy zero-based convention |
 
 **Policy encoding**: `make_direction_policy_index` — (direction 0–26) × 81
 destination squares = 2187; directions 0–9 moves, 10–19 promotions, 20–26
@@ -32,13 +33,13 @@ move (side-to-move ✓); `.pack` results are absolute (0/1/2) and correctly
 converted; PSV results are already side-to-move ±1/0 ✓.
 
 **MLH convention**: raw remaining plies, **not** normalized/log/bucketed;
-scalar regression head (`MovesLeftHead`, ReLU output). Zero-point: the last
-recorded position of a game has mlh = 0 (i.e. "plies left *after* the teacher
-move"), consistent across `gen_pack_shards.py`, `pack_to_shards.py`,
-`psv_to_shards.py`. At inference the MCTS uses only *relative* deltas
-(child_M − parent_M), so the zero-point choice is harmless as long as it stays
-consistent. Note: docstrings say "remaining plies to game end", which is off
-by one from the code (`n_moves - i - 1`); cosmetic only.
+scalar regression head (`MovesLeftHead`, ReLU output). As of the MLH refactor,
+the label follows lc0 V5+ training data: it counts from the encoded, pre-move
+position, so the last real record has mlh = 1. Older generated JHBR2/JHBR3
+shards used zero for that row ("plies after the teacher move"). Those existing
+checkpoints remain usable because the constant one-ply shift mostly cancels in
+the search's child-minus-parent M delta, but new shards should not mix both
+conventions in one training run.
 
 **Policy loss expected one-hot** (before this work): `F.cross_entropy` with a
 long class index — i.e. the loader had **no support for policy vectors**.
@@ -196,9 +197,10 @@ active).
   `shogi/encoder.h`), so the canonical key ignores repetition history. If the
   engine sets it at inference, the model sees an input pattern it never
   trained on — pre-existing, out of scope here.
-* **MLH zero-point**: kept the existing "0 at the last recorded position"
-  convention (off-by-one vs. the docstrings). Inference uses relative deltas,
-  so consistency matters more than the offset.
+* **MLH zero-point**: the original audit kept "0 at the last recorded
+  position." The later MLH refactor corrected new generators to lc0's
+  current-position convention, where the final pre-move record is 1. See
+  `docs/MLH.md` for old-checkpoint compatibility.
 * **Aggregated value is an unweighted per-record mean**; positions with many
   records get a lower-variance target but the same *sample* weight as
   singletons. The `count` array is stored if you later want frequency- or

@@ -261,6 +261,7 @@ class ShardedDataset(Dataset):
         self.policy = None
         self.wdl = None
         self.mlh = None
+        self.mlh_version = None
         self.sparse_policy = False        # aggregated shards (auto-detected)
         self.p_idx = self.p_wt = self.p_off = None
         self.current_shard = -1
@@ -289,6 +290,19 @@ class ShardedDataset(Dataset):
         self.p_idx = self.p_wt = self.p_off = None
 
         data = np.load(self.shard_paths[shard_id])
+        shard_mlh_version = (
+            int(np.asarray(data['mlh_version']).item())
+            if 'mlh_version' in data.files else 0
+        )
+        if self.mlh_version is None:
+            self.mlh_version = shard_mlh_version
+        elif shard_mlh_version != self.mlh_version:
+            raise ValueError(
+                "Mixed MLH target conventions in one dataset: "
+                f"expected version {self.mlh_version}, but "
+                f"{self.shard_paths[shard_id]} has version "
+                f"{shard_mlh_version}. Regenerate or separate the shards."
+            )
         if 'packed1' in data.files:          # bit-packed shard
             self.packed = True
             self.packed1 = data['packed1']

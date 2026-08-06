@@ -364,7 +364,7 @@ class ValueHead(nn.Module):
 
 
 class MovesLeftHead(nn.Module):
-    """Moves-left prediction head."""
+    """Lc0-style V1 scalar head: plies from the current position to the end."""
 
     def __init__(self, cfg: ShogiBT4Config):
         super().__init__()

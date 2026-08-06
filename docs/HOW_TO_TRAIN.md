@@ -164,15 +164,19 @@ and uses the packed-bits + GPU-unpack input path. (`ModelFormat` defaults to
 ### Optional: enable the moves-left (MLH) effect in search
 
 Off by default. Once you've trained a model with the MLH head, you can have MCTS
-prefer shorter wins / longer losses:
+prefer shorter wins / longer losses. The parameter shape and values below match
+lc0; they are not yet strength-tuned for Shogi:
 
 ```
-setoption name MovesLeftWeight value 0.03   # 0 disables; start small
-setoption name MovesLeftThreshold value 0.1 # only act when clearly won/lost
+setoption name UseMovesLeft value true
+# Optional overrides of the lc0-shaped defaults:
+setoption name MovesLeftMaxEffect value 0.0345
+setoption name MovesLeftThreshold value 0.8
+setoption name MovesLeftSlope value 0.0027
 ```
 
-Tune `MovesLeftWeight` with real games (e.g. sweep 0.01–0.05 vs. the baseline);
-too high can cost strength.
+Tune with paired games against `UseMovesLeft=false`; too much effect can cost
+strength. See `docs/MLH.md` for semantics and the lc0 comparison.
 
 ---
 

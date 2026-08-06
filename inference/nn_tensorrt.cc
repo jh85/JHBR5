@@ -366,7 +366,10 @@ NNEvaluator::NNEvaluator(const std::string& engine_path, bool /*use_gpu*/,
     }
     CUDA_CHECK(cudaMalloc(&slot->d_policy, static_cast<size_t>(B) * P * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&slot->d_wdl,    static_cast<size_t>(B) * value_planes * sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&slot->d_mlh,    static_cast<size_t>(B) * 1 * sizeof(float)));
+    if (impl_->mlh_idx >= 0) {
+      CUDA_CHECK(cudaMalloc(&slot->d_mlh,
+                            static_cast<size_t>(B) * sizeof(float)));
+    }
     if (impl_->model_format == ModelFormat::kDlshogi) {
       CUDA_CHECK(cudaMallocHost(reinterpret_cast<void**>(&slot->h_input),
                                 static_cast<size_t>(B) * C * 81 * sizeof(float)));
@@ -382,8 +385,10 @@ NNEvaluator::NNEvaluator(const std::string& engine_path, bool /*use_gpu*/,
                               static_cast<size_t>(B) * P * sizeof(float)));
     CUDA_CHECK(cudaMallocHost(reinterpret_cast<void**>(&slot->h_wdl),
                               static_cast<size_t>(B) * value_planes * sizeof(float)));
-    CUDA_CHECK(cudaMallocHost(reinterpret_cast<void**>(&slot->h_mlh),
-                              static_cast<size_t>(B) * 1 * sizeof(float)));
+    if (impl_->mlh_idx >= 0) {
+      CUDA_CHECK(cudaMallocHost(reinterpret_cast<void**>(&slot->h_mlh),
+                                static_cast<size_t>(B) * sizeof(float)));
+    }
     impl_->slots.push_back(std::move(slot));
   }
 }
@@ -394,6 +399,10 @@ NNEvaluator::~NNEvaluator() {
 
 int NNEvaluator::num_slots() const {
   return impl_ ? static_cast<int>(impl_->slots.size()) : 0;
+}
+
+bool NNEvaluator::has_moves_left() const {
+  return impl_ && impl_->mlh_idx >= 0;
 }
 
 NNOutput NNEvaluator::Evaluate(const ShogiBoard& board,

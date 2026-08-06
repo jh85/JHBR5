@@ -35,11 +35,20 @@ from multiprocessing import Pool
 import numpy as np
 import cshogi
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                                "YaneuraOu-ScriptCollection", "GenSfen"))
+_HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, _HERE)
+for _cand in (
+        os.path.join(_HERE, "YaneuraOu-ScriptCollection", "CommonLib"),
+        os.path.join(_HERE, "YaneuraOu-ScriptCollection", "GenSfen"),
+        os.path.join(os.path.dirname(_HERE), "YaneuraOu-ScriptCollection",
+                     "CommonLib")):
+    if os.path.isdir(_cand):
+        sys.path.insert(0, _cand)
 from shogi_train import sfen_to_planes, move_to_policy_index
-from ShogiCommonLib import GameDataDecoder
+try:
+    from YaneShogiLib import GameDataDecoder
+except ImportError:
+    from ShogiCommonLib import GameDataDecoder
 
 
 def encode_one_position(board, move_raw, score, game_result_abs,
@@ -88,6 +97,7 @@ def flush_shard(shard_id, output_dir, planes, policy, wdl, mlh):
         policy=np.asarray(policy, dtype=np.int32),
         wdl=np.asarray(wdl, dtype=np.float16),
         mlh=np.asarray(mlh, dtype=np.int16),
+        mlh_version=np.asarray([1], dtype=np.uint8),
     )
     return out_path
 
@@ -144,7 +154,9 @@ def process_pack_file(args):
         try:
             board.set_sfen(sfen)
             for i, (move, eval16) in enumerate(game_kif):
-                remaining_plies = n_moves - i - 1
+                # Position is encoded before move i; include that move in the
+                # plies-to-end target, as lc0 training data does.
+                remaining_plies = n_moves - i
                 # Store the raw value; clipping is applied at training time
                 # in shogi_train.py so the clip threshold can be tuned
                 # without regenerating shards. int16 holds values to 32767

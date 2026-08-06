@@ -40,6 +40,11 @@ namespace {
 // while still preventing an accidental unbounded allocation.
 constexpr int kMaxWorkersPerGpu = 64;
 
+// Search-wide counters are signed 32-bit integers. One billion leaves ample
+// overflow headroom while making MaxNodes an effectively non-binding safety
+// ceiling for normal clock-based play.
+constexpr int kMaxMctsNodes = 1'000'000'000;
+
 const char* RepetitionResultName(ShogiBoard::RepetitionResult result) {
   switch (result) {
     case ShogiBoard::RepetitionResult::kNone:
@@ -240,7 +245,8 @@ void USIEngine::CmdUsi() {
   Send(std::string("id name ") + ENGINE_NAME);
   Send(std::string("id author ") + ENGINE_AUTHOR);
 
-  Send("option name MaxNodes type spin default 800 min 1 max 10000000");
+  Send("option name MaxNodes type spin default 800 min 1 max " +
+       std::to_string(kMaxMctsNodes));
   Send("option name RootMateSolver type combo default bns var bns var dfpn");
   Send("option name OnnxModel type string default shogi_bt4.onnx");
   Send("option name ModelFormat type combo default auto var auto var jhbr2 var dlshogi");
@@ -266,9 +272,13 @@ void USIEngine::CmdUsi() {
   Send("option name NNCacheSize type spin default 0 min 0 max 100000000");
   Send("option name NumGPUs type spin default 1 min 1 max 8");
   Send("option name MaxMovesToDraw type spin default 100000 min 1 max 100000");
-  Send("option name MovesLeftWeight type string default 0.0");
-  Send("option name MovesLeftThreshold type string default 0.0");
-  Send("option name MovesLeftCap type string default 20.0");
+  Send("option name UseMovesLeft type check default false");
+  Send("option name MovesLeftMaxEffect type string default 0.0345");
+  Send("option name MovesLeftThreshold type string default 0.8");
+  Send("option name MovesLeftSlope type string default 0.0027");
+  Send("option name MovesLeftConstantFactor type string default 0.0");
+  Send("option name MovesLeftScaledFactor type string default 1.6521");
+  Send("option name MovesLeftQuadraticFactor type string default -0.6521");
   Send("option name DfPnMaxTime type spin default 4000 min 100 max 60000");
   Send("option name MaxMoveTime type spin default 0 min 0 max 300000");
   Send("option name MaxMoveTime1m type spin default 0 min 0 max 60000");
@@ -307,9 +317,20 @@ void USIEngine::CmdIsReady() {
       return;
     }
 
+    const bool has_moves_left =
+        !evaluators_.empty() &&
+        std::all_of(evaluators_.begin(), evaluators_.end(),
+                    [](const auto& evaluator) {
+                      return evaluator && evaluator->has_moves_left();
+                    });
     Log("Model loaded, GPUs=" + std::to_string(num_gpus_) +
         ", format=" + ModelFormatToString(model_format_) +
+        ", mlh=" + (has_moves_left ? "yes" : "no") +
         ", max_nodes=" + std::to_string(max_nodes_));
+    if (search_config_.moves_left.enabled && !has_moves_left) {
+      Log("UseMovesLeft requested, but the loaded model has no MLH output; "
+          "the search effect is disabled");
+    }
 
   }
 
@@ -390,7 +411,11 @@ void USIEngine::CmdSetOption(const std::vector<std::string>& parts) {
 
   try {
     if (name_lower == "maxnodes") {
-      max_nodes_ = std::clamp(ParseInt(value), 1, 10000000);
+      max_nodes_ = std::clamp(ParseInt(value), 1, kMaxMctsNodes);
+      // Unlike most options, make the diagnostic report the effective value
+      // after clamping instead of echoing a potentially misleading request.
+      Log("Set " + name + " = " + std::to_string(max_nodes_));
+      return;
     } else if (name_lower == "onnxmodel") {
       onnx_path_ = value;
       reset_inference();
@@ -497,17 +522,33 @@ void USIEngine::CmdSetOption(const std::vector<std::string>& parts) {
       search_config_.max_moves_to_draw =
           std::clamp(ParseInt(value), 1, 100000);
       reset_search();
-    } else if (name_lower == "movesleftweight") {
-      search_config_.moves_left_weight =
-          std::clamp(ParseFiniteFloat(value), 0.0f, 100.0f);
+    } else if (name_lower == "usemovesleft") {
+      search_config_.moves_left.enabled =
+          ToLower(value) == "true" || value == "1";
+      reset_search();
+    } else if (name_lower == "movesleftmaxeffect") {
+      search_config_.moves_left.max_effect =
+          std::clamp(ParseFiniteFloat(value), 0.0f, 1.0f);
       reset_search();
     } else if (name_lower == "movesleftthreshold") {
-      search_config_.moves_left_threshold =
-          std::clamp(ParseFiniteFloat(value), 0.0f, 0.5f);
+      search_config_.moves_left.threshold =
+          std::clamp(ParseFiniteFloat(value), 0.0f, 1.0f);
       reset_search();
-    } else if (name_lower == "movesleftcap") {
-      search_config_.moves_left_cap =
-          std::clamp(ParseFiniteFloat(value), 0.0f, 10000.0f);
+    } else if (name_lower == "movesleftslope") {
+      search_config_.moves_left.slope =
+          std::clamp(ParseFiniteFloat(value), 0.0f, 1.0f);
+      reset_search();
+    } else if (name_lower == "movesleftconstantfactor") {
+      search_config_.moves_left.constant_factor =
+          std::clamp(ParseFiniteFloat(value), -1.0f, 1.0f);
+      reset_search();
+    } else if (name_lower == "movesleftscaledfactor") {
+      search_config_.moves_left.scaled_factor =
+          std::clamp(ParseFiniteFloat(value), -2.0f, 2.0f);
+      reset_search();
+    } else if (name_lower == "movesleftquadraticfactor") {
+      search_config_.moves_left.quadratic_factor =
+          std::clamp(ParseFiniteFloat(value), -1.0f, 1.0f);
       reset_search();
     } else if (name_lower == "rootmatesolver") {
       std::string mode = value;
@@ -545,6 +586,8 @@ void USIEngine::CmdSetOption(const std::vector<std::string>& parts) {
                name_lower == "leafdfpnnodes" ||
                name_lower == "virtuallossweight" ||
                name_lower == "maxgpubatch" ||
+               name_lower == "movesleftweight" ||
+               name_lower == "movesleftcap" ||
                name_lower == "bookonthefly") {
       Log("Option " + name + " is retired and ignored");
       return;
@@ -645,7 +688,7 @@ void USIEngine::CmdGo(const std::vector<std::string>& parts) {
       has_explicit_nodes = true;
       i += 2;
     } else if (parts[i] == "infinite") {
-      nodes_limit = 10000000;
+      nodes_limit = kMaxMctsNodes;
       infinite = true;
       i++;
     } else if (parts[i] == "mate") {

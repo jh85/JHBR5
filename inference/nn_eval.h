@@ -78,6 +78,11 @@ class NNEvaluator {
 
   int num_slots() const { return 1; }
 
+  // Whether the loaded model exposes a usable moves-left output. Search must
+  // not infer support from a zero value: zero is also a valid terminal MLH
+  // estimate.
+  bool has_moves_left() const;
+
   // Is the evaluator using GPU?
   bool using_gpu() const { return using_gpu_; }
 

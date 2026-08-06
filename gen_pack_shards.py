@@ -149,7 +149,8 @@ def process_pack_file(task):
         nonlocal policy_buf, wdl_buf, mlh_buf
         common = dict(policy=np.asarray(policy_buf, dtype=np.int32),
                       wdl=np.asarray(wdl_buf, dtype=np.float16),
-                      mlh=np.asarray(mlh_buf, dtype=np.int16))
+                      mlh=np.asarray(mlh_buf, dtype=np.int16),
+                      mlh_version=np.asarray([1], dtype=np.uint8))
         if packed:
             flush_shard(shard_id, output_dir, dict(
                 packed1=np.asarray(p1_buf, dtype=np.uint8),
@@ -197,7 +198,10 @@ def process_pack_file(task):
             # Collect per-position metadata; encode planes in one batch per game.
             g_sfens, g_policy, g_wdl, g_mlh = [], [], [], []
             for i, (move, eval16) in enumerate(game_kif):
-                mlh_target = n_moves - i - 1   # raw remaining plies (no clip)
+                # The encoded position is before move i. Match lc0's V5+
+                # plies_left convention: the final real position therefore
+                # has target 1, not 0.
+                mlh_target = n_moves - i       # raw remaining plies (no clip)
                 rec = position_meta(board, move, eval16, game_result_abs,
                                     eval_coef)
                 if rec is None:
