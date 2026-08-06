@@ -1,6 +1,5 @@
 #pragma once
 
-#include <cstddef>
 #include <cstdint>
 
 namespace jhbr2 {
@@ -34,7 +33,6 @@ struct TimeControl {
 struct TimeOptions {
   int max_move_time_ms = 0;
   int max_move_time_1m_ms = 0;
-  int dfpn_max_time_ms = 4000;
   int move_overhead_ms = 100;
   int max_extension_percent = 175;
   TimeManagementMode mode = TimeManagementMode::kShadow;
@@ -50,11 +48,6 @@ struct TimeBudget {
   // option cap applies, the watchdog allows two seconds beyond nominal MCTS.
   int active_move_cap_ms = 0;
   int hard_deadline_ms = 0;
-
-  // Concurrent root DFPN limits and allowed wait after MCTS completes.
-  int root_dfpn_time_ms = 0;
-  int root_dfpn_grace_ms = 0;
-  std::size_t root_dfpn_nodes = 0;
 
   // Adaptive time points, all relative to receipt of `go`. They are populated
   // in shadow/on modes. In shadow mode the legacy fields above still control

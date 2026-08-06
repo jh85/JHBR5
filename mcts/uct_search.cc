@@ -360,7 +360,7 @@ void Search::RejectRootMates() {
         root_board_, config_.root_mate_depth, &limits);
     root_board_.UndoMove(child.move, undo);
     if (probe == jhbr2::shallow_mate::ProbeResult::kCancelled) {
-      root_mate_cancelled_ = true;
+      root_guard_cancelled_ = true;
       return;
     }
     if (probe == jhbr2::shallow_mate::ProbeResult::kNoMate) {
@@ -476,7 +476,8 @@ unsigned Search::SelectBestChild(const uct_node_t* node) const {
 
 SearchResult Search::Run(ShogiBoard board, uint64_t starting_pos_key,
                          const std::vector<Move>& moves,
-                         Clock::time_point move_start) {
+                         Clock::time_point move_start,
+                         SearchStartedCallback on_search_started) {
   stop_.store(false, std::memory_order_release);
   adaptive_stop_.store(false, std::memory_order_release);
   playout_count_.store(0, std::memory_order_release);
@@ -485,13 +486,17 @@ SearchResult Search::Run(ShogiBoard board, uint64_t starting_pos_key,
   time_controller_.Reset(config_.time_budget, in_flight_playouts_);
   last_time_check_ms_.store(-1000000, std::memory_order_release);
   time_check_busy_.store(false, std::memory_order_release);
-  root_mate_cancelled_ = false;
+  root_guard_cancelled_ = false;
   last_info_ms_ = 0;
   root_board_ = std::move(board);
   tree_reused_ = tree_.ResetToPosition(starting_pos_key, moves);
   root_ = tree_.GetCurrentHead();
   root_visits_before_ =
       std::max(0, root_->move_count.load(std::memory_order_acquire));
+
+  // Notify concurrent helpers only after this run has reset stop_. This keeps
+  // a helper's early Stop() request from being erased at search startup.
+  if (on_search_started) on_search_started();
 
   auto root_legal = root_board_.GenerateLegalMoves();
   if (root_legal.empty()) return BuildResult();
@@ -948,7 +953,7 @@ SearchResult Search::BuildResult() const {
   result.nn_cache = nn_cache_.GetStats();
   result.time_budget = config_.time_budget;
   result.time_decision = time_controller_.decision();
-  result.root_mate_cancelled = root_mate_cancelled_;
+  result.root_guard_cancelled = root_guard_cancelled_;
   if (result.time_decision.reason == jhbr2::TimeStopReason::kNone) {
     if (config_.max_nodes > 0 && result.nodes >= config_.max_nodes) {
       result.time_decision.reason = jhbr2::TimeStopReason::kNodeLimit;

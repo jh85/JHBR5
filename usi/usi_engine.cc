@@ -45,6 +45,12 @@ constexpr int kMaxWorkersPerGpu = 64;
 // ceiling for normal clock-based play.
 constexpr int kMaxMctsNodes = 1'000'000'000;
 
+// BNS uses fixed-size tables, so its playing-strength budget follows the MCTS
+// lifetime instead of an independent node tier. The legacy tree df-pn keeps a
+// fixed cap because its node pool grows linearly with this value.
+constexpr size_t kTreeDfpnMaxNodes = 2'000'000;
+constexpr int kRootMateDeadlineMarginMs = 50;
+
 const char* RepetitionResultName(ShogiBoard::RepetitionResult result) {
   switch (result) {
     case ShogiBoard::RepetitionResult::kNone:
@@ -279,7 +285,6 @@ void USIEngine::CmdUsi() {
   Send("option name MovesLeftConstantFactor type string default 0.0");
   Send("option name MovesLeftScaledFactor type string default 1.6521");
   Send("option name MovesLeftQuadraticFactor type string default -0.6521");
-  Send("option name DfPnMaxTime type spin default 4000 min 100 max 60000");
   Send("option name MaxMoveTime type spin default 0 min 0 max 300000");
   Send("option name MaxMoveTime1m type spin default 0 min 0 max 60000");
   Send("option name TimeManagement type combo default shadow var off var shadow var on");
@@ -557,7 +562,10 @@ void USIEngine::CmdSetOption(const std::vector<std::string>& parts) {
       Log("RootMateSolver=" + std::string(root_mate_solver_bns_ ? "bns"
                                                                 : "dfpn"));
     } else if (name_lower == "dfpnmaxtime") {
-      dfpn_max_time_ms_ = std::clamp(ParseInt(value), 100, 60000);
+      // Accepted for old engine configuration files, but no longer advertised
+      // or used. Root mate search now follows the MCTS lifetime.
+      Log("DfPnMaxTime is retired; root mate search follows MCTS");
+      return;
     } else if (name_lower == "maxmovetime") {
       max_move_time_ms_ = std::clamp(ParseInt(value), 0, 300000);
     } else if (name_lower == "maxmovetime1m") {
@@ -718,7 +726,6 @@ void USIEngine::CmdGo(const std::vector<std::string>& parts) {
   TimeOptions time_options;
   time_options.max_move_time_ms = max_move_time_ms_;
   time_options.max_move_time_1m_ms = max_move_time_1m_ms_;
-  time_options.dfpn_max_time_ms = dfpn_max_time_ms_;
   time_options.move_overhead_ms = move_overhead_ms_;
   time_options.max_extension_percent = time_max_extension_percent_;
   time_options.mode = time_management_mode_;
@@ -778,71 +785,6 @@ void USIEngine::CmdGo(const std::vector<std::string>& parts) {
   search_config_.max_time = time_budget.mcts_time_seconds;
   search_config_.time_budget = time_budget;
 
-  // --- Launch the root mate solver in parallel ---
-  // Keep the solver and its result in one state shared with the worker.
-  // RootMateSolver selects the engine: the BNS-family solver in its
-  // pn/dn configuration (default; ~9x the mate throughput of the tree
-  // df-pn on benchmark sets) or the original tree df-pn.
-  struct DfpnState {
-    std::unique_ptr<MateDfpnSolver> tree;
-    std::unique_ptr<MateBnsSolver> bns;
-    std::atomic<bool> done{false};
-    std::mutex mutex;
-    std::condition_variable cv;
-    Move mate_move;
-    ShogiBoard board;
-    DfpnState(bool use_bns, size_t nodes, const ShogiBoard& b) : board(b) {
-      if (use_bns) {
-        // Table allocations are calloc-backed (lazy pages), so a fresh
-        // per-move solver costs nothing up front. Sticky stop()
-        // semantics make solver reuse across moves unsafe, exactly as
-        // with MateDfpnSolver.
-        // Keep the two hot search tables inside the local cache slice. The
-        // mate-suite sweep is faster at 4 MiB TT / 2 MiB move cache than with
-        // the former 64 MiB / 16 MiB configuration.
-        bns = std::make_unique<MateBnsSolver>(/*tt_mb=*/4, nodes);
-        bns->set_move_cache_mb(2);
-      } else {
-        tree = std::make_unique<MateDfpnSolver>(nodes);
-      }
-    }
-    Move Search(size_t nodes, MateDfpnSolver::Deadline deadline) {
-      return bns ? bns->search(board, nodes, deadline)
-                 : tree->search(board, nodes, deadline);
-    }
-    void Stop() {
-      if (bns) bns->stop(); else tree->stop();
-    }
-    size_t NodesSearched() const {
-      return bns ? bns->get_nodes_searched() : tree->get_nodes_searched();
-    }
-    std::vector<Move> Pv() const {
-      return bns ? bns->get_pv() : tree->get_pv();
-    }
-  };
-  auto dfpn = std::make_shared<DfpnState>(
-      root_mate_solver_bns_, time_budget.root_dfpn_nodes, board_);
-
-  auto dfpn_time_deadline =
-      move_start_time +
-      std::chrono::milliseconds(time_budget.root_dfpn_time_ms);
-  if (time_budget.mode == TimeManagementMode::kOn &&
-      time_budget.response_deadline_ms > 0) {
-    dfpn_time_deadline = std::min(
-        dfpn_time_deadline,
-        move_start_time +
-            std::chrono::milliseconds(time_budget.response_deadline_ms));
-  }
-  auto dfpn_thread =
-      std::thread([dfpn, root_dfpn_nodes = time_budget.root_dfpn_nodes,
-                   dfpn_time_deadline]() {
-        dfpn->mate_move =
-            dfpn->Search(root_dfpn_nodes, dfpn_time_deadline);
-        dfpn->done.store(true, std::memory_order_release);
-        dfpn->cv.notify_all();
-      });
-
-  // --- Run dlshogi-style MCTS ---
   // Set info callback for periodic GUI output during search.
   search_config_.info_callback = [this](const dlshogi_mcts::SearchInfo& info) {
     // Keep free-form diagnostics before the structured record.  Some GUIs
@@ -873,31 +815,165 @@ void USIEngine::CmdGo(const std::vector<std::string>& parts) {
   search_->SetMaxNodes(search_config_.max_nodes);
   search_->SetTimeBudget(time_budget);
 
+  // --- Launch the root mate solver in parallel ---
+  // BNS owns fixed-size tables and therefore has no independent strength
+  // budget: MCTS controls its lifetime. The legacy tree df-pn retains a fixed
+  // node cap because its linear node pool is a memory allocation limit.
+  struct RootMateState {
+    std::unique_ptr<MateDfpnSolver> tree;
+    std::unique_ptr<MateBnsSolver> bns;
+    const bool use_bns;
+    const size_t nodes_limit;
+    std::atomic<bool> done{false};
+    std::atomic<bool> stop_requested{false};
+    std::atomic<bool> stopped_mcts{false};
+    std::mutex start_mutex;
+    std::condition_variable start_cv;
+    bool started = false;
+    Move mate_move;
+    ShogiBoard board;
+    std::int64_t elapsed_ms = 0;
+
+    RootMateState(bool use_bns_solver, const ShogiBoard& b)
+        : use_bns(use_bns_solver),
+          nodes_limit(use_bns_solver
+                          ? std::numeric_limits<size_t>::max()
+                          : kTreeDfpnMaxNodes),
+          board(b) {
+      if (use_bns) {
+        // Keep the two hot search tables inside the local cache slice. Their
+        // fixed allocation does not grow with nodes_limit.
+        bns = std::make_unique<MateBnsSolver>(/*tt_mb=*/4, nodes_limit);
+        bns->set_move_cache_mb(2);
+      } else {
+        tree = std::make_unique<MateDfpnSolver>(nodes_limit);
+      }
+    }
+
+    void Start() {
+      {
+        std::lock_guard<std::mutex> lock(start_mutex);
+        started = true;
+      }
+      start_cv.notify_all();
+    }
+
+    bool WaitForStart() {
+      std::unique_lock<std::mutex> lock(start_mutex);
+      start_cv.wait(lock, [this] {
+        return started || stop_requested.load(std::memory_order_acquire);
+      });
+      return started && !stop_requested.load(std::memory_order_acquire);
+    }
+
+    Move Search(MateDfpnSolver::Deadline deadline) {
+      return bns ? bns->search(board, nodes_limit, deadline)
+                 : tree->search(board, nodes_limit, deadline);
+    }
+
+    void Stop() {
+      stop_requested.store(true, std::memory_order_release);
+      if (bns)
+        bns->stop();
+      else
+        tree->stop();
+      start_cv.notify_all();
+    }
+
+    size_t NodesSearched() const {
+      return bns ? bns->get_nodes_searched() : tree->get_nodes_searched();
+    }
+
+    std::vector<Move> Pv() const {
+      return bns ? bns->get_pv() : tree->get_pv();
+    }
+
+    const char* SolverName() const { return use_bns ? "bns" : "dfpn"; }
+  };
+
+  auto root_mate =
+      std::make_shared<RootMateState>(root_mate_solver_bns_, board_);
+  auto root_mate_deadline = MateDfpnSolver::Deadline::max();
+  if (time_budget.hard_deadline_ms > 0) {
+    const int safe_deadline_ms = std::max(
+        time_budget.hard_deadline_ms - kRootMateDeadlineMarginMs, 1);
+    root_mate_deadline =
+        move_start_time + std::chrono::milliseconds(safe_deadline_ms);
+  }
+
+  // Search::Run releases this worker only after it has reset its stop flag.
+  // Otherwise a fast mate proof could call Stop() just before Run() and have
+  // that cancellation erased by search startup.
+  dlshogi_mcts::Search* const mcts_search = search_.get();
+  std::thread root_mate_thread(
+      [root_mate, root_mate_deadline, mcts_search]() {
+        if (root_mate->WaitForStart()) {
+          const auto started_at = std::chrono::steady_clock::now();
+          root_mate->mate_move = root_mate->Search(root_mate_deadline);
+          root_mate->elapsed_ms =
+              std::chrono::duration_cast<std::chrono::milliseconds>(
+                  std::chrono::steady_clock::now() - started_at)
+                  .count();
+          const bool proved_mate =
+              !root_mate->mate_move.is_null() &&
+              !MateDfpnSolver::IsNoMate(root_mate->mate_move);
+          root_mate->done.store(true, std::memory_order_release);
+          // Apply the same root repetition boundary before stopping MCTS. If
+          // defense-in-depth rejects a solver regression, normal search must
+          // still be allowed to finish and provide a usable fallback move.
+          if (proved_mate &&
+              RootMoveRepetitionResult(root_mate->board,
+                                       root_mate->mate_move) ==
+                  ShogiBoard::RepetitionResult::kNone) {
+            root_mate->stopped_mcts.store(true, std::memory_order_release);
+            mcts_search->Stop();
+          }
+        } else {
+          root_mate->done.store(true, std::memory_order_release);
+        }
+      });
+
   // Exact watchdog: a condition-variable deadline avoids the old 0-50 ms
   // polling/join delay. Pure node-limited searches remain uncapped.
   std::mutex watchdog_mutex;
   std::condition_variable watchdog_cv;
   bool search_done = false;
+  std::atomic<bool> watchdog_fired{false};
   std::thread watchdog;
   if (time_budget.hard_deadline_ms > 0) {
     const auto hard_deadline =
         move_start_time +
         std::chrono::milliseconds(time_budget.hard_deadline_ms);
     watchdog = std::thread(
-        [this, dfpn, &watchdog_mutex, &watchdog_cv, &search_done,
+        [this, root_mate, &watchdog_mutex, &watchdog_cv, &search_done,
+         &watchdog_fired,
          hard_deadline]() {
           std::unique_lock<std::mutex> lock(watchdog_mutex);
           if (!watchdog_cv.wait_until(
                   lock, hard_deadline, [&search_done] { return search_done; })) {
+            watchdog_fired.store(true, std::memory_order_release);
             if (search_) search_->Stop();
-            dfpn->Stop();
+            root_mate->Stop();
           }
         });
   }
 
   auto result =
       search_->Run(board_, position_start_key_, position_moves_,
-                   move_start_time);
+                   move_start_time, [root_mate] { root_mate->Start(); });
+
+  // MCTS is the single owner of move time. Do not grant a separate post-MCTS
+  // grace period: stop and join the mate worker as soon as MCTS returns.
+  const bool root_mate_finished_before_stop =
+      root_mate->done.load(std::memory_order_acquire);
+  const auto join_started_at = std::chrono::steady_clock::now();
+  root_mate->Stop();
+  if (root_mate_thread.joinable()) root_mate_thread.join();
+  const auto root_mate_join_ms =
+      std::chrono::duration_cast<std::chrono::milliseconds>(
+          std::chrono::steady_clock::now() - join_started_at)
+          .count();
+
   {
     std::lock_guard<std::mutex> lock(watchdog_mutex);
     search_done = true;
@@ -931,33 +1007,37 @@ void USIEngine::CmdGo(const std::vector<std::string>& parts) {
            << " projected=" << decision.projected_remaining
            << " best_changes=" << decision.best_changes
            << " extension=" << (decision.extension_active ? 1 : 0)
-           << " root_mate_cancelled="
-           << (result.root_mate_cancelled ? 1 : 0);
+           << " root_guard_cancelled="
+           << (result.root_guard_cancelled ? 1 : 0);
     Log(timing.str());
   }
 
-  // If MCTS finishes first, preserve the original clock-scaled grace period
-  // for root df-pn. The grace period is capped by DfPnMaxTime and by the move
-  // deadline, so it cannot recreate the old tournament time overruns.
-  auto dfpn_wait_deadline =
-      std::chrono::steady_clock::now() +
-      std::chrono::milliseconds(time_budget.root_dfpn_grace_ms);
-  dfpn_wait_deadline = std::min(dfpn_wait_deadline, dfpn_time_deadline);
-  if (time_budget.hard_deadline_ms > 0) {
-    const auto move_deadline =
-        move_start_time +
-        std::chrono::milliseconds(time_budget.hard_deadline_ms);
-    dfpn_wait_deadline = std::min(dfpn_wait_deadline, move_deadline);
+  const bool root_mate_is_mate =
+      !root_mate->mate_move.is_null() &&
+      !MateDfpnSolver::IsNoMate(root_mate->mate_move);
+  const bool root_mate_is_nomate =
+      MateDfpnSolver::IsNoMate(root_mate->mate_move);
+  const char* root_mate_outcome =
+      root_mate_is_mate
+          ? "mate"
+          : root_mate_is_nomate
+                ? "nomate"
+                : root_mate_finished_before_stop ? "limit" : "stopped";
+  const char* root_mate_stop_source = "mcts";
+  if (root_mate->stopped_mcts.load(std::memory_order_acquire)) {
+    root_mate_stop_source = "mate";
+  } else if (root_mate_is_nomate || root_mate_finished_before_stop) {
+    root_mate_stop_source = "self";
+  } else if (watchdog_fired.load(std::memory_order_acquire)) {
+    root_mate_stop_source = "watchdog";
   }
+  Log("root_mate solver=" + std::string(root_mate->SolverName()) +
+      " outcome=" + root_mate_outcome +
+      " elapsed_ms=" + std::to_string(root_mate->elapsed_ms) +
+      " nodes=" + std::to_string(root_mate->NodesSearched()) +
+      " stop_source=" + root_mate_stop_source +
+      " join_ms=" + std::to_string(root_mate_join_ms));
 
-  {
-    std::unique_lock<std::mutex> lock(dfpn->mutex);
-    dfpn->cv.wait_until(lock, dfpn_wait_deadline, [dfpn] {
-      return dfpn->done.load(std::memory_order_acquire);
-    });
-  }
-  if (!dfpn->done.load(std::memory_order_acquire)) dfpn->Stop();
-  if (dfpn_thread.joinable()) dfpn_thread.join();
   if (time_management_mode_ != TimeManagementMode::kOff || time_debug_) {
     const auto response_elapsed_ms =
         std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -967,14 +1047,12 @@ void USIEngine::CmdGo(const std::vector<std::string>& parts) {
         std::to_string(response_elapsed_ms) +
         " deadline_ms=" +
         std::to_string(time_budget.response_deadline_ms) +
-        " dfpn_nodes=" +
-        std::to_string(dfpn->NodesSearched()));
+        " root_mate_nodes=" +
+        std::to_string(root_mate->NodesSearched()));
   }
 
   // --- Choose result ---
-  bool use_mate = dfpn->done.load(std::memory_order_acquire) &&
-                  !dfpn->mate_move.is_null() &&
-                  !MateDfpnSolver::IsNoMate(dfpn->mate_move);
+  bool use_mate = root_mate_is_mate;
 
   // Defense in depth: a root df-pn result must not replace MCTS when its very
   // first move enters a repetition. The solver now adjudicates these nodes
@@ -982,30 +1060,31 @@ void USIEngine::CmdGo(const std::vector<std::string>& parts) {
   // regression from turning an OUTE_SENNICHITE loss into bestmove.
   if (use_mate) {
     const auto repetition =
-        RootMoveRepetitionResult(board_, dfpn->mate_move);
+        RootMoveRepetitionResult(board_, root_mate->mate_move);
     if (repetition != ShogiBoard::RepetitionResult::kNone) {
-      Log("Rejected root df-pn move " + dfpn->mate_move.ToString() +
+      Log("Rejected root mate move " + root_mate->mate_move.ToString() +
           ": repetition=" + RepetitionResultName(repetition));
       use_mate = false;
     }
   }
 
   if (use_mate) {
-    auto pv = dfpn->Pv();
+    auto pv = root_mate->Pv();
     std::string pv_str;
     for (const auto& m : pv) {
       if (!pv_str.empty()) pv_str += " ";
       pv_str += m.ToString();
     }
-    if (pv_str.empty()) pv_str = dfpn->mate_move.ToString();
+    if (pv_str.empty()) pv_str = root_mate->mate_move.ToString();
 
     int mate_ply = (int)pv.size();
-    Log("Root df-pn found mate in " + std::to_string(mate_ply) + " ply");
+    Log("Root mate solver found mate in " + std::to_string(mate_ply) +
+        " ply");
 
     Send("info depth 1 score mate " + std::to_string((mate_ply + 1) / 2) +
-         " nodes " + std::to_string(dfpn->NodesSearched()) +
+         " nodes " + std::to_string(root_mate->NodesSearched()) +
          " pv " + pv_str);
-    Send("bestmove " + dfpn->mate_move.ToString());
+    Send("bestmove " + root_mate->mate_move.ToString());
     return;
   }
 

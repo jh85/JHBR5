@@ -17,29 +17,6 @@ int ActiveMoveCap(const TimeControl& control, const TimeOptions& options) {
   return cap;
 }
 
-void SetDfpnSchedule(const TimeControl& control, const TimeOptions& options,
-                     TimeBudget* budget) {
-  const int64_t available_ms = static_cast<int64_t>(control.main_time_ms) +
-                               control.increment_ms + control.byoyomi_ms;
-  if (available_ms <= 0) {
-    budget->root_dfpn_grace_ms = 300;
-    budget->root_dfpn_nodes = 100000;
-  } else if (available_ms < 10000) {
-    budget->root_dfpn_grace_ms = 100;
-    budget->root_dfpn_nodes = 10000;
-  } else if (available_ms < 60000) {
-    budget->root_dfpn_grace_ms = 300;
-    budget->root_dfpn_nodes = 100000;
-  } else if (available_ms < 300000) {
-    budget->root_dfpn_grace_ms = 500;
-    budget->root_dfpn_nodes = 500000;
-  } else {
-    budget->root_dfpn_grace_ms = 1000;
-    budget->root_dfpn_nodes = 2000000;
-  }
-  budget->root_dfpn_time_ms = options.dfpn_max_time_ms;
-}
-
 TimeBudget ComputeLegacy(const TimeControl& control,
                          const TimeOptions& options) {
   TimeBudget budget;
@@ -69,8 +46,6 @@ TimeBudget ComputeLegacy(const TimeControl& control,
     }
   }
 
-  SetDfpnSchedule(control, options, &budget);
-
   if (control.move_time_ms > 0) {
     budget.hard_deadline_ms = control.move_time_ms;
   } else if (budget.active_move_cap_ms > 0) {
@@ -80,11 +55,6 @@ TimeBudget ComputeLegacy(const TimeControl& control,
         static_cast<int>(budget.mcts_time_seconds * 1000.0f) + 2000;
   }
 
-  if (budget.hard_deadline_ms > 0) {
-    budget.root_dfpn_time_ms =
-        std::min(budget.root_dfpn_time_ms,
-                 std::max(budget.hard_deadline_ms - 50, 1));
-  }
   return budget;
 }
 
@@ -222,8 +192,6 @@ TimeBudget TimeManager::Compute(const TimeControl& control,
   if (options.mode == TimeManagementMode::kOn) {
     budget.mcts_time_seconds = latest_ms / 1000.0f;
     budget.hard_deadline_ms = response_ms;
-    budget.root_dfpn_time_ms =
-        std::min(options.dfpn_max_time_ms, std::max(response_ms - 10, 1));
   }
   return budget;
 }

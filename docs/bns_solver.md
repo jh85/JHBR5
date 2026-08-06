@@ -280,6 +280,17 @@ or the original tree df-pn. Result handling, the repetition boundary
 check, and info output are unchanged; both solvers share the same
 interface by construction.
 
+Root mate time is owned by the main MCTS lifecycle. The worker is released
+after `Search::Run()` has reset its stop state, a proved mate immediately stops
+MCTS, and every MCTS exit immediately stops and joins the root mate worker.
+There is no post-MCTS grace period or independent wall-time limit. BNS uses an
+effectively unlimited node count because its tables are fixed-size; the
+optional tree df-pn keeps a 2,000,000-node cap as a linear-memory guard. The
+move watchdog stops both workers at the shared response deadline.
+
+The retired `DfPnMaxTime` option is accepted but ignored for compatibility
+with existing engine configuration files.
+
 A/B strength test (2026-08-04): 200 opening pairs (400 games, colors
 swapped) from a book-derived balanced suite, byoyomi 500 ms, TensorRT
 epoch-3 148-plane model on an RTX 3090, zero failed games.

@@ -98,13 +98,22 @@ overshoot the exact limit by work already gathered into their batches.
 | `LeafMateMode` | `shallow` | `off`, `shallow` | Tune | Enables or disables depth-bounded mate checks before NN evaluation |
 | `LeafMateDepth` | 5 | 1--7 | Tune | Rounded down to one of 1, 3, 5, 7 |
 | `RootMateDepth` | 7 | 0--7 | Tune/safety | Rejects root candidates allowing an opponent mate; zero disables, positive values round down to odd |
-| `DfPnMaxTime` | 4000 ms | 100--60,000 | Tune/time | Wall-time cap for concurrent root DFPN |
 | `MaxMoveTime` | 0 | 0--300,000 ms | Operational | Hard move cap; zero disables |
 | `MaxMoveTime1m` | 0 | 0--60,000 ms | Operational | Replaces `MaxMoveTime` when remaining main time is below 60 seconds; zero disables |
 | `TimeManagement` | `shadow` | `off`, `shadow`, `on` | Operational/test | `off` uses only the legacy allocator; `shadow` logs adaptive decisions while legacy timing controls play; `on` enables adaptive stopping |
 | `MoveOverheadMs` | 100 ms | 0--5000 | Operational/safety | Reserved from the legal clock and explicit move-time deadline in adaptive mode |
 | `TimeMaxExtensionPercent` | 175 | 100--300 | Tune/time | Maximum adaptive extension as a percentage of target time; below 60 seconds it is capped at 125%, and below 10 seconds extensions are disabled |
 | `TimeDebug` | `false` | check | Operational | Emits the calculated time points before search; shadow/on always emit one final `time_result` record |
+
+The concurrent root mate solver has no independent time or BNS node option.
+It starts with MCTS, stops as soon as MCTS ends, and stops MCTS immediately
+when it proves mate. Both workers share the move's hard response deadline. The
+fixed-table BNS solver runs without a playing-strength node cap; the optional
+tree df-pn solver retains a fixed 2,000,000-node memory/resource cap because
+its linear node pool grows with that value.
+
+`DfPnMaxTime` is still accepted for compatibility with old configuration files,
+but it is no longer advertised and has no effect.
 
 `LeafMateMode=dfpn` is accepted only for old configuration compatibility and
 is treated as `off`. It is no longer advertised.

@@ -1,10 +1,15 @@
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <cstdio>
+#include <limits>
 #include <memory>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
+#include "mate/bns.h"
 #include "mcts/uct_search.h"
 #include "shogi/bitboard.h"
 #include "shogi/board.h"
@@ -181,12 +186,98 @@ void TestAdaptiveDeadlineStopsWorkers() {
             result.time_decision.reason == jhbr2::TimeStopReason::kLatest);
 }
 
+void TestStartedHookKeepsEarlyStop() {
+  ShogiBoard start;
+  start.SetStartPos();
+
+  jhbr2::NNEvaluator evaluator("", false, 0, 2);
+  SearchConfig config;
+  config.workers_per_gpu = 2;
+  config.minibatch_size = 8;
+  config.max_nodes = 1000000;
+  config.max_time = 0.0f;
+  config.leaf_mate_depth = 0;
+  config.root_mate_depth = 0;
+
+  Search search({&evaluator}, config);
+  int started_calls = 0;
+  const SearchResult result = search.Run(
+      start, start.Hash(), {}, Search::Clock::now(), [&] {
+        ++started_calls;
+        // Models a root mate worker proving mate at the first possible
+        // instant. Run() must not clear this request after the callback.
+        search.Stop();
+      });
+
+  Check("search-start hook runs exactly once", started_calls == 1);
+  Check("search-start hook returns a legal fallback move",
+        !result.best_move.is_null() &&
+            IsLegalMove(start, result.best_move));
+  Check("early helper stop is not erased", result.nodes < config.max_nodes);
+  Check("early helper stop is reported",
+        result.time_decision.reason == jhbr2::TimeStopReason::kExternal);
+}
+
+void TestRootMateWorkerStopsMcts() {
+  ShogiBoard mate_position;
+  Check("root-mate integration position parses",
+        mate_position.SetFromSfen(
+            "4k4/9/4G4/9/9/9/9/9/8K b G 1"));
+  if (mate_position.GenerateLegalMoves().size() <= 1) {
+    Check("root-mate integration position has alternatives", false);
+    return;
+  }
+
+  jhbr2::NNEvaluator evaluator("", false, 0, 2);
+  SearchConfig config;
+  config.workers_per_gpu = 2;
+  config.minibatch_size = 8;
+  config.max_nodes = 10000000;
+  config.max_time = 2.0f;
+  config.leaf_mate_depth = 0;
+  config.root_mate_depth = 0;
+
+  Search search({&evaluator}, config);
+  jhbr2::MateBnsSolver mate_solver(
+      /*tt_mb=*/4, std::numeric_limits<size_t>::max());
+  mate_solver.set_move_cache_mb(2);
+  Move mate_move;
+  std::atomic<bool> proved_mate{false};
+  std::thread mate_thread;
+
+  const SearchResult result = search.Run(
+      mate_position, mate_position.Hash(), {}, Search::Clock::now(), [&] {
+        mate_thread = std::thread([&] {
+          mate_move = mate_solver.search(
+              mate_position, std::numeric_limits<size_t>::max(),
+              Search::Clock::now() + std::chrono::seconds(1));
+          if (!mate_move.is_null() &&
+              !jhbr2::MateBnsSolver::IsNoMate(mate_move)) {
+            proved_mate.store(true, std::memory_order_release);
+            search.Stop();
+          }
+        });
+      });
+
+  mate_solver.stop();
+  if (mate_thread.joinable()) mate_thread.join();
+  Check("root mate worker proves the test mate",
+        proved_mate.load(std::memory_order_acquire));
+  Check("proved root mate stops MCTS before its node cap",
+        result.nodes < config.max_nodes);
+  Check("mate-stopped MCTS retains a legal fallback",
+        !result.best_move.is_null() &&
+            IsLegalMove(mate_position, result.best_move));
+}
+
 }  // namespace
 
 int main() {
   lczero::ShogiTables::Init();
   TestConcurrentSearchAndReuse();
   TestAdaptiveDeadlineStopsWorkers();
+  TestStartedHookKeepsEarlyStop();
+  TestRootMateWorkerStopsMcts();
   std::printf("\n=== Lock-free MCTS search: %d failed ===\n", failures);
   return failures == 0 ? 0 : 1;
 }

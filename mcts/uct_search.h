@@ -31,6 +31,7 @@ struct SearchInfo {
   jhbr2::NNCacheStats nn_cache;
 };
 using InfoCallback = std::function<void(const SearchInfo&)>;
+using SearchStartedCallback = std::function<void()>;
 
 struct SearchConfig {
   float c_init = 1.25f;
@@ -77,7 +78,7 @@ struct SearchResult {
   jhbr2::NNCacheStats nn_cache;
   jhbr2::TimeBudget time_budget;
   jhbr2::AdaptiveTimeDecision time_decision;
-  bool root_mate_cancelled = false;
+  bool root_guard_cancelled = false;
 };
 
 class Search;
@@ -110,7 +111,8 @@ class Search {
 
   SearchResult Run(lczero::ShogiBoard board, uint64_t starting_pos_key,
                    const std::vector<lczero::Move>& moves,
-                   Clock::time_point move_start = Clock::now());
+                   Clock::time_point move_start = Clock::now(),
+                   SearchStartedCallback on_search_started = nullptr);
   // Called from the acknowledged isready phase. Clears game-specific tree
   // state and NN entries while preserving GPU evaluators, workers, and cache
   // bucket allocation.
@@ -155,7 +157,7 @@ class Search {
   std::atomic<int> last_time_check_ms_{-1000000};
   std::atomic<bool> time_check_busy_{false};
   int in_flight_playouts_ = 0;
-  bool root_mate_cancelled_ = false;
+  bool root_guard_cancelled_ = false;
   bool moves_left_supported_ = false;
   mutable std::mutex info_mutex_;
   int last_info_ms_ = 0;
