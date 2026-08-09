@@ -9,9 +9,17 @@
 
 #pragma once
 
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
 #include <cstdint>
+#include <functional>
 #include <memory>
+#include <mutex>
+#include <optional>
 #include <string>
+#include <thread>
+#include <unordered_map>
 #include <vector>
 
 #ifdef USE_TENSORRT
@@ -22,6 +30,7 @@
 #include "book/opening_book.h"
 #include "mcts/uct_search.h"
 #include "shogi/board.h"
+#include "usi/root_mate_state.h"
 #include "usi/time_manager.h"
 
 namespace jhbr2 {
@@ -53,6 +62,54 @@ class USIEngine {
   void Send(const std::string& msg);
   void Log(const std::string& msg);
   void EnsureSearch();
+
+  // Option parsing. Each registered lambda implements one setoption name and
+  // may throw std::invalid_argument for malformed values.
+  enum class OptionSetResult {
+    kSetAndLog,     // Value was set; emit the generic "Set name = value" log.
+    kAlreadyLogged  // Handler already logged; skip the generic log.
+  };
+  void RegisterOptionParsers();
+  std::unordered_map<std::string,
+                     std::function<OptionSetResult(const std::string&,
+                                                   const std::string&)>>
+      option_parsers_;
+
+  // "go" command decomposition.
+  struct GoParameters {
+    TimeControl time_control;
+    int nodes_limit = 0;
+    bool infinite = false;
+    bool ponder = false;
+  };
+  GoParameters ParseGoParameters(
+      const std::vector<std::string>& parts) const;
+  std::optional<std::string> ProbeOpeningBook();
+  struct RootMateLaunch {
+    std::shared_ptr<RootMateState> state;
+    std::thread search_thread;
+    std::thread watchdog_thread;
+  };
+  RootMateLaunch LaunchRootMateSearch(
+      const TimeBudget& time_budget,
+      std::chrono::steady_clock::time_point move_start_time,
+      dlshogi_mcts::Search* mcts_search,
+      std::mutex& watchdog_mutex,
+      std::condition_variable& watchdog_cv,
+      bool& search_done,
+      std::atomic<bool>& watchdog_fired);
+  std::string FormatTimeBudgetForLog(const TimeBudget& budget,
+                                     bool compact) const;
+  void LogTimeResult(const dlshogi_mcts::SearchResult& result);
+  void LogTimeResponse(std::chrono::steady_clock::time_point move_start_time,
+                       const TimeBudget& time_budget,
+                       const RootMateState& state);
+  void LogRootMateResult(const RootMateState& state,
+                         bool finished_before_stop,
+                         bool watchdog_fired,
+                         std::int64_t join_ms);
+  void SelectAndReportBestMove(const dlshogi_mcts::SearchResult& result,
+                               const RootMateState& root_mate);
 
   // --- Members ---
   lczero::ShogiBoard board_;

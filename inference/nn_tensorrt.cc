@@ -55,25 +55,6 @@ class TrtLogger : public nvinfer1::ILogger {
 };
 
 // =====================================================================
-// Softmax helper
-// =====================================================================
-
-static bool Softmax(float* data, int size) {
-  for (int i = 0; i < size; ++i) {
-    if (!std::isfinite(data[i])) return false;
-  }
-  float max_val = *std::max_element(data, data + size);
-  float sum = 0.0f;
-  for (int i = 0; i < size; i++) {
-    data[i] = std::exp(data[i] - max_val);
-    sum += data[i];
-  }
-  if (!std::isfinite(sum) || sum <= 0.0f) return false;
-  for (int i = 0; i < size; i++) data[i] /= sum;
-  return true;
-}
-
-// =====================================================================
 // CUDA helpers
 // =====================================================================
 
@@ -85,47 +66,199 @@ static bool Softmax(float* data, int size) {
   } \
 } while(0)
 
+namespace {
+
+// Lightweight RAII wrappers for CUDA allocations. They are movable but not
+// copyable, and they free the underlying resource in the destructor.
+
+class CudaDeviceBuffer {
+ public:
+  CudaDeviceBuffer() = default;
+  explicit CudaDeviceBuffer(size_t size) { Allocate(size); }
+  ~CudaDeviceBuffer() { Free(); }
+
+  CudaDeviceBuffer(CudaDeviceBuffer&& other) noexcept
+      : data_(other.data_), size_(other.size_) {
+    other.data_ = nullptr;
+    other.size_ = 0;
+  }
+  CudaDeviceBuffer& operator=(CudaDeviceBuffer&& other) noexcept {
+    if (this != &other) {
+      Free();
+      data_ = other.data_;
+      size_ = other.size_;
+      other.data_ = nullptr;
+      other.size_ = 0;
+    }
+    return *this;
+  }
+
+  CudaDeviceBuffer(const CudaDeviceBuffer&) = delete;
+  CudaDeviceBuffer& operator=(const CudaDeviceBuffer&) = delete;
+
+  bool Allocate(size_t size) {
+    Free();
+    if (size == 0) return true;
+    cudaError_t err = cudaMalloc(&data_, size);
+    if (err != cudaSuccess) {
+      fprintf(stderr, "[CUDA] cudaMalloc failed: %s\n",
+              cudaGetErrorString(err));
+      data_ = nullptr;
+      return false;
+    }
+    size_ = size;
+    return true;
+  }
+
+  void Free() {
+    if (data_) {
+      cudaFree(data_);
+      data_ = nullptr;
+      size_ = 0;
+    }
+  }
+
+  void* data() const { return data_; }
+  size_t size() const { return size_; }
+  bool valid() const { return data_ != nullptr; }
+  explicit operator bool() const { return valid(); }
+
+ private:
+  void* data_ = nullptr;
+  size_t size_ = 0;
+};
+
+class CudaHostBuffer {
+ public:
+  CudaHostBuffer() = default;
+  explicit CudaHostBuffer(size_t size) { Allocate(size); }
+  ~CudaHostBuffer() { Free(); }
+
+  CudaHostBuffer(CudaHostBuffer&& other) noexcept
+      : data_(other.data_), size_(other.size_) {
+    other.data_ = nullptr;
+    other.size_ = 0;
+  }
+  CudaHostBuffer& operator=(CudaHostBuffer&& other) noexcept {
+    if (this != &other) {
+      Free();
+      data_ = other.data_;
+      size_ = other.size_;
+      other.data_ = nullptr;
+      other.size_ = 0;
+    }
+    return *this;
+  }
+
+  CudaHostBuffer(const CudaHostBuffer&) = delete;
+  CudaHostBuffer& operator=(const CudaHostBuffer&) = delete;
+
+  bool Allocate(size_t size) {
+    Free();
+    if (size == 0) return true;
+    cudaError_t err = cudaMallocHost(&data_, size);
+    if (err != cudaSuccess) {
+      fprintf(stderr, "[CUDA] cudaMallocHost failed: %s\n",
+              cudaGetErrorString(err));
+      data_ = nullptr;
+      return false;
+    }
+    size_ = size;
+    return true;
+  }
+
+  void Free() {
+    if (data_) {
+      cudaFreeHost(data_);
+      data_ = nullptr;
+      size_ = 0;
+    }
+  }
+
+  void* data() const { return data_; }
+  size_t size() const { return size_; }
+  bool valid() const { return data_ != nullptr; }
+  explicit operator bool() const { return valid(); }
+
+  uint8_t* as_u8() const { return static_cast<uint8_t*>(data_); }
+  float* as_float() const { return static_cast<float*>(data_); }
+
+ private:
+  void* data_ = nullptr;
+  size_t size_ = 0;
+};
+
+class CudaStream {
+ public:
+  CudaStream() = default;
+  ~CudaStream() { Destroy(); }
+
+  CudaStream(CudaStream&& other) noexcept : stream_(other.stream_) {
+    other.stream_ = nullptr;
+  }
+  CudaStream& operator=(CudaStream&& other) noexcept {
+    if (this != &other) {
+      Destroy();
+      stream_ = other.stream_;
+      other.stream_ = nullptr;
+    }
+    return *this;
+  }
+
+  CudaStream(const CudaStream&) = delete;
+  CudaStream& operator=(const CudaStream&) = delete;
+
+  bool Create() {
+    Destroy();
+    cudaError_t err = cudaStreamCreate(&stream_);
+    if (err != cudaSuccess) {
+      fprintf(stderr, "[CUDA] cudaStreamCreate failed: %s\n",
+              cudaGetErrorString(err));
+      stream_ = nullptr;
+      return false;
+    }
+    return true;
+  }
+
+  void Destroy() {
+    if (stream_) {
+      cudaStreamDestroy(stream_);
+      stream_ = nullptr;
+    }
+  }
+
+  cudaStream_t get() const { return stream_; }
+  explicit operator bool() const { return stream_ != nullptr; }
+
+ private:
+  cudaStream_t stream_ = nullptr;
+};
+
+}  // namespace
+
 // =====================================================================
 // Per-slot resources: one IExecutionContext + stream + buffers.
 // =====================================================================
 
 struct Slot {
   std::unique_ptr<nvinfer1::IExecutionContext> context;
-  cudaStream_t stream = nullptr;
-  void* d_input = nullptr;       // dlshogi input1 / native unpack target (float)
-  void* d_input2 = nullptr;      // dlshogi input2 (float)
-  void* d_packed_f1 = nullptr;   // native: packed features1 bits (device)
-  void* d_packed_f2 = nullptr;   // native: packed features2 bits (device)
-  void* d_policy = nullptr;
-  void* d_wdl = nullptr;
-  void* d_mlh = nullptr;
-  float* h_input = nullptr;        // dlshogi input1 (pinned float)
-  float* h_input2 = nullptr;       // dlshogi input2 (pinned float)
-  uint8_t* h_packed_f1 = nullptr;  // native: packed features1 bits (pinned)
-  uint8_t* h_packed_f2 = nullptr;  // native: packed features2 bits (pinned)
-  float* h_policy = nullptr;
-  float* h_wdl = nullptr;
-  float* h_mlh = nullptr;
+  CudaStream stream;
+  CudaDeviceBuffer d_input;       // dlshogi input1 / native unpack target (float)
+  CudaDeviceBuffer d_input2;      // dlshogi input2 (float)
+  CudaDeviceBuffer d_packed_f1;   // native: packed features1 bits
+  CudaDeviceBuffer d_packed_f2;   // native: packed features2 bits
+  CudaDeviceBuffer d_policy;
+  CudaDeviceBuffer d_wdl;
+  CudaDeviceBuffer d_mlh;
+  CudaHostBuffer h_input;         // dlshogi input1 (pinned float)
+  CudaHostBuffer h_input2;        // dlshogi input2 (pinned float)
+  CudaHostBuffer h_packed_f1;     // native: packed features1 bits (pinned)
+  CudaHostBuffer h_packed_f2;     // native: packed features2 bits (pinned)
+  CudaHostBuffer h_policy;
+  CudaHostBuffer h_wdl;
+  CudaHostBuffer h_mlh;
   std::atomic_flag in_use = ATOMIC_FLAG_INIT;
   std::atomic<uint64_t> sequence{0};
-
-  ~Slot() {
-    if (d_input)     cudaFree(d_input);
-    if (d_input2)    cudaFree(d_input2);
-    if (d_packed_f1) cudaFree(d_packed_f1);
-    if (d_packed_f2) cudaFree(d_packed_f2);
-    if (d_policy)    cudaFree(d_policy);
-    if (d_wdl)       cudaFree(d_wdl);
-    if (d_mlh)       cudaFree(d_mlh);
-    if (h_input)     cudaFreeHost(h_input);
-    if (h_input2)    cudaFreeHost(h_input2);
-    if (h_packed_f1) cudaFreeHost(h_packed_f1);
-    if (h_packed_f2) cudaFreeHost(h_packed_f2);
-    if (h_policy)    cudaFreeHost(h_policy);
-    if (h_wdl)       cudaFreeHost(h_wdl);
-    if (h_mlh)       cudaFreeHost(h_mlh);
-    if (stream)      cudaStreamDestroy(stream);
-  }
 };
 
 namespace {
@@ -356,38 +489,30 @@ NNEvaluator::NNEvaluator(const std::string& engine_path, bool /*use_gpu*/,
       fprintf(stderr, "[TRT] Failed to create execution context (slot=%d)\n", s);
       continue;
     }
-    CUDA_CHECK(cudaStreamCreate(&slot->stream));
-    CUDA_CHECK(cudaMalloc(&slot->d_input,  static_cast<size_t>(B) * C * 81 * sizeof(float)));
+    slot->stream.Create();
+    slot->d_input.Allocate(static_cast<size_t>(B) * C * 81 * sizeof(float));
     if (impl_->model_format == ModelFormat::kDlshogi) {
-      CUDA_CHECK(cudaMalloc(&slot->d_input2, static_cast<size_t>(B) * C2 * 81 * sizeof(float)));
+      slot->d_input2.Allocate(static_cast<size_t>(B) * C2 * 81 * sizeof(float));
     } else {
-      CUDA_CHECK(cudaMalloc(&slot->d_packed_f1, static_cast<size_t>(B) * kPackedF1Bytes));
-      CUDA_CHECK(cudaMalloc(&slot->d_packed_f2, static_cast<size_t>(B) * kPackedF2Bytes));
+      slot->d_packed_f1.Allocate(static_cast<size_t>(B) * kPackedF1Bytes);
+      slot->d_packed_f2.Allocate(static_cast<size_t>(B) * kPackedF2Bytes);
     }
-    CUDA_CHECK(cudaMalloc(&slot->d_policy, static_cast<size_t>(B) * P * sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&slot->d_wdl,    static_cast<size_t>(B) * value_planes * sizeof(float)));
+    slot->d_policy.Allocate(static_cast<size_t>(B) * P * sizeof(float));
+    slot->d_wdl.Allocate(static_cast<size_t>(B) * value_planes * sizeof(float));
     if (impl_->mlh_idx >= 0) {
-      CUDA_CHECK(cudaMalloc(&slot->d_mlh,
-                            static_cast<size_t>(B) * sizeof(float)));
+      slot->d_mlh.Allocate(static_cast<size_t>(B) * sizeof(float));
     }
     if (impl_->model_format == ModelFormat::kDlshogi) {
-      CUDA_CHECK(cudaMallocHost(reinterpret_cast<void**>(&slot->h_input),
-                                static_cast<size_t>(B) * C * 81 * sizeof(float)));
-      CUDA_CHECK(cudaMallocHost(reinterpret_cast<void**>(&slot->h_input2),
-                                static_cast<size_t>(B) * C2 * 81 * sizeof(float)));
+      slot->h_input.Allocate(static_cast<size_t>(B) * C * 81 * sizeof(float));
+      slot->h_input2.Allocate(static_cast<size_t>(B) * C2 * 81 * sizeof(float));
     } else {
-      CUDA_CHECK(cudaMallocHost(reinterpret_cast<void**>(&slot->h_packed_f1),
-                                static_cast<size_t>(B) * kPackedF1Bytes));
-      CUDA_CHECK(cudaMallocHost(reinterpret_cast<void**>(&slot->h_packed_f2),
-                                static_cast<size_t>(B) * kPackedF2Bytes));
+      slot->h_packed_f1.Allocate(static_cast<size_t>(B) * kPackedF1Bytes);
+      slot->h_packed_f2.Allocate(static_cast<size_t>(B) * kPackedF2Bytes);
     }
-    CUDA_CHECK(cudaMallocHost(reinterpret_cast<void**>(&slot->h_policy),
-                              static_cast<size_t>(B) * P * sizeof(float)));
-    CUDA_CHECK(cudaMallocHost(reinterpret_cast<void**>(&slot->h_wdl),
-                              static_cast<size_t>(B) * value_planes * sizeof(float)));
+    slot->h_policy.Allocate(static_cast<size_t>(B) * P * sizeof(float));
+    slot->h_wdl.Allocate(static_cast<size_t>(B) * value_planes * sizeof(float));
     if (impl_->mlh_idx >= 0) {
-      CUDA_CHECK(cudaMallocHost(reinterpret_cast<void**>(&slot->h_mlh),
-                                static_cast<size_t>(B) * sizeof(float)));
+      slot->h_mlh.Allocate(static_cast<size_t>(B) * sizeof(float));
     }
     impl_->slots.push_back(std::move(slot));
   }
@@ -506,18 +631,18 @@ std::vector<NNOutput> NNEvaluator::EvaluateBatchSlot(
         uint64_t input_hash = 1469598103934665603ULL;
         if (is_dlshogi) {
           input_hash = Fnv1a(
-              slot.h_input + static_cast<size_t>(element) * C * sq,
+              slot.h_input.as_float() + static_cast<size_t>(element) * C * sq,
               static_cast<size_t>(C) * sq * sizeof(float), input_hash);
           input_hash = Fnv1a(
-              slot.h_input2 + static_cast<size_t>(element) * C2 * sq,
+              slot.h_input2.as_float() + static_cast<size_t>(element) * C2 * sq,
               static_cast<size_t>(C2) * sq * sizeof(float), input_hash);
         } else {
           input_hash = Fnv1a(
-              slot.h_packed_f1 +
+              slot.h_packed_f1.as_u8() +
                   static_cast<size_t>(element) * kPackedF1Bytes,
               kPackedF1Bytes, input_hash);
           input_hash = Fnv1a(
-              slot.h_packed_f2 +
+              slot.h_packed_f2.as_u8() +
                   static_cast<size_t>(element) * kPackedF2Bytes,
               kPackedF2Bytes, input_hash);
         }
@@ -527,12 +652,12 @@ std::vector<NNOutput> NNEvaluator::EvaluateBatchSlot(
         details << " raw_wdl=";
         for (int i = 0; i < value_planes; ++i) {
           if (i != 0) details << ',';
-          details << slot.h_wdl[element * value_planes + i];
+          details << slot.h_wdl.as_float()[element * value_planes + i];
         }
         if (impl_->mlh_idx >= 0) {
-          details << " raw_mlh=" << slot.h_mlh[element];
+          details << " raw_mlh=" << slot.h_mlh.as_float()[element];
         }
-        const float* policy = slot.h_policy + static_cast<size_t>(element) * P;
+        const float* policy = slot.h_policy.as_float() + static_cast<size_t>(element) * P;
         int policy_nonfinite = 0;
         float policy_min = std::numeric_limits<float>::infinity();
         float policy_max = -std::numeric_limits<float>::infinity();
@@ -560,15 +685,15 @@ std::vector<NNOutput> NNEvaluator::EvaluateBatchSlot(
   }
 
   if (is_dlshogi) {
-    std::fill(slot.h_input,
-              slot.h_input + static_cast<size_t>(run_batch) * C * sq, 0.0f);
-    std::fill(slot.h_input2,
-              slot.h_input2 + static_cast<size_t>(run_batch) * C2 * sq, 0.0f);
+    std::fill(slot.h_input.as_float(),
+              slot.h_input.as_float() + static_cast<size_t>(run_batch) * C * sq, 0.0f);
+    std::fill(slot.h_input2.as_float(),
+              slot.h_input2.as_float() + static_cast<size_t>(run_batch) * C2 * sq, 0.0f);
 
     for (int b = 0; b < batch_size; b++) {
       EncodeDlshogiPosition(batch[b].first,
-                            slot.h_input + static_cast<size_t>(b) * C * sq,
-                            slot.h_input2 + static_cast<size_t>(b) * C2 * sq);
+                            slot.h_input.as_float() + static_cast<size_t>(b) * C * sq,
+                            slot.h_input2.as_float() + static_cast<size_t>(b) * C2 * sq);
     }
     input_prepared = true;
 
@@ -577,25 +702,25 @@ std::vector<NNOutput> NNEvaluator::EvaluateBatchSlot(
     const bool shapes_ok = slot.context->setInputShape("input1", input1_dims) &&
                            slot.context->setInputShape("input2", input2_dims);
     const bool addresses_ok =
-        slot.context->setTensorAddress("input1", slot.d_input) &&
-        slot.context->setTensorAddress("input2", slot.d_input2) &&
-        slot.context->setTensorAddress("output_policy", slot.d_policy) &&
-        slot.context->setTensorAddress("output_value", slot.d_wdl);
+        slot.context->setTensorAddress("input1", slot.d_input.data()) &&
+        slot.context->setTensorAddress("input2", slot.d_input2.data()) &&
+        slot.context->setTensorAddress("output_policy", slot.d_policy.data()) &&
+        slot.context->setTensorAddress("output_value", slot.d_wdl.data());
     if (!shapes_ok || !addresses_ok) {
       log_failure("tensor_binding", "setInputShape/setTensorAddress failed", 0);
       return InvalidResults(batch_size);
     }
 
-    cuda_error = cudaMemcpyAsync(slot.d_input, slot.h_input,
+    cuda_error = cudaMemcpyAsync(slot.d_input.data(), slot.h_input.as_float(),
         static_cast<size_t>(run_batch) * C * sq * sizeof(float),
-        cudaMemcpyHostToDevice, slot.stream);
+        cudaMemcpyHostToDevice, slot.stream.get());
     if (cuda_error != cudaSuccess) {
       log_failure("cuda_h2d_input1", cudaGetErrorString(cuda_error), 0);
       return InvalidResults(batch_size);
     }
-    cuda_error = cudaMemcpyAsync(slot.d_input2, slot.h_input2,
+    cuda_error = cudaMemcpyAsync(slot.d_input2.data(), slot.h_input2.as_float(),
         static_cast<size_t>(run_batch) * C2 * sq * sizeof(float),
-        cudaMemcpyHostToDevice, slot.stream);
+        cudaMemcpyHostToDevice, slot.stream.get());
     if (cuda_error != cudaSuccess) {
       log_failure("cuda_h2d_input2", cudaGetErrorString(cuda_error), 0);
       return InvalidResults(batch_size);
@@ -605,27 +730,27 @@ std::vector<NNOutput> NNEvaluator::EvaluateBatchSlot(
     // vs ~48 KB of float planes), transfer, and expand on the GPU into d_input.
     // Zero first: padding rows (run_batch > batch_size) must read as empty, and
     // packing ORs bits in.
-    std::memset(slot.h_packed_f1, 0,
+    std::memset(slot.h_packed_f1.as_u8(), 0,
                 static_cast<size_t>(run_batch) * kPackedF1Bytes);
-    std::memset(slot.h_packed_f2, 0,
+    std::memset(slot.h_packed_f2.as_u8(), 0,
                 static_cast<size_t>(run_batch) * kPackedF2Bytes);
     for (int b = 0; b < batch_size; b++) {
       PackShogiPosition(batch[b].first,
-                        slot.h_packed_f1 + static_cast<size_t>(b) * kPackedF1Bytes,
-                        slot.h_packed_f2 + static_cast<size_t>(b) * kPackedF2Bytes);
+                        slot.h_packed_f1.as_u8() + static_cast<size_t>(b) * kPackedF1Bytes,
+                        slot.h_packed_f2.as_u8() + static_cast<size_t>(b) * kPackedF2Bytes);
     }
     input_prepared = true;
 
     nvinfer1::Dims4 input_dims{run_batch, C, 9, 9};
     bool bindings_ok = slot.context->setInputShape("input_planes", input_dims);
-    bindings_ok = slot.context->setTensorAddress("input_planes", slot.d_input) &&
+    bindings_ok = slot.context->setTensorAddress("input_planes", slot.d_input.data()) &&
                   bindings_ok;
-    bindings_ok = slot.context->setTensorAddress("policy", slot.d_policy) &&
+    bindings_ok = slot.context->setTensorAddress("policy", slot.d_policy.data()) &&
                   bindings_ok;
-    bindings_ok = slot.context->setTensorAddress("wdl", slot.d_wdl) &&
+    bindings_ok = slot.context->setTensorAddress("wdl", slot.d_wdl.data()) &&
                   bindings_ok;
     if (impl_->mlh_idx >= 0) {
-      bindings_ok = slot.context->setTensorAddress("mlh", slot.d_mlh) &&
+      bindings_ok = slot.context->setTensorAddress("mlh", slot.d_mlh.data()) &&
                     bindings_ok;
     }
     if (!bindings_ok) {
@@ -633,16 +758,16 @@ std::vector<NNOutput> NNEvaluator::EvaluateBatchSlot(
       return InvalidResults(batch_size);
     }
 
-    cuda_error = cudaMemcpyAsync(slot.d_packed_f1, slot.h_packed_f1,
+    cuda_error = cudaMemcpyAsync(slot.d_packed_f1.data(), slot.h_packed_f1.as_u8(),
         static_cast<size_t>(run_batch) * kPackedF1Bytes,
-        cudaMemcpyHostToDevice, slot.stream);
+        cudaMemcpyHostToDevice, slot.stream.get());
     if (cuda_error != cudaSuccess) {
       log_failure("cuda_h2d_packed_f1", cudaGetErrorString(cuda_error), 0);
       return InvalidResults(batch_size);
     }
-    cuda_error = cudaMemcpyAsync(slot.d_packed_f2, slot.h_packed_f2,
+    cuda_error = cudaMemcpyAsync(slot.d_packed_f2.data(), slot.h_packed_f2.as_u8(),
         static_cast<size_t>(run_batch) * kPackedF2Bytes,
-        cudaMemcpyHostToDevice, slot.stream);
+        cudaMemcpyHostToDevice, slot.stream.get());
     if (cuda_error != cudaSuccess) {
       log_failure("cuda_h2d_packed_f2", cudaGetErrorString(cuda_error), 0);
       return InvalidResults(batch_size);
@@ -650,9 +775,9 @@ std::vector<NNOutput> NNEvaluator::EvaluateBatchSlot(
     LaunchUnpackFeatures(run_batch, C,
         kShogiNumF1Planes, kPackedF1Bytes,
         kShogiNumF2Planes, kPackedF2Bytes,
-        static_cast<const uint8_t*>(slot.d_packed_f1),
-        static_cast<const uint8_t*>(slot.d_packed_f2),
-        static_cast<float*>(slot.d_input), slot.stream);
+        static_cast<const uint8_t*>(slot.d_packed_f1.data()),
+        static_cast<const uint8_t*>(slot.d_packed_f2.data()),
+        static_cast<float*>(slot.d_input.data()), slot.stream.get());
     cuda_error = cudaGetLastError();
     if (cuda_error != cudaSuccess) {
       log_failure("cuda_unpack_launch", cudaGetErrorString(cuda_error), 0);
@@ -660,36 +785,36 @@ std::vector<NNOutput> NNEvaluator::EvaluateBatchSlot(
     }
   }
 
-  if (!slot.context->enqueueV3(slot.stream)) {
+  if (!slot.context->enqueueV3(slot.stream.get())) {
     log_failure("tensorrt_enqueue", "enqueueV3 returned false", 0);
     return InvalidResults(batch_size);
   }
 
-  cuda_error = cudaMemcpyAsync(slot.h_policy, slot.d_policy,
+  cuda_error = cudaMemcpyAsync(slot.h_policy.as_float(), slot.d_policy.data(),
       static_cast<size_t>(run_batch) * P * sizeof(float),
-      cudaMemcpyDeviceToHost, slot.stream);
+      cudaMemcpyDeviceToHost, slot.stream.get());
   if (cuda_error != cudaSuccess) {
     log_failure("cuda_d2h_policy", cudaGetErrorString(cuda_error), 0);
     return InvalidResults(batch_size);
   }
-  cuda_error = cudaMemcpyAsync(slot.h_wdl, slot.d_wdl,
+  cuda_error = cudaMemcpyAsync(slot.h_wdl.as_float(), slot.d_wdl.data(),
       static_cast<size_t>(run_batch) * value_planes * sizeof(float),
-      cudaMemcpyDeviceToHost, slot.stream);
+      cudaMemcpyDeviceToHost, slot.stream.get());
   if (cuda_error != cudaSuccess) {
     log_failure("cuda_d2h_wdl", cudaGetErrorString(cuda_error), 0);
     return InvalidResults(batch_size);
   }
   if (impl_->mlh_idx >= 0) {
-    cuda_error = cudaMemcpyAsync(slot.h_mlh, slot.d_mlh,
+    cuda_error = cudaMemcpyAsync(slot.h_mlh.as_float(), slot.d_mlh.data(),
         static_cast<size_t>(run_batch) * 1 * sizeof(float),
-        cudaMemcpyDeviceToHost, slot.stream);
+        cudaMemcpyDeviceToHost, slot.stream.get());
     if (cuda_error != cudaSuccess) {
       log_failure("cuda_d2h_mlh", cudaGetErrorString(cuda_error), 0);
       return InvalidResults(batch_size);
     }
   }
 
-  cuda_error = cudaStreamSynchronize(slot.stream);
+  cuda_error = cudaStreamSynchronize(slot.stream.get());
   if (cuda_error != cudaSuccess) {
     log_failure("cuda_stream_sync", cudaGetErrorString(cuda_error), 0);
     return InvalidResults(batch_size);
@@ -702,14 +827,14 @@ std::vector<NNOutput> NNEvaluator::EvaluateBatchSlot(
     const auto& board = batch[b].first;
     const auto& legal_moves = batch[b].second;
 
-    result.moves_left = (impl_->mlh_idx >= 0) ? slot.h_mlh[b] : 0.0f;
+    result.moves_left = (impl_->mlh_idx >= 0) ? slot.h_mlh.as_float()[b] : 0.0f;
     if (!std::isfinite(result.moves_left)) {
       log_failure("raw_output", "non-finite moves-left output", b);
       return InvalidResults(batch_size);
     }
 
     if (is_dlshogi) {
-      float value_win = slot.h_wdl[b];
+      float value_win = slot.h_wdl.as_float()[b];
       if (!std::isfinite(value_win)) {
         log_failure("raw_output", "non-finite value output", b);
         return InvalidResults(batch_size);
@@ -722,8 +847,8 @@ std::vector<NNOutput> NNEvaluator::EvaluateBatchSlot(
       result.draw = 0.0f;
     } else {
       float wdl[3];
-      std::copy(slot.h_wdl + b * 3, slot.h_wdl + b * 3 + 3, wdl);
-      if (!Softmax(wdl, 3)) {
+      std::copy(slot.h_wdl.as_float() + b * 3, slot.h_wdl.as_float() + b * 3 + 3, wdl);
+      if (!SoftmaxInPlace(wdl, 3)) {
         log_failure("raw_output", "non-finite or invalid WDL logits", b);
         return InvalidResults(batch_size);
       }
@@ -734,43 +859,23 @@ std::vector<NNOutput> NNEvaluator::EvaluateBatchSlot(
       result.draw = wdl[1];
     }
 
-    float* logits = slot.h_policy + b * P;
-
-    std::vector<float> legal_logits(legal_moves.size());
-    float max_logit = -std::numeric_limits<float>::infinity();
-
-    for (size_t i = 0; i < legal_moves.size(); i++) {
-      int idx;
-      if (is_dlshogi) {
-        idx = DlshogiMoveToNNIndex(legal_moves[i], board.side_to_move());
-      } else {
-        Move m = legal_moves[i];
-        if (board.side_to_move() == lczero::WHITE) m.Flip();
-        idx = ShogiMoveToNNIndex(m);
-      }
-      if (idx >= 0 && idx < P) {
-        legal_logits[i] = logits[idx];
-        if (!std::isfinite(legal_logits[i])) {
-          log_failure("raw_output", "non-finite legal policy logit", b);
-          return InvalidResults(batch_size);
-        }
-      } else {
-        legal_logits[i] = -1000.0f;
-      }
-      max_logit = std::max(max_logit, legal_logits[i]);
+    float* logits = slot.h_policy.as_float() + b * P;
+    bool policy_ok;
+    if (is_dlshogi) {
+      policy_ok = LegalPolicySoftmax(
+          logits, P, legal_moves,
+          [&board](Move move) {
+            return DlshogiMoveToNNIndex(move, board.side_to_move());
+          },
+          &result.policy);
+    } else {
+      policy_ok = LegalPolicySoftmax(logits, P, legal_moves,
+                                     board.side_to_move(), &result.policy);
     }
-
-    result.policy.resize(legal_moves.size());
-    float total = 0.0f;
-    for (size_t i = 0; i < legal_moves.size(); i++) {
-      result.policy[i] = std::exp(legal_logits[i] - max_logit);
-      total += result.policy[i];
-    }
-    if (!std::isfinite(total) || total <= 0.0f) {
+    if (!policy_ok) {
       log_failure("policy_softmax", "invalid policy normalization", b);
       return InvalidResults(batch_size);
     }
-    for (auto& p : result.policy) p /= total;
 
     const float wdl_sum = result.wdl[0] + result.wdl[1] + result.wdl[2];
     if (!std::isfinite(result.value) || !std::isfinite(result.draw) ||

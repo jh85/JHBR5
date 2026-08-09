@@ -28,22 +28,6 @@ namespace jhbr2 {
 
 using namespace lczero;
 
-namespace {
-
-void Softmax(float* data, int size) {
-  const float max_val = *std::max_element(data, data + size);
-  float sum = 0.0f;
-  for (int i = 0; i < size; i++) {
-    data[i] = std::exp(data[i] - max_val);
-    sum += data[i];
-  }
-  if (sum > 0.0f) {
-    for (int i = 0; i < size; i++) data[i] /= sum;
-  }
-}
-
-}  // namespace
-
 #if HAS_ONNXRUNTIME
 
 struct NNEvaluator::Impl {
@@ -258,7 +242,10 @@ std::vector<NNOutput> NNEvaluator::EvaluateBatch(
 
     float wdl[3];
     std::copy(wdl_data + b * 3, wdl_data + b * 3 + 3, wdl);
-    Softmax(wdl, 3);
+    if (!SoftmaxInPlace(wdl, 3)) {
+      result.valid = false;
+      continue;
+    }
 
     result.wdl[0] = wdl[0];
     result.wdl[1] = wdl[1];
@@ -267,31 +254,10 @@ std::vector<NNOutput> NNEvaluator::EvaluateBatch(
     result.draw = wdl[1];
     result.moves_left = moves_left_data ? moves_left_data[b] : 0.0f;
 
-    float* logits = policy_data + b * policy_size;
-    const bool is_white = (board.side_to_move() == lczero::WHITE);
-
-    std::vector<float> legal_logits(legal_moves.size());
-    float max_logit = -1e10f;
-    for (size_t i = 0; i < legal_moves.size(); i++) {
-      Move move = legal_moves[i];
-      if (is_white) move.Flip();
-      const int index = ShogiMoveToNNIndex(move);
-      if (index >= 0 && index < policy_size) {
-        legal_logits[i] = logits[index];
-      } else {
-        legal_logits[i] = -1000.0f;
-      }
-      max_logit = std::max(max_logit, legal_logits[i]);
-    }
-
-    result.policy.resize(legal_moves.size());
-    float total = 0.0f;
-    for (size_t i = 0; i < legal_moves.size(); i++) {
-      result.policy[i] = std::exp(legal_logits[i] - max_logit);
-      total += result.policy[i];
-    }
-    if (total > 0.0f) {
-      for (auto& probability : result.policy) probability /= total;
+    if (!LegalPolicySoftmax(policy_data + b * policy_size, policy_size,
+                            legal_moves, board.side_to_move(),
+                            &result.policy)) {
+      result.valid = false;
     }
   }
 

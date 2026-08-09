@@ -232,10 +232,10 @@ int main() {
 
 class NNEvaluator:
     """
-    Wraps an ONNX model for MCTS evaluation.
+    Wraps a v2 ONNX model for MCTS evaluation.
 
-    The NN takes (batch, 44, 9, 9) and returns:
-      - policy (batch, 3849) raw logits
+    The NN takes (batch, 148, 9, 9) and returns:
+      - policy (batch, 2187) raw logits
       - wdl (batch, 3) logits
       - mlh (batch, 1)
     """
@@ -561,55 +561,15 @@ class MCTS:
 
 def create_mcts(onnx_path, config=None, lc0_src_path=None):
     """
-    Create an MCTS instance with ONNX model and board helper.
+    Create an MCTS instance with a v2 ONNX model and board helper.
 
     Returns (mcts, cleanup_fn)
     """
     from shogi_train import move_to_policy_index
-    from shogi_model import generate_attn_policy_map
-
-    # Build policy index lookup
-    BOARD = 9
-    def in_bounds(f, r): return 0 <= f < BOARD and 0 <= r < BOARD
-    piece_moves_def = {
-        'pawn':[(0,-1,1)],'lance':[(0,-1,8)],'knight':[(-1,-2,1),(1,-2,1)],
-        'silver':[(0,-1,1),(-1,-1,1),(1,-1,1),(-1,1,1),(1,1,1)],
-        'gold':[(0,-1,1),(-1,-1,1),(1,-1,1),(-1,0,1),(1,0,1),(0,1,1)],
-        'bishop':[(-1,-1,8),(-1,1,8),(1,-1,8),(1,1,8)],
-        'rook':[(0,-1,8),(0,1,8),(-1,0,8),(1,0,8)],
-        'king':[(df,dr,1) for df in(-1,0,1) for dr in(-1,0,1) if(df,dr)!=(0,0)],
-        'horse':[(-1,-1,8),(-1,1,8),(1,-1,8),(1,1,8),(0,-1,1),(0,1,1),(-1,0,1),(1,0,1)],
-        'dragon':[(0,-1,8),(0,1,8),(-1,0,8),(1,0,8),(-1,-1,1),(-1,1,1),(1,-1,1),(1,1,1)],
-    }
-    valid_pairs = set()
-    for moves in piece_moves_def.values():
-        for f in range(9):
-            for r in range(9):
-                for df,dr,md in moves:
-                    for dist in range(1,md+1):
-                        nf,nr=f+df*dist,r+dr*dist
-                        if not in_bounds(nf,nr): break
-                        valid_pairs.add((f*9+r,nf*9+nr))
-
-    board_idx = {}; promo_idx = {}; drop_idx = {}; current = 0
-    for f,t in sorted(valid_pairs):
-        board_idx[(f,t)] = current; current += 1
-    promo_pairs = {(f,t) for f,t in valid_pairs if f%9<=2 or t%9<=2}
-    for f,t in sorted(promo_pairs):
-        promo_idx[(f,t)] = current; current += 1
-    for pt in range(7):
-        for sq in range(81):
-            drop_idx[(pt,sq)] = current; current += 1
 
     def move_str_to_idx(move_str, flip):
-        info = move_to_policy_index(move_str, flip)
-        if info[0] == 'drop':
-            _, pt, sq = info
-            return drop_idx.get((pt, sq), -1)
-        elif info[0] == 'board':
-            _, f, t, promote = info
-            return (promo_idx if promote else board_idx).get((f, t), -1)
-        return -1
+        """Map a USI move to the v2 direction-based policy index."""
+        return move_to_policy_index(move_str, flip)
 
     board = BoardHelper(lc0_src_path)
     nn = NNEvaluator(onnx_path, move_str_to_idx)

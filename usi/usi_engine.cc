@@ -25,6 +25,7 @@
 #include "mate/bns.h"
 #include "mate/dfpn.h"
 #include "shogi/encoder.h"
+#include "usi/root_mate_state.h"
 #include "usi/search_info.h"
 #include "usi/time_manager.h"
 
@@ -46,9 +47,9 @@ constexpr int kMaxWorkersPerGpu = 64;
 constexpr int kMaxMctsNodes = 1'000'000'000;
 
 // BNS uses fixed-size tables, so its playing-strength budget follows the MCTS
-// lifetime instead of an independent node tier. The legacy tree df-pn keeps a
-// fixed cap because its node pool grows linearly with this value.
-constexpr size_t kTreeDfpnMaxNodes = 2'000'000;
+// lifetime instead of an independent node tier. The legacy tree df-pn cap is
+// defined in usi/root_mate_state.h because it is part of the root mate solver
+// configuration.
 constexpr int kRootMateDeadlineMarginMs = 50;
 
 const char* RepetitionResultName(ShogiBoard::RepetitionResult result) {
@@ -194,6 +195,7 @@ static int NNCacheHashfull(const NNCacheStats& stats) {
 USIEngine::USIEngine() {
   board_.SetStartPos();
   position_start_key_ = board_.Hash();
+  RegisterOptionParsers();
 }
 
 // =====================================================================
@@ -380,6 +382,390 @@ void USIEngine::CmdIsReady() {
   Send("readyok");
 }
 
+void USIEngine::RegisterOptionParsers() {
+  const auto reset_search = [this]() { search_.reset(); };
+  const auto reset_inference = [this]() {
+    search_.reset();
+    evaluators_.clear();
+  };
+
+  option_parsers_["maxnodes"] =
+      [this](const std::string& name, const std::string& value) {
+        max_nodes_ = std::clamp(ParseInt(value), 1, kMaxMctsNodes);
+        // Unlike most options, make the diagnostic report the effective value
+        // after clamping instead of echoing a potentially misleading request.
+        Log("Set " + name + " = " + std::to_string(max_nodes_));
+        return OptionSetResult::kAlreadyLogged;
+      };
+
+  option_parsers_["onnxmodel"] =
+      [this, reset_inference](const std::string& /*name*/,
+                              const std::string& value) {
+        onnx_path_ = value;
+        reset_inference();
+        return OptionSetResult::kSetAndLog;
+      };
+
+  option_parsers_["modelformat"] =
+      [this, reset_inference](const std::string& /*name*/,
+                              const std::string& value) {
+        model_format_ = ParseModelFormat(value);
+        reset_inference();
+        return OptionSetResult::kSetAndLog;
+      };
+
+  option_parsers_["dlshogimodel"] =
+      [this, reset_inference](const std::string& /*name*/,
+                              const std::string& value) {
+        model_format_ = ToLower(value) == "true" ? ModelFormat::kDlshogi
+                                                  : ModelFormat::kAuto;
+        reset_inference();
+        return OptionSetResult::kSetAndLog;
+      };
+
+  option_parsers_["usegpu"] =
+      [this, reset_inference](const std::string& /*name*/,
+                              const std::string& value) {
+        use_gpu_ = ToLower(value) == "true" || value == "1";
+        reset_inference();
+        return OptionSetResult::kSetAndLog;
+      };
+
+  option_parsers_["threads"] = option_parsers_["workerspergpu"] =
+      [this, reset_inference](const std::string& /*name*/,
+                              const std::string& value) {
+        search_config_.workers_per_gpu =
+            std::clamp(ParseInt(value), 1, kMaxWorkersPerGpu);
+        // TensorRT allocates one execution slot per worker.
+        reset_inference();
+        return OptionSetResult::kSetAndLog;
+      };
+
+  option_parsers_["minibatchsize"] =
+      [this, reset_search](const std::string& /*name*/,
+                           const std::string& value) {
+        search_config_.minibatch_size =
+            std::clamp(ParseInt(value), 1, 4096);
+        reset_search();
+        return OptionSetResult::kSetAndLog;
+      };
+
+  option_parsers_["cinit"] = option_parsers_["c_init"] =
+      [this, reset_search](const std::string& /*name*/,
+                           const std::string& value) {
+        search_config_.c_init =
+            std::clamp(ParseFiniteFloat(value), 0.0f, 100.0f);
+        reset_search();
+        return OptionSetResult::kSetAndLog;
+      };
+
+  option_parsers_["cbase"] = option_parsers_["c_base"] =
+      [this, reset_search](const std::string& /*name*/,
+                           const std::string& value) {
+        search_config_.c_base =
+            std::clamp(ParseFiniteFloat(value), 1.0f, 1.0e9f);
+        reset_search();
+        return OptionSetResult::kSetAndLog;
+      };
+
+  option_parsers_["fpureduction"] = option_parsers_["c_fpu_reduction"] =
+      [this, reset_search](const std::string& /*name*/,
+                           const std::string& value) {
+        search_config_.c_fpu_reduction =
+            std::clamp(ParseFiniteFloat(value), 0.0f, 100.0f);
+        reset_search();
+        return OptionSetResult::kSetAndLog;
+      };
+
+  option_parsers_["cinitroot"] = option_parsers_["c_init_root"] =
+      [this, reset_search](const std::string& /*name*/,
+                           const std::string& value) {
+        search_config_.c_init_root =
+            std::clamp(ParseFiniteFloat(value), 0.0f, 100.0f);
+        reset_search();
+        return OptionSetResult::kSetAndLog;
+      };
+
+  option_parsers_["cbaseroot"] = option_parsers_["c_base_root"] =
+      [this, reset_search](const std::string& /*name*/,
+                           const std::string& value) {
+        search_config_.c_base_root =
+            std::clamp(ParseFiniteFloat(value), 1.0f, 1.0e9f);
+        reset_search();
+        return OptionSetResult::kSetAndLog;
+      };
+
+  option_parsers_["fpureductionroot"] =
+      option_parsers_["c_fpu_reduction_root"] =
+          [this, reset_search](const std::string& /*name*/,
+                               const std::string& value) {
+            search_config_.c_fpu_reduction_root =
+                std::clamp(ParseFiniteFloat(value), 0.0f, 100.0f);
+            reset_search();
+            return OptionSetResult::kSetAndLog;
+          };
+
+  option_parsers_["drawvalueblack"] =
+      [this, reset_search](const std::string& /*name*/,
+                           const std::string& value) {
+        search_config_.draw_value_black =
+            std::clamp(ParseFiniteFloat(value), 0.0f, 1.0f);
+        reset_search();
+        return OptionSetResult::kSetAndLog;
+      };
+
+  option_parsers_["drawvaluewhite"] =
+      [this, reset_search](const std::string& /*name*/,
+                           const std::string& value) {
+        search_config_.draw_value_white =
+            std::clamp(ParseFiniteFloat(value), 0.0f, 1.0f);
+        reset_search();
+        return OptionSetResult::kSetAndLog;
+      };
+
+  option_parsers_["resignthreshold"] =
+      [this, reset_search](const std::string& /*name*/,
+                           const std::string& value) {
+        search_config_.resign_threshold =
+            std::clamp(ParseFiniteFloat(value), 0.0f, 0.5f);
+        reset_search();
+        return OptionSetResult::kSetAndLog;
+      };
+
+  option_parsers_["infointervalms"] =
+      [this, reset_search](const std::string& /*name*/,
+                           const std::string& value) {
+        search_config_.info_interval_ms =
+            std::clamp(ParseInt(value), 100, 10000);
+        reset_search();
+        return OptionSetResult::kSetAndLog;
+      };
+
+  option_parsers_["leafmatemode"] =
+      [this, reset_search](const std::string& name,
+                           const std::string& value) {
+        const std::string mode = ToLower(value);
+        if (mode == "shallow") {
+          if (search_config_.leaf_mate_depth <= 0 ||
+              search_config_.leaf_mate_depth % 2 == 0) {
+            search_config_.leaf_mate_depth = 5;
+          }
+        } else if (mode == "off") {
+          search_config_.leaf_mate_depth = 0;
+        } else if (mode == "dfpn") {
+          // Historical behavior treated the unimplemented df-pn mode as off.
+          search_config_.leaf_mate_depth = 0;
+          Log("LeafMateMode=dfpn is retired; treating it as off");
+          return OptionSetResult::kAlreadyLogged;
+        } else {
+          Log("Ignored unsupported LeafMateMode value: " + value);
+          return OptionSetResult::kAlreadyLogged;
+        }
+        reset_search();
+        return OptionSetResult::kSetAndLog;
+      };
+
+  option_parsers_["leafmatedepth"] =
+      [this, reset_search](const std::string& /*name*/,
+                           const std::string& value) {
+        int depth = std::clamp(ParseInt(value), 1, 7);
+        if (depth % 2 == 0) --depth;
+        search_config_.leaf_mate_depth = depth;
+        reset_search();
+        return OptionSetResult::kSetAndLog;
+      };
+
+  option_parsers_["rootmatedepth"] =
+      [this, reset_search](const std::string& /*name*/,
+                           const std::string& value) {
+        int depth = std::clamp(ParseInt(value), 0, 7);
+        if (depth > 0 && depth % 2 == 0) --depth;
+        search_config_.root_mate_depth = depth;
+        reset_search();
+        return OptionSetResult::kSetAndLog;
+      };
+
+  option_parsers_["nncachesize"] =
+      [this, reset_search](const std::string& /*name*/,
+                           const std::string& value) {
+        search_config_.nn_cache_size =
+            std::min<std::size_t>(ParseSize(value), 100000000);
+        reset_search();
+        return OptionSetResult::kSetAndLog;
+      };
+
+  option_parsers_["numgpus"] =
+      [this, reset_inference](const std::string& /*name*/,
+                              const std::string& value) {
+        num_gpus_ = std::clamp(ParseInt(value), 1, 8);
+        reset_inference();
+        return OptionSetResult::kSetAndLog;
+      };
+
+  option_parsers_["maxmovestodraw"] =
+      [this, reset_search](const std::string& /*name*/,
+                           const std::string& value) {
+        search_config_.max_moves_to_draw =
+            std::clamp(ParseInt(value), 1, 100000);
+        reset_search();
+        return OptionSetResult::kSetAndLog;
+      };
+
+  option_parsers_["usemovesleft"] =
+      [this, reset_search](const std::string& /*name*/,
+                           const std::string& value) {
+        search_config_.moves_left.enabled =
+            ToLower(value) == "true" || value == "1";
+        reset_search();
+        return OptionSetResult::kSetAndLog;
+      };
+
+  option_parsers_["movesleftmaxeffect"] =
+      [this, reset_search](const std::string& /*name*/,
+                           const std::string& value) {
+        search_config_.moves_left.max_effect =
+            std::clamp(ParseFiniteFloat(value), 0.0f, 1.0f);
+        reset_search();
+        return OptionSetResult::kSetAndLog;
+      };
+
+  option_parsers_["movesleftthreshold"] =
+      [this, reset_search](const std::string& /*name*/,
+                           const std::string& value) {
+        search_config_.moves_left.threshold =
+            std::clamp(ParseFiniteFloat(value), 0.0f, 1.0f);
+        reset_search();
+        return OptionSetResult::kSetAndLog;
+      };
+
+  option_parsers_["movesleftslope"] =
+      [this, reset_search](const std::string& /*name*/,
+                           const std::string& value) {
+        search_config_.moves_left.slope =
+            std::clamp(ParseFiniteFloat(value), 0.0f, 1.0f);
+        reset_search();
+        return OptionSetResult::kSetAndLog;
+      };
+
+  option_parsers_["movesleftconstantfactor"] =
+      [this, reset_search](const std::string& /*name*/,
+                           const std::string& value) {
+        search_config_.moves_left.constant_factor =
+            std::clamp(ParseFiniteFloat(value), -1.0f, 1.0f);
+        reset_search();
+        return OptionSetResult::kSetAndLog;
+      };
+
+  option_parsers_["movesleftscaledfactor"] =
+      [this, reset_search](const std::string& /*name*/,
+                           const std::string& value) {
+        search_config_.moves_left.scaled_factor =
+            std::clamp(ParseFiniteFloat(value), -2.0f, 2.0f);
+        reset_search();
+        return OptionSetResult::kSetAndLog;
+      };
+
+  option_parsers_["movesleftquadraticfactor"] =
+      [this, reset_search](const std::string& /*name*/,
+                           const std::string& value) {
+        search_config_.moves_left.quadratic_factor =
+            std::clamp(ParseFiniteFloat(value), -1.0f, 1.0f);
+        reset_search();
+        return OptionSetResult::kSetAndLog;
+      };
+
+  option_parsers_["rootmatesolver"] =
+      [this](const std::string& /*name*/, const std::string& value) {
+        std::string mode = value;
+        std::transform(mode.begin(), mode.end(), mode.begin(), ::tolower);
+        root_mate_solver_bns_ = mode != "dfpn";
+        Log("RootMateSolver=" + std::string(root_mate_solver_bns_ ? "bns"
+                                                                  : "dfpn"));
+        return OptionSetResult::kAlreadyLogged;
+      };
+
+  option_parsers_["dfpnmaxtime"] =
+      [this](const std::string& /*name*/, const std::string& /*value*/) {
+        // Accepted for old engine configuration files, but no longer advertised
+        // or used. Root mate search now follows the MCTS lifetime.
+        Log("DfPnMaxTime is retired; root mate search follows MCTS");
+        return OptionSetResult::kAlreadyLogged;
+      };
+
+  option_parsers_["maxmovetime"] =
+      [this](const std::string& /*name*/, const std::string& value) {
+        max_move_time_ms_ = std::clamp(ParseInt(value), 0, 300000);
+        return OptionSetResult::kSetAndLog;
+      };
+
+  option_parsers_["maxmovetime1m"] =
+      [this](const std::string& /*name*/, const std::string& value) {
+        max_move_time_1m_ms_ = std::clamp(ParseInt(value), 0, 60000);
+        return OptionSetResult::kSetAndLog;
+      };
+
+  option_parsers_["timemanagement"] =
+      [this](const std::string& /*name*/, const std::string& value) {
+        time_management_mode_ = ParseTimeManagementMode(value);
+        return OptionSetResult::kSetAndLog;
+      };
+
+  option_parsers_["moveoverheadms"] =
+      [this](const std::string& /*name*/, const std::string& value) {
+        move_overhead_ms_ = std::clamp(ParseInt(value), 0, 5000);
+        return OptionSetResult::kSetAndLog;
+      };
+
+  option_parsers_["timemaxextensionpercent"] =
+      [this](const std::string& /*name*/, const std::string& value) {
+        time_max_extension_percent_ =
+            std::clamp(ParseInt(value), 100, 300);
+        return OptionSetResult::kSetAndLog;
+      };
+
+  option_parsers_["timedebug"] =
+      [this](const std::string& /*name*/, const std::string& value) {
+        time_debug_ = ToLower(value) == "true" || value == "1";
+        return OptionSetResult::kSetAndLog;
+      };
+
+  option_parsers_["bookfile"] =
+      [this](const std::string& /*name*/, const std::string& value) {
+        book_path_ = value;
+        books_dirty_ = true;
+        return OptionSetResult::kSetAndLog;
+      };
+
+  option_parsers_["goteexitbookfile"] =
+      [this](const std::string& /*name*/, const std::string& value) {
+        gote_exit_book_path_ = value;
+        books_dirty_ = true;
+        return OptionSetResult::kSetAndLog;
+      };
+
+  option_parsers_["usegoteexitbook"] =
+      [this](const std::string& /*name*/, const std::string& value) {
+        const bool enabled = ToLower(value) == "true" || value == "1";
+        if (enabled != use_gote_exit_book_) books_dirty_ = true;
+        use_gote_exit_book_ = enabled;
+        return OptionSetResult::kSetAndLog;
+      };
+
+  const auto retired_option = [this](const std::string& name,
+                                     const std::string& /*value*/) {
+    Log("Option " + name + " is retired and ignored");
+    return OptionSetResult::kAlreadyLogged;
+  };
+  option_parsers_["noiseepsilon"] = retired_option;
+  option_parsers_["perleafgathering"] = retired_option;
+  option_parsers_["leafdfpnnodes"] = retired_option;
+  option_parsers_["virtuallossweight"] = retired_option;
+  option_parsers_["maxgpubatch"] = retired_option;
+  option_parsers_["movesleftweight"] = retired_option;
+  option_parsers_["movesleftcap"] = retired_option;
+  option_parsers_["bookonthefly"] = retired_option;
+}
+
 void USIEngine::CmdSetOption(const std::vector<std::string>& parts) {
   std::string name, value;
   std::size_t value_marker = parts.size();
@@ -408,207 +794,20 @@ void USIEngine::CmdSetOption(const std::vector<std::string>& parts) {
   }
 
   const std::string name_lower = ToLower(name);
-  const auto reset_search = [this]() { search_.reset(); };
-  const auto reset_inference = [this]() {
-    search_.reset();
-    evaluators_.clear();
-  };
-
-  try {
-    if (name_lower == "maxnodes") {
-      max_nodes_ = std::clamp(ParseInt(value), 1, kMaxMctsNodes);
-      // Unlike most options, make the diagnostic report the effective value
-      // after clamping instead of echoing a potentially misleading request.
-      Log("Set " + name + " = " + std::to_string(max_nodes_));
-      return;
-    } else if (name_lower == "onnxmodel") {
-      onnx_path_ = value;
-      reset_inference();
-    } else if (name_lower == "modelformat") {
-      model_format_ = ParseModelFormat(value);
-      reset_inference();
-    } else if (name_lower == "dlshogimodel") {
-      model_format_ = ToLower(value) == "true" ? ModelFormat::kDlshogi
-                                                : ModelFormat::kAuto;
-      reset_inference();
-    } else if (name_lower == "usegpu") {
-      use_gpu_ = ToLower(value) == "true" || value == "1";
-      reset_inference();
-    } else if (name_lower == "threads" ||
-               name_lower == "workerspergpu") {
-      search_config_.workers_per_gpu =
-          std::clamp(ParseInt(value), 1, kMaxWorkersPerGpu);
-      // TensorRT allocates one execution slot per worker.
-      reset_inference();
-    } else if (name_lower == "minibatchsize") {
-      search_config_.minibatch_size =
-          std::clamp(ParseInt(value), 1, 4096);
-      reset_search();
-    } else if (name_lower == "cinit" || name_lower == "c_init") {
-      search_config_.c_init =
-          std::clamp(ParseFiniteFloat(value), 0.0f, 100.0f);
-      reset_search();
-    } else if (name_lower == "cbase" || name_lower == "c_base") {
-      search_config_.c_base =
-          std::clamp(ParseFiniteFloat(value), 1.0f, 1.0e9f);
-      reset_search();
-    } else if (name_lower == "fpureduction" ||
-               name_lower == "c_fpu_reduction") {
-      search_config_.c_fpu_reduction =
-          std::clamp(ParseFiniteFloat(value), 0.0f, 100.0f);
-      reset_search();
-    } else if (name_lower == "cinitroot" ||
-               name_lower == "c_init_root") {
-      search_config_.c_init_root =
-          std::clamp(ParseFiniteFloat(value), 0.0f, 100.0f);
-      reset_search();
-    } else if (name_lower == "cbaseroot" ||
-               name_lower == "c_base_root") {
-      search_config_.c_base_root =
-          std::clamp(ParseFiniteFloat(value), 1.0f, 1.0e9f);
-      reset_search();
-    } else if (name_lower == "fpureductionroot" ||
-               name_lower == "c_fpu_reduction_root") {
-      search_config_.c_fpu_reduction_root =
-          std::clamp(ParseFiniteFloat(value), 0.0f, 100.0f);
-      reset_search();
-    } else if (name_lower == "drawvalueblack") {
-      search_config_.draw_value_black =
-          std::clamp(ParseFiniteFloat(value), 0.0f, 1.0f);
-      reset_search();
-    } else if (name_lower == "drawvaluewhite") {
-      search_config_.draw_value_white =
-          std::clamp(ParseFiniteFloat(value), 0.0f, 1.0f);
-      reset_search();
-    } else if (name_lower == "resignthreshold") {
-      search_config_.resign_threshold =
-          std::clamp(ParseFiniteFloat(value), 0.0f, 0.5f);
-      reset_search();
-    } else if (name_lower == "infointervalms") {
-      search_config_.info_interval_ms =
-          std::clamp(ParseInt(value), 100, 10000);
-      reset_search();
-    } else if (name_lower == "leafmatemode") {
-      const std::string mode = ToLower(value);
-      if (mode == "shallow") {
-        if (search_config_.leaf_mate_depth <= 0 ||
-            search_config_.leaf_mate_depth % 2 == 0) {
-          search_config_.leaf_mate_depth = 5;
-        }
-      } else if (mode == "off") {
-        search_config_.leaf_mate_depth = 0;
-      } else if (mode == "dfpn") {
-        // Historical behavior treated the unimplemented df-pn mode as off.
-        search_config_.leaf_mate_depth = 0;
-        Log("LeafMateMode=dfpn is retired; treating it as off");
-      } else {
-        Log("Ignored unsupported LeafMateMode value: " + value);
-        return;
-      }
-      reset_search();
-    } else if (name_lower == "leafmatedepth") {
-      int depth = std::clamp(ParseInt(value), 1, 7);
-      if (depth % 2 == 0) --depth;
-      search_config_.leaf_mate_depth = depth;
-      reset_search();
-    } else if (name_lower == "rootmatedepth") {
-      int depth = std::clamp(ParseInt(value), 0, 7);
-      if (depth > 0 && depth % 2 == 0) --depth;
-      search_config_.root_mate_depth = depth;
-      reset_search();
-    } else if (name_lower == "nncachesize") {
-      search_config_.nn_cache_size =
-          std::min<std::size_t>(ParseSize(value), 100000000);
-      reset_search();
-    } else if (name_lower == "numgpus") {
-      num_gpus_ = std::clamp(ParseInt(value), 1, 8);
-      reset_inference();
-    } else if (name_lower == "maxmovestodraw") {
-      search_config_.max_moves_to_draw =
-          std::clamp(ParseInt(value), 1, 100000);
-      reset_search();
-    } else if (name_lower == "usemovesleft") {
-      search_config_.moves_left.enabled =
-          ToLower(value) == "true" || value == "1";
-      reset_search();
-    } else if (name_lower == "movesleftmaxeffect") {
-      search_config_.moves_left.max_effect =
-          std::clamp(ParseFiniteFloat(value), 0.0f, 1.0f);
-      reset_search();
-    } else if (name_lower == "movesleftthreshold") {
-      search_config_.moves_left.threshold =
-          std::clamp(ParseFiniteFloat(value), 0.0f, 1.0f);
-      reset_search();
-    } else if (name_lower == "movesleftslope") {
-      search_config_.moves_left.slope =
-          std::clamp(ParseFiniteFloat(value), 0.0f, 1.0f);
-      reset_search();
-    } else if (name_lower == "movesleftconstantfactor") {
-      search_config_.moves_left.constant_factor =
-          std::clamp(ParseFiniteFloat(value), -1.0f, 1.0f);
-      reset_search();
-    } else if (name_lower == "movesleftscaledfactor") {
-      search_config_.moves_left.scaled_factor =
-          std::clamp(ParseFiniteFloat(value), -2.0f, 2.0f);
-      reset_search();
-    } else if (name_lower == "movesleftquadraticfactor") {
-      search_config_.moves_left.quadratic_factor =
-          std::clamp(ParseFiniteFloat(value), -1.0f, 1.0f);
-      reset_search();
-    } else if (name_lower == "rootmatesolver") {
-      std::string mode = value;
-      std::transform(mode.begin(), mode.end(), mode.begin(), ::tolower);
-      root_mate_solver_bns_ = mode != "dfpn";
-      Log("RootMateSolver=" + std::string(root_mate_solver_bns_ ? "bns"
-                                                                : "dfpn"));
-    } else if (name_lower == "dfpnmaxtime") {
-      // Accepted for old engine configuration files, but no longer advertised
-      // or used. Root mate search now follows the MCTS lifetime.
-      Log("DfPnMaxTime is retired; root mate search follows MCTS");
-      return;
-    } else if (name_lower == "maxmovetime") {
-      max_move_time_ms_ = std::clamp(ParseInt(value), 0, 300000);
-    } else if (name_lower == "maxmovetime1m") {
-      max_move_time_1m_ms_ = std::clamp(ParseInt(value), 0, 60000);
-    } else if (name_lower == "timemanagement") {
-      time_management_mode_ = ParseTimeManagementMode(value);
-    } else if (name_lower == "moveoverheadms") {
-      move_overhead_ms_ = std::clamp(ParseInt(value), 0, 5000);
-    } else if (name_lower == "timemaxextensionpercent") {
-      time_max_extension_percent_ =
-          std::clamp(ParseInt(value), 100, 300);
-    } else if (name_lower == "timedebug") {
-      time_debug_ = ToLower(value) == "true" || value == "1";
-    } else if (name_lower == "bookfile") {
-      book_path_ = value;
-      books_dirty_ = true;
-    } else if (name_lower == "goteexitbookfile") {
-      gote_exit_book_path_ = value;
-      books_dirty_ = true;
-    } else if (name_lower == "usegoteexitbook") {
-      const bool enabled = ToLower(value) == "true" || value == "1";
-      if (enabled != use_gote_exit_book_) books_dirty_ = true;
-      use_gote_exit_book_ = enabled;
-    } else if (name_lower == "noiseepsilon" ||
-               name_lower == "perleafgathering" ||
-               name_lower == "leafdfpnnodes" ||
-               name_lower == "virtuallossweight" ||
-               name_lower == "maxgpubatch" ||
-               name_lower == "movesleftweight" ||
-               name_lower == "movesleftcap" ||
-               name_lower == "bookonthefly") {
-      Log("Option " + name + " is retired and ignored");
-      return;
-    } else {
-      Log("Unknown option ignored: " + name);
-      return;
-    }
-  } catch (const std::exception& error) {
-    Log("Invalid value for " + name + ": " + error.what());
+  const auto it = option_parsers_.find(name_lower);
+  if (it == option_parsers_.end()) {
+    Log("Unknown option ignored: " + name);
     return;
   }
 
-  Log("Set " + name + " = " + value);
+  try {
+    const auto result = it->second(name, value);
+    if (result == OptionSetResult::kSetAndLog) {
+      Log("Set " + name + " = " + value);
+    }
+  } catch (const std::exception& error) {
+    Log("Invalid value for " + name + ": " + error.what());
+  }
 }
 
 void USIEngine::CmdUsiNewGame() {
@@ -662,20 +861,12 @@ void USIEngine::CmdPosition(const std::vector<std::string>& parts) {
 
 }
 
-void USIEngine::CmdGo(const std::vector<std::string>& parts) {
-  const auto move_start_time = std::chrono::steady_clock::now();
-  if (evaluators_.empty()) {
-    Send("bestmove resign");
-    return;
-  }
-
-  // Parse time controls.
+USIEngine::GoParameters USIEngine::ParseGoParameters(
+    const std::vector<std::string>& parts) const {
+  GoParameters params;
+  params.nodes_limit = max_nodes_;
   int btime = 0, wtime = 0, byoyomi = 0, binc = 0, winc = 0;
   int move_time = 0;
-  int nodes_limit = max_nodes_;
-  bool has_explicit_nodes = false;
-  bool infinite = false;
-  bool ponder = false;
 
   size_t i = 1;
   while (i < parts.size()) {
@@ -692,64 +883,36 @@ void USIEngine::CmdGo(const std::vector<std::string>& parts) {
     } else if (parts[i] == "movetime" && i + 1 < parts.size()) {
       move_time = std::stoi(parts[i + 1]); i += 2;
     } else if (parts[i] == "nodes" && i + 1 < parts.size()) {
-      nodes_limit = std::stoi(parts[i + 1]);
-      has_explicit_nodes = true;
+      params.nodes_limit = std::stoi(parts[i + 1]);
+      params.time_control.has_explicit_nodes = true;
       i += 2;
     } else if (parts[i] == "infinite") {
-      nodes_limit = kMaxMctsNodes;
-      infinite = true;
+      params.nodes_limit = kMaxMctsNodes;
+      params.infinite = true;
       i++;
-    } else if (parts[i] == "mate") {
-      CmdGoMate(parts);
-      return;
     } else if (parts[i] == "ponder") {
-      ponder = true;
+      params.ponder = true;
       i++;
     } else {
       i++;
     }
   }
 
-  TimeControl time_control;
-  time_control.main_time_ms =
+  params.time_control.main_time_ms =
       board_.side_to_move() == BLACK ? btime : wtime;
-  time_control.increment_ms =
+  params.time_control.increment_ms =
       board_.side_to_move() == BLACK ? binc : winc;
-  time_control.byoyomi_ms = byoyomi;
-  time_control.move_time_ms = move_time;
-  time_control.game_ply = board_.ply();
-  time_control.has_main_time = btime > 0 || wtime > 0;
-  time_control.has_explicit_nodes = has_explicit_nodes;
-  time_control.infinite = infinite;
-  time_control.ponder = ponder;
+  params.time_control.byoyomi_ms = byoyomi;
+  params.time_control.move_time_ms = move_time;
+  params.time_control.game_ply = board_.ply();
+  params.time_control.has_main_time = btime > 0 || wtime > 0;
+  return params;
+}
 
-  TimeOptions time_options;
-  time_options.max_move_time_ms = max_move_time_ms_;
-  time_options.max_move_time_1m_ms = max_move_time_1m_ms_;
-  time_options.move_overhead_ms = move_overhead_ms_;
-  time_options.max_extension_percent = time_max_extension_percent_;
-  time_options.mode = time_management_mode_;
-  const TimeBudget time_budget =
-      TimeManager::Compute(time_control, time_options);
-  if (time_debug_) {
-    std::ostringstream timing;
-    timing << "time_budget mode="
-           << TimeManagementModeName(time_budget.mode)
-           << " ply=" << time_control.game_ply
-           << " earliest_ms=" << time_budget.earliest_stop_ms
-           << " target_ms=" << time_budget.target_stop_ms
-           << " latest_ms=" << time_budget.latest_search_ms
-           << " response_ms=" << time_budget.response_deadline_ms
-           << " actual_mcts_ms="
-           << static_cast<int>(time_budget.mcts_time_seconds * 1000.0f)
-           << " hard_ms=" << time_budget.hard_deadline_ms;
-    Log(timing.str());
-  }
-
+std::optional<std::string> USIEngine::ProbeOpeningBook() {
   // Check entering-king declaration.
   if (board_.CanDeclareWin()) {
-    Send("bestmove win");
-    return;
+    return std::string("win");
   }
 
   // Probe the specialized policy only on Gote turns. A miss deliberately
@@ -775,13 +938,278 @@ void USIEngine::CmdGo(const std::vector<std::string>& parts) {
           move_usi + " (eval=" +
           std::to_string(entry->eval) + ", depth=" +
           std::to_string(entry->depth) + ")");
-      Send("bestmove " + move_usi);
-      return;
+      return move_usi;
+    }
+  }
+  return std::nullopt;
+}
+
+std::string USIEngine::FormatTimeBudgetForLog(const TimeBudget& budget,
+                                              bool compact) const {
+  std::ostringstream out;
+  out << "mode=" << TimeManagementModeName(budget.mode);
+  if (compact) {
+    out << " budget_ms=" << budget.earliest_stop_ms << "/"
+        << budget.target_stop_ms << "/" << budget.latest_search_ms;
+  } else {
+    out << " earliest_ms=" << budget.earliest_stop_ms
+        << " target_ms=" << budget.target_stop_ms
+        << " latest_ms=" << budget.latest_search_ms;
+  }
+  out << " response_ms=" << budget.response_deadline_ms;
+  return out.str();
+}
+
+USIEngine::RootMateLaunch USIEngine::LaunchRootMateSearch(
+    const TimeBudget& time_budget,
+    std::chrono::steady_clock::time_point move_start_time,
+    dlshogi_mcts::Search* mcts_search,
+    std::mutex& watchdog_mutex,
+    std::condition_variable& watchdog_cv,
+    bool& search_done,
+    std::atomic<bool>& watchdog_fired) {
+  RootMateLaunch launch;
+  launch.state =
+      std::make_shared<RootMateState>(root_mate_solver_bns_, board_);
+
+  auto root_mate_deadline = MateDfpnSolver::Deadline::max();
+  if (time_budget.hard_deadline_ms > 0) {
+    const int safe_deadline_ms = std::max(
+        time_budget.hard_deadline_ms - kRootMateDeadlineMarginMs, 1);
+    root_mate_deadline =
+        move_start_time + std::chrono::milliseconds(safe_deadline_ms);
+  }
+
+  // Search::Run releases this worker only after it has reset its stop flag.
+  // Otherwise a fast mate proof could call Stop() just before Run() and have
+  // that cancellation erased by search startup.
+  launch.search_thread = std::thread(
+      [root_mate = launch.state, root_mate_deadline, mcts_search]() {
+        if (root_mate->WaitForStart()) {
+          const auto started_at = std::chrono::steady_clock::now();
+          root_mate->mate_move = root_mate->Search(root_mate_deadline);
+          root_mate->elapsed_ms =
+              std::chrono::duration_cast<std::chrono::milliseconds>(
+                  std::chrono::steady_clock::now() - started_at)
+                  .count();
+          const bool proved_mate =
+              !root_mate->mate_move.is_null() &&
+              !MateDfpnSolver::IsNoMate(root_mate->mate_move);
+          root_mate->done.store(true, std::memory_order_release);
+          // Apply the same root repetition boundary before stopping MCTS. If
+          // defense-in-depth rejects a solver regression, normal search must
+          // still be allowed to finish and provide a usable fallback move.
+          if (proved_mate &&
+              RootMoveRepetitionResult(root_mate->board,
+                                       root_mate->mate_move) ==
+                  ShogiBoard::RepetitionResult::kNone) {
+            root_mate->stopped_mcts.store(true, std::memory_order_release);
+            mcts_search->Stop();
+          }
+        } else {
+          root_mate->done.store(true, std::memory_order_release);
+        }
+      });
+
+  // Exact watchdog: a condition-variable deadline avoids the old 0-50 ms
+  // polling/join delay. Pure node-limited searches remain uncapped.
+  if (time_budget.hard_deadline_ms > 0) {
+    const auto hard_deadline =
+        move_start_time +
+        std::chrono::milliseconds(time_budget.hard_deadline_ms);
+    launch.watchdog_thread = std::thread(
+        [this, root_mate = launch.state, &watchdog_mutex, &watchdog_cv,
+         &search_done, &watchdog_fired, hard_deadline]() {
+          std::unique_lock<std::mutex> lock(watchdog_mutex);
+          if (!watchdog_cv.wait_until(
+                  lock, hard_deadline, [&search_done] { return search_done; })) {
+            watchdog_fired.store(true, std::memory_order_release);
+            if (search_) search_->Stop();
+            root_mate->Stop();
+          }
+        });
+  }
+
+  return launch;
+}
+
+void USIEngine::LogRootMateResult(const RootMateState& state,
+                                  bool finished_before_stop,
+                                  bool watchdog_fired,
+                                  std::int64_t join_ms) {
+  const bool is_mate =
+      !state.mate_move.is_null() &&
+      !MateDfpnSolver::IsNoMate(state.mate_move);
+  const bool is_nomate = MateDfpnSolver::IsNoMate(state.mate_move);
+  const char* outcome =
+      is_mate ? "mate"
+              : is_nomate ? "nomate"
+                          : finished_before_stop ? "limit" : "stopped";
+  const char* stop_source = "mcts";
+  if (state.stopped_mcts.load(std::memory_order_acquire)) {
+    stop_source = "mate";
+  } else if (is_nomate || finished_before_stop) {
+    stop_source = "self";
+  } else if (watchdog_fired) {
+    stop_source = "watchdog";
+  }
+  Log("root_mate solver=" + std::string(state.SolverName()) +
+      " outcome=" + outcome +
+      " elapsed_ms=" + std::to_string(state.elapsed_ms) +
+      " nodes=" + std::to_string(state.NodesSearched()) +
+      " stop_source=" + stop_source +
+      " join_ms=" + std::to_string(join_ms));
+}
+
+void USIEngine::LogTimeResult(const dlshogi_mcts::SearchResult& result) {
+  if (time_management_mode_ == TimeManagementMode::kOff && !time_debug_) {
+    return;
+  }
+  const auto& decision = result.time_decision;
+  const auto& snapshot = decision.snapshot;
+  std::ostringstream timing;
+  timing << "time_result " << FormatTimeBudgetForLog(result.time_budget, true)
+         << " reason=" << TimeStopReasonName(decision.reason)
+         << " search_ms=" << static_cast<int>(result.time_sec * 1000.0f)
+         << " effective_ms=" << decision.effective_deadline_ms
+         << " playouts=" << snapshot.new_playouts
+         << " best_visits=" << snapshot.best_visits
+         << " second_visits=" << snapshot.second_visits
+         << " best_q=" << std::fixed << std::setprecision(4) << snapshot.best_q
+         << " second_q=" << snapshot.second_q
+         << " stable_ms=" << decision.stable_ms
+         << " projected=" << decision.projected_remaining
+         << " best_changes=" << decision.best_changes
+         << " extension=" << (decision.extension_active ? 1 : 0)
+         << " root_guard_cancelled="
+         << (result.root_guard_cancelled ? 1 : 0);
+  Log(timing.str());
+}
+
+void USIEngine::LogTimeResponse(
+    std::chrono::steady_clock::time_point move_start_time,
+    const TimeBudget& time_budget,
+    const RootMateState& state) {
+  if (time_management_mode_ == TimeManagementMode::kOff && !time_debug_) {
+    return;
+  }
+  const auto response_elapsed_ms =
+      std::chrono::duration_cast<std::chrono::milliseconds>(
+          std::chrono::steady_clock::now() - move_start_time)
+          .count();
+  Log("time_response elapsed_ms=" + std::to_string(response_elapsed_ms) +
+      " deadline_ms=" + std::to_string(time_budget.response_deadline_ms) +
+      " root_mate_nodes=" + std::to_string(state.NodesSearched()));
+}
+
+void USIEngine::SelectAndReportBestMove(
+    const dlshogi_mcts::SearchResult& result,
+    const RootMateState& root_mate) {
+  const bool root_mate_is_mate =
+      !root_mate.mate_move.is_null() &&
+      !MateDfpnSolver::IsNoMate(root_mate.mate_move);
+
+  // --- Choose result ---
+  bool use_mate = root_mate_is_mate;
+
+  // Defense in depth: a root df-pn result must not replace MCTS when its very
+  // first move enters a repetition. The solver now adjudicates these nodes
+  // itself, but keeping the final boundary check prevents a future df-pn
+  // regression from turning an OUTE_SENNICHITE loss into bestmove.
+  if (use_mate) {
+    const auto repetition =
+        RootMoveRepetitionResult(board_, root_mate.mate_move);
+    if (repetition != ShogiBoard::RepetitionResult::kNone) {
+      Log("Rejected root mate move " + root_mate.mate_move.ToString() +
+          ": repetition=" + RepetitionResultName(repetition));
+      use_mate = false;
     }
   }
 
+  if (use_mate) {
+    auto pv = root_mate.Pv();
+    std::string pv_str;
+    for (const auto& m : pv) {
+      if (!pv_str.empty()) pv_str += " ";
+      pv_str += m.ToString();
+    }
+    if (pv_str.empty()) pv_str = root_mate.mate_move.ToString();
+
+    int mate_ply = (int)pv.size();
+    Log("Root mate solver found mate in " + std::to_string(mate_ply) +
+        " ply");
+
+    Send("info depth 1 score mate " + std::to_string((mate_ply + 1) / 2) +
+         " nodes " + std::to_string(root_mate.NodesSearched()) +
+         " pv " + pv_str);
+    Send("bestmove " + root_mate.mate_move.ToString());
+    return;
+  }
+
+  // --- Use MCTS result ---
+  if (result.best_move.is_null()) {
+    Send("bestmove resign");
+    return;
+  }
+
+  if (result.nn_cache.capacity > 0) {
+    Log(FormatNNCacheStats(result.nn_cache));
+  }
+
+  USISearchInfo usi_info;
+  usi_info.pv = result.pv;
+  if (usi_info.pv.empty()) usi_info.pv.push_back(result.best_move);
+  usi_info.depth = static_cast<int>(usi_info.pv.size());
+  usi_info.seldepth = usi_info.depth;
+  usi_info.score_cp = result.score_cp;
+  usi_info.nodes = std::max(result.nodes, 0);
+  usi_info.nps = static_cast<std::uint64_t>(std::max(result.nps, 0.0f));
+  usi_info.hashfull = NNCacheHashfull(result.nn_cache);
+  usi_info.time_ms = static_cast<std::uint64_t>(
+      std::max(result.time_sec, 0.0f) * 1000.0f);
+  Send(FormatUSISearchInfo(usi_info));
+
+  Send("bestmove " + result.best_move.ToString());
+}
+
+void USIEngine::CmdGo(const std::vector<std::string>& parts) {
+  if (std::find(parts.begin(), parts.end(), "mate") != parts.end()) {
+    CmdGoMate(parts);
+    return;
+  }
+
+  const auto move_start_time = std::chrono::steady_clock::now();
+  if (evaluators_.empty()) {
+    Send("bestmove resign");
+    return;
+  }
+
+  const auto params = ParseGoParameters(parts);
+
+  TimeOptions time_options;
+  time_options.max_move_time_ms = max_move_time_ms_;
+  time_options.max_move_time_1m_ms = max_move_time_1m_ms_;
+  time_options.move_overhead_ms = move_overhead_ms_;
+  time_options.max_extension_percent = time_max_extension_percent_;
+  time_options.mode = time_management_mode_;
+  const TimeBudget time_budget =
+      TimeManager::Compute(params.time_control, time_options);
+
+  if (time_debug_) {
+    Log("time_budget " + FormatTimeBudgetForLog(time_budget, false) +
+        " ply=" + std::to_string(params.time_control.game_ply) +
+        " actual_mcts_ms=" +
+        std::to_string(static_cast<int>(time_budget.mcts_time_seconds * 1000.0f)) +
+        " hard_ms=" + std::to_string(time_budget.hard_deadline_ms));
+  }
+
+  if (auto book_move = ProbeOpeningBook()) {
+    Send("bestmove " + *book_move);
+    return;
+  }
+
   // Configure the dlshogi-style MCTS search.
-  search_config_.max_nodes = nodes_limit;
+  search_config_.max_nodes = params.nodes_limit;
   search_config_.max_time = time_budget.mcts_time_seconds;
   search_config_.time_budget = time_budget;
 
@@ -815,160 +1243,26 @@ void USIEngine::CmdGo(const std::vector<std::string>& parts) {
   search_->SetMaxNodes(search_config_.max_nodes);
   search_->SetTimeBudget(time_budget);
 
-  // --- Launch the root mate solver in parallel ---
-  // BNS owns fixed-size tables and therefore has no independent strength
-  // budget: MCTS controls its lifetime. The legacy tree df-pn retains a fixed
-  // node cap because its linear node pool is a memory allocation limit.
-  struct RootMateState {
-    std::unique_ptr<MateDfpnSolver> tree;
-    std::unique_ptr<MateBnsSolver> bns;
-    const bool use_bns;
-    const size_t nodes_limit;
-    std::atomic<bool> done{false};
-    std::atomic<bool> stop_requested{false};
-    std::atomic<bool> stopped_mcts{false};
-    std::mutex start_mutex;
-    std::condition_variable start_cv;
-    bool started = false;
-    Move mate_move;
-    ShogiBoard board;
-    std::int64_t elapsed_ms = 0;
-
-    RootMateState(bool use_bns_solver, const ShogiBoard& b)
-        : use_bns(use_bns_solver),
-          nodes_limit(use_bns_solver
-                          ? std::numeric_limits<size_t>::max()
-                          : kTreeDfpnMaxNodes),
-          board(b) {
-      if (use_bns) {
-        // Keep the two hot search tables inside the local cache slice. Their
-        // fixed allocation does not grow with nodes_limit.
-        bns = std::make_unique<MateBnsSolver>(/*tt_mb=*/4, nodes_limit);
-        bns->set_move_cache_mb(2);
-      } else {
-        tree = std::make_unique<MateDfpnSolver>(nodes_limit);
-      }
-    }
-
-    void Start() {
-      {
-        std::lock_guard<std::mutex> lock(start_mutex);
-        started = true;
-      }
-      start_cv.notify_all();
-    }
-
-    bool WaitForStart() {
-      std::unique_lock<std::mutex> lock(start_mutex);
-      start_cv.wait(lock, [this] {
-        return started || stop_requested.load(std::memory_order_acquire);
-      });
-      return started && !stop_requested.load(std::memory_order_acquire);
-    }
-
-    Move Search(MateDfpnSolver::Deadline deadline) {
-      return bns ? bns->search(board, nodes_limit, deadline)
-                 : tree->search(board, nodes_limit, deadline);
-    }
-
-    void Stop() {
-      stop_requested.store(true, std::memory_order_release);
-      if (bns)
-        bns->stop();
-      else
-        tree->stop();
-      start_cv.notify_all();
-    }
-
-    size_t NodesSearched() const {
-      return bns ? bns->get_nodes_searched() : tree->get_nodes_searched();
-    }
-
-    std::vector<Move> Pv() const {
-      return bns ? bns->get_pv() : tree->get_pv();
-    }
-
-    const char* SolverName() const { return use_bns ? "bns" : "dfpn"; }
-  };
-
-  auto root_mate =
-      std::make_shared<RootMateState>(root_mate_solver_bns_, board_);
-  auto root_mate_deadline = MateDfpnSolver::Deadline::max();
-  if (time_budget.hard_deadline_ms > 0) {
-    const int safe_deadline_ms = std::max(
-        time_budget.hard_deadline_ms - kRootMateDeadlineMarginMs, 1);
-    root_mate_deadline =
-        move_start_time + std::chrono::milliseconds(safe_deadline_ms);
-  }
-
-  // Search::Run releases this worker only after it has reset its stop flag.
-  // Otherwise a fast mate proof could call Stop() just before Run() and have
-  // that cancellation erased by search startup.
-  dlshogi_mcts::Search* const mcts_search = search_.get();
-  std::thread root_mate_thread(
-      [root_mate, root_mate_deadline, mcts_search]() {
-        if (root_mate->WaitForStart()) {
-          const auto started_at = std::chrono::steady_clock::now();
-          root_mate->mate_move = root_mate->Search(root_mate_deadline);
-          root_mate->elapsed_ms =
-              std::chrono::duration_cast<std::chrono::milliseconds>(
-                  std::chrono::steady_clock::now() - started_at)
-                  .count();
-          const bool proved_mate =
-              !root_mate->mate_move.is_null() &&
-              !MateDfpnSolver::IsNoMate(root_mate->mate_move);
-          root_mate->done.store(true, std::memory_order_release);
-          // Apply the same root repetition boundary before stopping MCTS. If
-          // defense-in-depth rejects a solver regression, normal search must
-          // still be allowed to finish and provide a usable fallback move.
-          if (proved_mate &&
-              RootMoveRepetitionResult(root_mate->board,
-                                       root_mate->mate_move) ==
-                  ShogiBoard::RepetitionResult::kNone) {
-            root_mate->stopped_mcts.store(true, std::memory_order_release);
-            mcts_search->Stop();
-          }
-        } else {
-          root_mate->done.store(true, std::memory_order_release);
-        }
-      });
-
-  // Exact watchdog: a condition-variable deadline avoids the old 0-50 ms
-  // polling/join delay. Pure node-limited searches remain uncapped.
   std::mutex watchdog_mutex;
   std::condition_variable watchdog_cv;
   bool search_done = false;
   std::atomic<bool> watchdog_fired{false};
-  std::thread watchdog;
-  if (time_budget.hard_deadline_ms > 0) {
-    const auto hard_deadline =
-        move_start_time +
-        std::chrono::milliseconds(time_budget.hard_deadline_ms);
-    watchdog = std::thread(
-        [this, root_mate, &watchdog_mutex, &watchdog_cv, &search_done,
-         &watchdog_fired,
-         hard_deadline]() {
-          std::unique_lock<std::mutex> lock(watchdog_mutex);
-          if (!watchdog_cv.wait_until(
-                  lock, hard_deadline, [&search_done] { return search_done; })) {
-            watchdog_fired.store(true, std::memory_order_release);
-            if (search_) search_->Stop();
-            root_mate->Stop();
-          }
-        });
-  }
+  auto launch = LaunchRootMateSearch(
+      time_budget, move_start_time, search_.get(),
+      watchdog_mutex, watchdog_cv, search_done, watchdog_fired);
 
   auto result =
       search_->Run(board_, position_start_key_, position_moves_,
-                   move_start_time, [root_mate] { root_mate->Start(); });
+                   move_start_time,
+                   [state = launch.state] { state->Start(); });
 
   // MCTS is the single owner of move time. Do not grant a separate post-MCTS
   // grace period: stop and join the mate worker as soon as MCTS returns.
   const bool root_mate_finished_before_stop =
-      root_mate->done.load(std::memory_order_acquire);
+      launch.state->done.load(std::memory_order_acquire);
   const auto join_started_at = std::chrono::steady_clock::now();
-  root_mate->Stop();
-  if (root_mate_thread.joinable()) root_mate_thread.join();
+  launch.state->Stop();
+  if (launch.search_thread.joinable()) launch.search_thread.join();
   const auto root_mate_join_ms =
       std::chrono::duration_cast<std::chrono::milliseconds>(
           std::chrono::steady_clock::now() - join_started_at)
@@ -979,139 +1273,19 @@ void USIEngine::CmdGo(const std::vector<std::string>& parts) {
     search_done = true;
   }
   watchdog_cv.notify_all();
-  if (watchdog.joinable()) watchdog.join();
+  if (launch.watchdog_thread.joinable()) launch.watchdog_thread.join();
+
   Log(std::string("tree_reused ") + (result.tree_reused ? "true" : "false") +
       " root_visits_before " +
       std::to_string(result.root_visits_before));
-  if (time_management_mode_ != TimeManagementMode::kOff || time_debug_) {
-    const auto& decision = result.time_decision;
-    const auto& snapshot = decision.snapshot;
-    std::ostringstream timing;
-    timing << "time_result mode="
-           << TimeManagementModeName(result.time_budget.mode)
-           << " reason=" << TimeStopReasonName(decision.reason)
-           << " search_ms="
-           << static_cast<int>(result.time_sec * 1000.0f)
-           << " budget_ms=" << result.time_budget.earliest_stop_ms << "/"
-           << result.time_budget.target_stop_ms << "/"
-           << result.time_budget.latest_search_ms
-           << " response_ms=" << result.time_budget.response_deadline_ms
-           << " effective_ms=" << decision.effective_deadline_ms
-           << " playouts=" << snapshot.new_playouts
-           << " best_visits=" << snapshot.best_visits
-           << " second_visits=" << snapshot.second_visits
-           << " best_q=" << std::fixed << std::setprecision(4)
-           << snapshot.best_q
-           << " second_q=" << snapshot.second_q
-           << " stable_ms=" << decision.stable_ms
-           << " projected=" << decision.projected_remaining
-           << " best_changes=" << decision.best_changes
-           << " extension=" << (decision.extension_active ? 1 : 0)
-           << " root_guard_cancelled="
-           << (result.root_guard_cancelled ? 1 : 0);
-    Log(timing.str());
-  }
 
-  const bool root_mate_is_mate =
-      !root_mate->mate_move.is_null() &&
-      !MateDfpnSolver::IsNoMate(root_mate->mate_move);
-  const bool root_mate_is_nomate =
-      MateDfpnSolver::IsNoMate(root_mate->mate_move);
-  const char* root_mate_outcome =
-      root_mate_is_mate
-          ? "mate"
-          : root_mate_is_nomate
-                ? "nomate"
-                : root_mate_finished_before_stop ? "limit" : "stopped";
-  const char* root_mate_stop_source = "mcts";
-  if (root_mate->stopped_mcts.load(std::memory_order_acquire)) {
-    root_mate_stop_source = "mate";
-  } else if (root_mate_is_nomate || root_mate_finished_before_stop) {
-    root_mate_stop_source = "self";
-  } else if (watchdog_fired.load(std::memory_order_acquire)) {
-    root_mate_stop_source = "watchdog";
-  }
-  Log("root_mate solver=" + std::string(root_mate->SolverName()) +
-      " outcome=" + root_mate_outcome +
-      " elapsed_ms=" + std::to_string(root_mate->elapsed_ms) +
-      " nodes=" + std::to_string(root_mate->NodesSearched()) +
-      " stop_source=" + root_mate_stop_source +
-      " join_ms=" + std::to_string(root_mate_join_ms));
+  LogTimeResult(result);
+  LogRootMateResult(*launch.state, root_mate_finished_before_stop,
+                    watchdog_fired.load(std::memory_order_acquire),
+                    root_mate_join_ms);
+  LogTimeResponse(move_start_time, time_budget, *launch.state);
 
-  if (time_management_mode_ != TimeManagementMode::kOff || time_debug_) {
-    const auto response_elapsed_ms =
-        std::chrono::duration_cast<std::chrono::milliseconds>(
-            std::chrono::steady_clock::now() - move_start_time)
-            .count();
-    Log("time_response elapsed_ms=" +
-        std::to_string(response_elapsed_ms) +
-        " deadline_ms=" +
-        std::to_string(time_budget.response_deadline_ms) +
-        " root_mate_nodes=" +
-        std::to_string(root_mate->NodesSearched()));
-  }
-
-  // --- Choose result ---
-  bool use_mate = root_mate_is_mate;
-
-  // Defense in depth: a root df-pn result must not replace MCTS when its very
-  // first move enters a repetition. The solver now adjudicates these nodes
-  // itself, but keeping the final boundary check prevents a future df-pn
-  // regression from turning an OUTE_SENNICHITE loss into bestmove.
-  if (use_mate) {
-    const auto repetition =
-        RootMoveRepetitionResult(board_, root_mate->mate_move);
-    if (repetition != ShogiBoard::RepetitionResult::kNone) {
-      Log("Rejected root mate move " + root_mate->mate_move.ToString() +
-          ": repetition=" + RepetitionResultName(repetition));
-      use_mate = false;
-    }
-  }
-
-  if (use_mate) {
-    auto pv = root_mate->Pv();
-    std::string pv_str;
-    for (const auto& m : pv) {
-      if (!pv_str.empty()) pv_str += " ";
-      pv_str += m.ToString();
-    }
-    if (pv_str.empty()) pv_str = root_mate->mate_move.ToString();
-
-    int mate_ply = (int)pv.size();
-    Log("Root mate solver found mate in " + std::to_string(mate_ply) +
-        " ply");
-
-    Send("info depth 1 score mate " + std::to_string((mate_ply + 1) / 2) +
-         " nodes " + std::to_string(root_mate->NodesSearched()) +
-         " pv " + pv_str);
-    Send("bestmove " + root_mate->mate_move.ToString());
-    return;
-  }
-
-  // --- Use MCTS result ---
-  if (result.best_move.is_null()) {
-    Send("bestmove resign");
-    return;
-  }
-
-  if (result.nn_cache.capacity > 0) {
-    Log(FormatNNCacheStats(result.nn_cache));
-  }
-
-  USISearchInfo usi_info;
-  usi_info.pv = result.pv;
-  if (usi_info.pv.empty()) usi_info.pv.push_back(result.best_move);
-  usi_info.depth = static_cast<int>(usi_info.pv.size());
-  usi_info.seldepth = usi_info.depth;
-  usi_info.score_cp = result.score_cp;
-  usi_info.nodes = std::max(result.nodes, 0);
-  usi_info.nps = static_cast<std::uint64_t>(std::max(result.nps, 0.0f));
-  usi_info.hashfull = NNCacheHashfull(result.nn_cache);
-  usi_info.time_ms = static_cast<std::uint64_t>(
-      std::max(result.time_sec, 0.0f) * 1000.0f);
-  Send(FormatUSISearchInfo(usi_info));
-
-  Send("bestmove " + result.best_move.ToString());
+  SelectAndReportBestMove(result, *launch.state);
 }
 
 void USIEngine::CmdGoMate(const std::vector<std::string>& parts) {

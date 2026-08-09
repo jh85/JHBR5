@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 """
 BT4-v2 Transformer Model for Shogi.
 
@@ -9,11 +11,13 @@ Changes from v1:
     delta so promote/non-promote choices are trainable
 
 Architecture:
-  - PE-Dense input embedding (same as v1)
-  - Encoder stack with multi-head attention + smolgen (same as v1)
+  - PE-Dense input embedding v2 revision: raw piece planes are compressed with
+    a dense projection before being concatenated with the non-piece planes.
+  - Encoder stack with multi-head attention + smolgen; optional pre-norm and
+    gated attention (post-norm by default). v1 DeepNorm scaling is not used.
   - NEW: Direction-based attention policy head (81 × 27 = 2187 moves)
-  - WDL value head (same as v1)
-  - Moves-left head (same as v1)
+  - WDL value head
+  - Moves-left head
 
 Move encoding (dlshogi-compatible):
   Directions 0-9:   non-promotion (UP, UP_LEFT, UP_RIGHT, LEFT, RIGHT,
@@ -24,11 +28,12 @@ Move encoding (dlshogi-compatible):
 """
 
 import math
+from collections import defaultdict
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.utils.checkpoint
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 
 # =====================================================================
@@ -72,8 +77,8 @@ SLIDING_DIRS = {0, 1, 2, 3, 4, 5, 6, 7}
 STEP_DIRS = {8, 9}  # knight jumps
 
 
-def move_to_direction(from_sq, to_sq):
-    """Convert (from, to) to direction index. Returns -1 if not a valid direction."""
+def _compute_move_to_direction(from_sq: int, to_sq: int) -> int:
+    """Original implementation used to precompute _DIRECTION_TABLE."""
     from_f, from_r = from_sq // 9, from_sq % 9
     to_f, to_r = to_sq // 9, to_sq % 9
     df = to_f - from_f
@@ -103,7 +108,18 @@ def move_to_direction(from_sq, to_sq):
     return -1
 
 
-def make_direction_policy_index(move_str, flip):
+_DIRECTION_TABLE = torch.tensor(
+    [[_compute_move_to_direction(from_sq, to_sq) for to_sq in range(81)] for from_sq in range(81)],
+    dtype=torch.long,
+)
+
+
+def move_to_direction(from_sq: int, to_sq: int) -> int:
+    """Convert (from, to) to direction index. Returns -1 if not a valid direction."""
+    return int(_DIRECTION_TABLE[from_sq][to_sq])
+
+
+def make_direction_policy_index(move_str: str, flip: bool) -> int:
     """
     Convert a USI move string to a direction-based policy index (0-2186).
     If flip=True, rotate 180° (for WHITE's perspective).
@@ -194,31 +210,59 @@ class ShogiBT4v2Config:
     norm_type: str = "layernorm"
     no_qkv_bias: bool = True
 
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self, "input_planes", self.num_piece_planes + self.hand_planes + self.aux_planes
+        )
+        if self.embedding_size % self.num_heads != 0:
+            raise ValueError(
+                f"embedding_size ({self.embedding_size}) must be divisible by "
+                f"num_heads ({self.num_heads})"
+            )
+        if self.policy_d_model % self.num_heads != 0:
+            raise ValueError(
+                f"policy_d_model ({self.policy_d_model}) must be divisible by "
+                f"num_heads ({self.num_heads})"
+            )
+
     @property
-    def ffn_hidden(self):
+    def ffn_hidden(self) -> int:
         return int(self.embedding_size * self.ffn_multiplier)
 
 
 # =====================================================================
-# Shared components (same as v1)
+# Shared components
 # =====================================================================
 
-def get_activation(name):
-    return {"relu": nn.ReLU(), "mish": nn.Mish(), "silu": nn.SiLU()}.get(name, nn.Mish())
+def get_activation(name: str) -> nn.Module:
+    activations = {"relu": nn.ReLU(), "mish": nn.Mish(), "silu": nn.SiLU()}
+    if name not in activations:
+        raise ValueError(f"Unknown activation: {name!r}")
+    return activations[name]
 
-def make_norm(d, cfg):
+
+def make_norm(d: int, cfg: ShogiBT4v2Config) -> nn.Module:
     return nn.RMSNorm(d) if cfg.norm_type == "rmsnorm" else nn.LayerNorm(d)
 
 
 class InputEmbedding(nn.Module):
-    """PE-Dense embedding (same as v1)."""
-    def __init__(self, cfg):
+    """PE-Dense input embedding (v2 revision).
+
+    Raw piece planes are first flattened and compressed with a dense projection;
+    the compressed spatial features are concatenated with the remaining
+    (non-piece) planes and projected to the model dimension.  A learned
+    multiplicative/additive gate is applied before the final layer norm, and the
+    FFN residual is added after the norm, which differs from the v1 ordering.
+    """
+
+    def __init__(self, cfg: ShogiBT4v2Config) -> None:
         super().__init__()
         sq = cfg.num_squares
         d = cfg.embedding_size
         ds = cfg.embedding_dense_size
         pp = cfg.num_piece_planes
 
+        self.num_piece_planes = pp
         self.mult_gate = nn.Parameter(torch.ones(sq, d))
         self.add_gate = nn.Parameter(torch.zeros(sq, d))
         self.preproc = nn.Linear(sq * pp, sq * ds)
@@ -228,10 +272,9 @@ class InputEmbedding(nn.Module):
         self.ffn2 = nn.Linear(cfg.ffn_hidden, d)
         self.act = get_activation(cfg.activation)
 
-    def forward(self, x):
-        B = x.shape[0]
-        piece_planes = torch.flatten(x[:, :28], 1)
-        other_planes = x[:, 28:].flatten(2).transpose(1, 2)  # (B, C-28, 81) -> (B, 81, C-28)
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        piece_planes = torch.flatten(x[:, : self.num_piece_planes], 1)
+        other_planes = x[:, self.num_piece_planes :].flatten(2).transpose(1, 2)  # (B, C-pp, 81) -> (B, 81, C-pp)
         dense = self.preproc(piece_planes).unflatten(1, (81, -1))
         combined = torch.cat([dense, other_planes], dim=-1)
         h = self.act(self.embed(combined))
@@ -242,8 +285,9 @@ class InputEmbedding(nn.Module):
 
 
 class Smolgen(nn.Module):
-    """Smolgen: generates per-position attention biases (same as v1)."""
-    def __init__(self, cfg, global_gen):
+    """Smolgen: generates per-position attention biases."""
+
+    def __init__(self, cfg: ShogiBT4v2Config, global_gen: nn.Linear) -> None:
         super().__init__()
         d = cfg.embedding_size
         sq = cfg.num_squares
@@ -256,8 +300,7 @@ class Smolgen(nn.Module):
         self.global_gen = global_gen
         self.cfg = cfg
 
-    def forward(self, x):
-        B = x.shape[0]
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         h = torch.flatten(self.act(self.compress(x)), 1)
         h = self.act(self.ln1(self.dense1(h)))
         h = self.act(self.ln2(self.dense2(h)))
@@ -267,8 +310,15 @@ class Smolgen(nn.Module):
 
 
 class EncoderBlock(nn.Module):
-    """Transformer encoder block with smolgen (same as v1)."""
-    def __init__(self, cfg, global_gen):
+    """Transformer encoder block with smolgen and optional gated attention.
+
+    Post-normalization is used by default.  When ``cfg.pre_norm`` is set, the
+    block uses pre-normalization residuals instead.  ``cfg.gated_attention``
+    enables a sigmoid gate on the attention output.  v1 DeepNorm scaling is not
+    used.
+    """
+
+    def __init__(self, cfg: ShogiBT4v2Config, global_gen: nn.Linear) -> None:
         super().__init__()
         d = cfg.embedding_size
         no_qkv_bias = cfg.no_qkv_bias
@@ -286,7 +336,7 @@ class EncoderBlock(nn.Module):
         self.ffn_ln = make_norm(d, cfg)
         self.cfg = cfg
 
-    def _attention(self, a):
+    def _attention(self, a: torch.Tensor) -> torch.Tensor:
         """Multi-head attention (+ smolgen bias, + optional gate) on input `a`.
         Returns the projected output, before any residual add."""
         heads = self.cfg.num_heads
@@ -302,7 +352,7 @@ class EncoderBlock(nn.Module):
             out = out * torch.sigmoid(self.gate_proj(a))  # gated attention
         return self.out_proj(out)
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         if self.cfg.pre_norm:
             # Pre-norm: normalize the input, add the raw residual.
             h = x + self._attention(self.ln1(x))
@@ -331,12 +381,12 @@ class DirectionPolicyHead(nn.Module):
     older checkpoint initially retains its exact policy behavior while
     fine-tuning can learn promote/non-promote preferences.
 
-    For drops: learned query vectors (same as v1).
+    For drops: learned query vectors.
 
     Output: (B, 2187) = 81 squares × 27 move types
     """
 
-    def __init__(self, cfg: ShogiBT4v2Config):
+    def __init__(self, cfg: ShogiBT4v2Config) -> None:
         super().__init__()
         d = cfg.policy_d_model
         self.cfg = cfg
@@ -359,15 +409,14 @@ class DirectionPolicyHead(nn.Module):
         # Build gather indices for ONNX-compatible (from,to) → (direction,to) mapping.
         # For each of the 2187 policy slots, precompute which board_flat indices to
         # gather and take max over (handles sliding pieces with multiple sources).
-        MAX_SOURCES = 8  # max sliding distance
+        self.max_sources = 8  # max sliding distance
 
         # gather_idx[p][k] = index into board_flat (81*81), or 0 (masked out)
         # gather_mask[p][k] = 1.0 if valid, 0.0 if padding
-        gather_idx = torch.zeros(POLICY_SIZE, MAX_SOURCES, dtype=torch.long)
-        gather_mask = torch.zeros(POLICY_SIZE, MAX_SOURCES)
+        gather_idx = torch.zeros(POLICY_SIZE, self.max_sources, dtype=torch.long)
+        gather_mask = torch.zeros(POLICY_SIZE, self.max_sources)
 
         # Build mapping: for each policy slot, collect all (from, to) pairs
-        from collections import defaultdict
         policy_to_sources = defaultdict(list)  # policy_idx → [board_flat_idx, ...]
 
         for from_sq in range(81):
@@ -389,16 +438,17 @@ class DirectionPolicyHead(nn.Module):
                     policy_to_sources[p_promo].append(flat_idx)
 
         for p, sources in policy_to_sources.items():
-            for k, src in enumerate(sources[:MAX_SOURCES]):
+            for k, src in enumerate(sources[: self.max_sources]):
                 gather_idx[p][k] = src
                 gather_mask[p][k] = 1.0
 
         self.register_buffer('gather_idx', gather_idx)
         self.register_buffer('gather_mask', gather_mask)
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         """x: (B, 81, d_model) → (B, 2187) policy logits"""
         d = self.cfg.policy_d_model
+        B = x.shape[0]
 
         pe = self.act(self.embed(x))
         Q = self.wq(pe)  # (B, 81, d)
@@ -409,19 +459,15 @@ class DirectionPolicyHead(nn.Module):
         board_logits = torch.matmul(Q, K.transpose(-2, -1)) * scale
         board_flat = board_logits.flatten(1)  # (B, 6561)
 
-        # Gather candidate logits for each policy slot.
-        # gather_idx: (2187, 8), gather_mask: (2187, 8)
-        # For each of 8 source slots, index_select from board_flat → (B, 2187)
-        # Then take masked max over the 8 sources.
-        # This avoids fancy indexing that produces static Reshape/Expand in ONNX.
-        channels = []
-        for c in range(self.gather_idx.shape[1]):
-            idx_c = self.gather_idx[:, c]  # (2187,) — indices into 6561
-            selected = torch.index_select(board_flat, 1, idx_c)  # (B, 2187)
-            channels.append(selected)
-        gathered = torch.stack(channels, dim=2)  # (B, 2187, 8)
+        # Gather candidate logits for each policy slot using torch.gather.
+        # gather_idx: (2187, max_sources), gather_mask: (2187, max_sources)
+        # Expanding board_flat on the trailing dim lets us gather all source
+        # slots in one call instead of looping over index_select.
+        gather_idx_expanded = self.gather_idx.unsqueeze(0).expand(B, -1, -1)  # (B, 2187, max_sources)
+        board_flat_expanded = board_flat.unsqueeze(-1).expand(-1, -1, self.max_sources)  # (B, 6561, max_sources)
+        gathered = torch.gather(board_flat_expanded, 1, gather_idx_expanded)  # (B, 2187, max_sources)
 
-        mask = self.gather_mask.unsqueeze(0)  # (1, 2187, 8)
+        mask = self.gather_mask.unsqueeze(0)  # (1, 2187, max_sources)
         gathered = gathered * mask + (1.0 - mask) * (-1e4)
 
         board_policy = gathered.max(dim=2).values  # (B, 2187)
@@ -452,11 +498,13 @@ class DirectionPolicyHead(nn.Module):
 
 
 # =====================================================================
-# Value and MLH heads (same as v1)
+# Value and MLH heads
 # =====================================================================
 
 class ValueHead(nn.Module):
-    def __init__(self, cfg):
+    """WDL value head: projects encoder output to win/draw/loss logits."""
+
+    def __init__(self, cfg: ShogiBT4v2Config) -> None:
         super().__init__()
         d = cfg.embedding_size
         self.embed = nn.Linear(d, cfg.value_embedding)
@@ -464,7 +512,7 @@ class ValueHead(nn.Module):
         self.fc1 = nn.Linear(cfg.num_squares * cfg.value_embedding, cfg.value_hidden)
         self.fc2 = nn.Linear(cfg.value_hidden, 3)
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         h = self.act(self.embed(x))
         h = torch.flatten(h, 1)  # (B, 81, emb) -> (B, 81*emb)
         h = self.act(self.fc1(h))
@@ -474,7 +522,7 @@ class ValueHead(nn.Module):
 class MovesLeftHead(nn.Module):
     """Lc0-style V1 scalar head: plies from the current position to the end."""
 
-    def __init__(self, cfg):
+    def __init__(self, cfg: ShogiBT4v2Config) -> None:
         super().__init__()
         d = cfg.embedding_size
         self.embed = nn.Linear(d, cfg.mlh_embedding)
@@ -482,7 +530,7 @@ class MovesLeftHead(nn.Module):
         self.fc1 = nn.Linear(cfg.num_squares * cfg.mlh_embedding, cfg.mlh_hidden)
         self.fc2 = nn.Linear(cfg.mlh_hidden, 1)
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         h = self.act(self.embed(x))
         h = torch.flatten(h, 1)  # (B, 81, emb) -> (B, 81*emb)
         h = self.act(self.fc1(h))
@@ -503,7 +551,7 @@ class ShogiBT4v2(nn.Module):
     Output: policy (batch, 2187), wdl (batch, 3), mlh (batch, 1)
     """
 
-    def __init__(self, cfg: ShogiBT4v2Config = None):
+    def __init__(self, cfg: ShogiBT4v2Config | None = None) -> None:
         super().__init__()
         if cfg is None:
             cfg = ShogiBT4v2Config()
@@ -538,7 +586,7 @@ class ShogiBT4v2(nn.Module):
             for enc in self.encoders:
                 nn.init.constant_(enc.gate_proj.bias, 3.0)
 
-    def _init_weights(self):
+    def _init_weights(self) -> None:
         for m in self.modules():
             if isinstance(m, nn.Linear):
                 nn.init.trunc_normal_(m.weight, std=0.02)
@@ -547,8 +595,10 @@ class ShogiBT4v2(nn.Module):
             elif isinstance(m, nn.LayerNorm):
                 nn.init.ones_(m.weight)
                 nn.init.zeros_(m.bias)
+            elif isinstance(m, nn.RMSNorm):
+                nn.init.ones_(m.weight)
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         h = self.embedding(x)
         for enc in self.encoders:
             checkpoint_this_block = (
@@ -567,7 +617,7 @@ class ShogiBT4v2(nn.Module):
         mlh = self.mlh_head(h)
         return policy, wdl, mlh
 
-    def count_parameters(self):
+    def count_parameters(self) -> int:
         return sum(p.numel() for p in self.parameters() if p.requires_grad)
 
 
@@ -577,17 +627,20 @@ PROMOTION_DELTA_STATE_KEYS = frozenset({
 })
 
 
-def strip_state_dict_wrapper_prefix(state_dict):
-    """Remove DataParallel/DDP's `module.` prefix when present."""
-    if any(key.startswith("module.") for key in state_dict):
-        return {
-            key.removeprefix("module."): value
-            for key, value in state_dict.items()
-        }
+def strip_state_dict_wrapper_prefix(state_dict: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+    """Remove DataParallel/DDP's `module.` prefix and torch.compile's `_orig_mod.` prefix when present."""
+    for prefix in ("module.", "_orig_mod."):
+        if any(key.startswith(prefix) for key in state_dict):
+            return {
+                key.removeprefix(prefix): value
+                for key, value in state_dict.items()
+            }
     return state_dict
 
 
-def load_state_dict_with_promotion_migration(model, state_dict):
+def load_state_dict_with_promotion_migration(
+    model: nn.Module, state_dict: dict[str, torch.Tensor]
+) -> bool:
     """Load a checkpoint, allowing only the legacy promotion-delta omission.
 
     Returns True when an older checkpoint was migrated.  Any unrelated
@@ -601,7 +654,7 @@ def load_state_dict_with_promotion_migration(model, state_dict):
     legacy = missing == PROMOTION_DELTA_STATE_KEYS and not unexpected
     if missing and not legacy:
         raise RuntimeError(
-            "Checkpoint is missing unexpected model parameters: "
+            "Checkpoint is missing model parameters: "
             + ", ".join(sorted(missing))
         )
     if unexpected:

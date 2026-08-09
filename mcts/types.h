@@ -11,11 +11,7 @@ constexpr int kVirtualLoss = 1;
 
 template <typename T>
 inline void AtomicFetchAdd(std::atomic<T>* obj, T arg) {
-  T expected = obj->load(std::memory_order_relaxed);
-  while (!obj->compare_exchange_weak(expected, expected + arg,
-                                     std::memory_order_acq_rel,
-                                     std::memory_order_relaxed)) {
-  }
+  obj->fetch_add(arg, std::memory_order_acq_rel);
 }
 
 class Timer {

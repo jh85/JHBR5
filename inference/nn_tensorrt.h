@@ -25,25 +25,14 @@
 #include <vector>
 
 #include "inference/model_format.h"
+#include "inference/nn_output.h"
 #include "shogi/board.h"
-#include "shogi/encoder.h"
 #include "shogi/types.h"
 
 namespace jhbr2 {
 
-using lczero::ShogiBoard;
-using lczero::Move;
 using lczero::MoveList;
-
-// Re-use the same NNOutput struct.
-struct NNOutput {
-  float value = 0.0f;
-  float draw = 0.0f;
-  float wdl[3] = {0.0f, 0.0f, 0.0f};
-  float moves_left = 0.0f;  // MLH head: model's plies-to-end estimate (0 if none)
-  bool valid = true;  // false results must not be cached or backed up
-  std::vector<float> policy;
-};
+using lczero::ShogiBoard;
 
 class NNEvaluator {
  public:

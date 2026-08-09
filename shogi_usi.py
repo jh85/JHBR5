@@ -1,7 +1,9 @@
 """
 USI (Universal Shogi Interface) protocol implementation.
 
-Connects our ShogiBT4 model + MCTS search to Shogi GUIs and tournament software.
+Connects our ShogiBT4-v2 model + MCTS search to Shogi GUIs and tournament
+software. The v2 model uses a dlshogi-style direction-based policy (2187
+outputs) and 148 input planes.
 
 USI protocol reference:
   http://shogidokoro.starfree.jp/usi.html
@@ -21,7 +23,6 @@ import math
 import cshogi
 import numpy as np
 
-from shogi_model import generate_attn_policy_map
 from shogi_train import sfen_to_planes, move_to_policy_index
 from shogi_mcts import MCTSConfig
 
@@ -40,55 +41,10 @@ class OnnxEvaluator:
             providers.append("CUDAExecutionProvider")
         providers.append("CPUExecutionProvider")
         self.sess = ort.InferenceSession(onnx_path, providers=providers)
-        self._build_policy_index()
-
-    def _build_policy_index(self):
-        """Build policy index lookup tables."""
-        BOARD = 9
-        def in_bounds(f, r): return 0 <= f < BOARD and 0 <= r < BOARD
-        piece_moves_def = {
-            'pawn':[(0,-1,1)],'lance':[(0,-1,8)],'knight':[(-1,-2,1),(1,-2,1)],
-            'silver':[(0,-1,1),(-1,-1,1),(1,-1,1),(-1,1,1),(1,1,1)],
-            'gold':[(0,-1,1),(-1,-1,1),(1,-1,1),(-1,0,1),(1,0,1),(0,1,1)],
-            'bishop':[(-1,-1,8),(-1,1,8),(1,-1,8),(1,1,8)],
-            'rook':[(0,-1,8),(0,1,8),(-1,0,8),(1,0,8)],
-            'king':[(df,dr,1) for df in(-1,0,1) for dr in(-1,0,1) if(df,dr)!=(0,0)],
-            'horse':[(-1,-1,8),(-1,1,8),(1,-1,8),(1,1,8),(0,-1,1),(0,1,1),(-1,0,1),(1,0,1)],
-            'dragon':[(0,-1,8),(0,1,8),(-1,0,8),(1,0,8),(-1,-1,1),(-1,1,1),(1,-1,1),(1,1,1)],
-        }
-        valid_pairs = set()
-        for moves in piece_moves_def.values():
-            for f in range(9):
-                for r in range(9):
-                    for df,dr,md in moves:
-                        for dist in range(1,md+1):
-                            nf,nr=f+df*dist,r+dr*dist
-                            if not in_bounds(nf,nr): break
-                            valid_pairs.add((f*9+r,nf*9+nr))
-
-        self.board_idx = {}
-        self.promo_idx = {}
-        self.drop_idx = {}
-        current = 0
-        for f,t in sorted(valid_pairs):
-            self.board_idx[(f,t)] = current; current += 1
-        promo_pairs = {(f,t) for f,t in valid_pairs if f%9<=2 or t%9<=2}
-        for f,t in sorted(promo_pairs):
-            self.promo_idx[(f,t)] = current; current += 1
-        for pt in range(7):
-            for sq in range(81):
-                self.drop_idx[(pt,sq)] = current; current += 1
 
     def move_to_index(self, move_usi, flip):
-        """Convert USI move string to policy index."""
-        info = move_to_policy_index(move_usi, flip)
-        if info[0] == 'drop':
-            _, pt, sq = info
-            return self.drop_idx.get((pt, sq), -1)
-        elif info[0] == 'board':
-            _, f, t, promote = info
-            return (self.promo_idx if promote else self.board_idx).get((f, t), -1)
-        return -1
+        """Convert USI move string to the v2 direction-based policy index."""
+        return move_to_policy_index(move_usi, flip)
 
     def evaluate(self, sfen, legal_moves_usi):
         """

@@ -70,6 +70,36 @@ static uint64_t HashHand(Color c, const Hand& h) {
 }
 
 // =====================================================================
+// Promotion helpers (shared by all move generators)
+// =====================================================================
+
+namespace {
+
+// Return the destination rank relative to the moving side.
+// For BLACK this is the raw rank; for WHITE it is mirrored.
+inline Rank RelativeRank(Rank rank, Color c) {
+  return c == BLACK ? rank : Rank::FromIdx(8 - rank.idx);
+}
+
+// True if `pt` can promote on this move (piece type supports promotion and
+// either the source or destination square is in the promotion zone).
+inline bool CanPromote(PieceType pt, Color us, Square from, Square to) {
+  return pt.CanPromote() &&
+         (from.InPromotionZone(us) || to.InPromotionZone(us));
+}
+
+// True if a piece of type `pt` MUST promote when moving to `to`.
+// Only pawn, lance and knight have forced promotion squares in shogi.
+inline bool MustPromote(PieceType pt, Color us, Square to) {
+  if (pt != kPawn && pt != kLance && pt != kKnight) return false;
+  const Rank rel = RelativeRank(to.rank(), us);
+  if (pt == kKnight) return rel.idx <= 1;  // last two ranks
+  return rel.idx == 0;                       // last rank
+}
+
+}  // namespace
+
+// =====================================================================
 // Step attack tables (non-sliding pieces)
 // =====================================================================
 
@@ -531,28 +561,10 @@ void ShogiBoard::GenerateBoardMoves(MoveList& moves) const {
     targets &= ~our;
 
     targets.ForEach([&](Square to) {
-      bool can_promote = false;
-      bool must_promote = false;
-
-      if (pt.CanPromote()) {
-        // Can promote if from or to is in promotion zone.
-        can_promote = from.InPromotionZone(us) || to.InPromotionZone(us);
-
-        // Must promote if the piece can't move further from the dest:
-        Rank dest_rank = to.rank();
-        Rank rel_rank = (us == BLACK) ? dest_rank
-                                      : Rank::FromIdx(8 - dest_rank.idx);
-        if (pt == kPawn || pt == kLance) {
-          must_promote = (rel_rank.idx == 0);  // rank a for BLACK
-        } else if (pt == kKnight) {
-          must_promote = (rel_rank.idx <= 1);  // ranks a,b for BLACK
-        }
-      }
-
-      if (can_promote) {
+      if (CanPromote(pt, us, from, to)) {
         moves.push_back(Move::Promotion(from, to));
       }
-      if (!must_promote) {
+      if (!MustPromote(pt, us, to)) {
         moves.push_back(Move::Normal(from, to));
       }
     });
@@ -590,26 +602,10 @@ void ShogiBoard::GenerateBoardMovesNonCheck(MoveList& moves,
     }
 
     targets.ForEach([&](Square to) {
-      bool can_promote = false;
-      bool must_promote = false;
-
-      if (pt.CanPromote()) {
-        can_promote = from.InPromotionZone(us) || to.InPromotionZone(us);
-
-        Rank dest_rank = to.rank();
-        Rank rel_rank = (us == BLACK) ? dest_rank
-                                      : Rank::FromIdx(8 - dest_rank.idx);
-        if (pt == kPawn || pt == kLance) {
-          must_promote = (rel_rank.idx == 0);
-        } else if (pt == kKnight) {
-          must_promote = (rel_rank.idx <= 1);
-        }
-      }
-
-      if (can_promote) {
+      if (CanPromote(pt, us, from, to)) {
         moves.push_back(Move::Promotion(from, to));
       }
-      if (!must_promote) {
+      if (!MustPromote(pt, us, to)) {
         moves.push_back(Move::Normal(from, to));
       }
     });
@@ -812,23 +808,12 @@ void ShogiBoard::GenerateEvasionMovesImpl(bool stop_after_one,
         continue;
       }
       PieceType pt = piece_on(from).GetType();
-      bool can_promote =
-          pt.CanPromote() &&
-          (from.InPromotionZone(us) || to.InPromotionZone(us));
-      bool must_promote = false;
-      if (pt == kPawn || pt == kLance || pt == kKnight) {
-        Rank dest_rank = to.rank();
-        Rank rel_rank = us == BLACK ? dest_rank
-                                    : Rank::FromIdx(8 - dest_rank.idx);
-        must_promote = (pt == kKnight) ? rel_rank.idx <= 1
-                                       : rel_rank.idx == 0;
-      }
 
-      if (can_promote) {
+      if (CanPromote(pt, us, from, to)) {
         legal.push_back(Move::Promotion(from, to));
         if (stop_after_one) return;
       }
-      if (!must_promote) {
+      if (!MustPromote(pt, us, to)) {
         legal.push_back(Move::Normal(from, to));
         if (stop_after_one) return;
       }
@@ -1078,19 +1063,7 @@ void ShogiBoard::GenerateCheckingMovesNonCheck(MoveList* output) {
     }
   };
 
-  auto must_promote = [&](PieceType pt, Square to) {
-    if (pt != kPawn && pt != kLance && pt != kKnight) return false;
-    Rank dest_rank = to.rank();
-    Rank rel_rank = us == BLACK ? dest_rank
-                                : Rank::FromIdx(8 - dest_rank.idx);
-    if (pt == kPawn || pt == kLance) return rel_rank.idx == 0;
-    return rel_rank.idx <= 1;
-  };
 
-  auto can_promote = [&](PieceType pt, Square from, Square to) {
-    return pt.CanPromote() &&
-           (from.InPromotionZone(us) || to.InPromotionZone(us));
-  };
 
   const Square our_ksq = king_sq_[us];
   auto add_if_legal = [&](Move move) {
@@ -1114,11 +1087,11 @@ void ShogiBoard::GenerateCheckingMovesNonCheck(MoveList* output) {
 
   auto add_variants = [&](Square from, Square to, PieceType pt,
                           const auto& gives_check) {
-    if (can_promote(pt, from, to)) {
+    if (CanPromote(pt, us, from, to)) {
       PieceType promoted = pt.Promote();
       if (gives_check(promoted)) add_if_legal(Move::Promotion(from, to));
     }
-    if (!must_promote(pt, to) && gives_check(pt)) {
+    if (!MustPromote(pt, us, to) && gives_check(pt)) {
       add_if_legal(Move::Normal(from, to));
     }
   };
@@ -1138,10 +1111,10 @@ void ShogiBoard::GenerateCheckingMovesNonCheck(MoveList* output) {
     Bitboard direct_union = targets & (now | promo);
     while (direct_union.Any()) {
       Square to = direct_union.Pop();
-      if (promo.Test(to) && can_promote(pt, from, to)) {
+      if (promo.Test(to) && CanPromote(pt, us, from, to)) {
         add_if_legal(Move::Promotion(from, to));
       }
-      if (now.Test(to) && !must_promote(pt, to)) {
+      if (now.Test(to) && !MustPromote(pt, us, to)) {
         add_if_legal(Move::Normal(from, to));
       }
     }
@@ -1520,18 +1493,7 @@ Move ShogiBoard::FindMateInOneNonCheckImpl() {
       kPawn.idx, kKing.idx,
   };
 
-  auto must_promote = [&](PieceType type, Square to) {
-    if (type != kPawn && type != kLance && type != kKnight) return false;
-    const Rank rank = to.rank();
-    const Rank relative =
-        Us == BLACK ? rank : Rank::FromIdx(8 - rank.idx);
-    return type == kKnight ? relative.idx <= 1 : relative.idx == 0;
-  };
 
-  auto can_promote = [&](PieceType type, Square from, Square to) {
-    return type.CanPromote() &&
-           (from.InPromotionZone(Us) || to.InPromotionZone(Us));
-  };
 
   for (const int type_idx : kPieceOrder) {
     const PieceType type = PieceType::FromIdx(type_idx);
@@ -1577,12 +1539,12 @@ Move ShogiBoard::FindMateInOneNonCheckImpl() {
           return IsMateAfterMateProbe<Us>(moved_type, to) ? move : Move();
         };
 
-        if (can_promote(type, from, to)) {
+        if (CanPromote(type, Us, from, to)) {
           mate = try_variant(
               type.Promote(), Move::Promotion(from, to));
           if (!mate.is_null()) return mate;
         }
-        if (!must_promote(type, to)) {
+        if (!MustPromote(type, Us, to)) {
           mate = try_variant(type, Move::Normal(from, to));
           if (!mate.is_null()) return mate;
         }

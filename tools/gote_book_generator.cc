@@ -250,7 +250,8 @@ class MappedYbb {
       throw std::runtime_error("YBB move index out of range");
     }
     const uint64_t relative =
-        entry.moves_offset + uint64_t(local_move) * move_record_size_;
+        entry.moves_offset +
+        static_cast<uint64_t>(local_move) * move_record_size_;
     if (relative > file_.size() - moves_base_ ||
         move_record_size_ > file_.size() - moves_base_ - relative) {
       throw std::runtime_error("YBB move area out of range");
@@ -314,17 +315,17 @@ struct BuildStats {
   uint64_t leaf_moves = 0;
   uint64_t internal_moves = 0;
   uint64_t invalid_moves = 0;
-};
 
-BuildStats& operator+=(BuildStats& lhs, const BuildStats& rhs) {
-  lhs.processed_positions += rhs.processed_positions;
-  lhs.allowed_moves += rhs.allowed_moves;
-  lhs.disallowed_moves += rhs.disallowed_moves;
-  lhs.leaf_moves += rhs.leaf_moves;
-  lhs.internal_moves += rhs.internal_moves;
-  lhs.invalid_moves += rhs.invalid_moves;
-  return lhs;
-}
+  BuildStats& operator+=(const BuildStats& rhs) {
+    processed_positions += rhs.processed_positions;
+    allowed_moves += rhs.allowed_moves;
+    disallowed_moves += rhs.disallowed_moves;
+    leaf_moves += rhs.leaf_moves;
+    internal_moves += rhs.internal_moves;
+    invalid_moves += rhs.invalid_moves;
+    return *this;
+  }
+};
 
 std::string FormatDuration(std::chrono::steady_clock::duration duration) {
   const auto seconds =
@@ -372,7 +373,7 @@ PreparedBook ValidateAndIndex(const MappedYbb& book, uint64_t max_positions) {
                                std::to_string(i));
     }
     const uint64_t move_bytes =
-        uint64_t(entry.move_count) * book.move_record_size();
+        static_cast<uint64_t>(entry.move_count) * book.move_record_size();
     if (expected_offset > book.file_size() - book.moves_base() ||
         move_bytes >
             book.file_size() - book.moves_base() - expected_offset) {
@@ -434,7 +435,7 @@ std::vector<uint32_t> ResolveChildren(
         for (uint32_t local = 0; local < entry.move_count; ++local) {
           const auto record = book.MoveAt(entry, local);
           if (PlausibleMove(record.move)) {
-            best_eval = std::max(best_eval, int(record.eval));
+            best_eval = std::max(best_eval, static_cast<int>(record.eval));
           }
         }
 
@@ -461,7 +462,8 @@ std::vector<uint32_t> ResolveChildren(
                 jhbr2::kExitDisallowed;
             continue;
           }
-          if (gote && int(record.eval) < best_eval - options.eval_margin) {
+          if (gote && static_cast<int>(record.eval) <
+                          best_eval - options.eval_margin) {
             ++stats.disallowed_moves;
             children[static_cast<size_t>(global)] =
                 jhbr2::kExitDisallowed;
@@ -507,16 +509,18 @@ std::vector<uint32_t> ResolveChildren(
     workers.emplace_back(worker, i);
   }
 
+  constexpr uint64_t kProgressInterval = 250000;
   uint64_t last_report = 0;
   while (!failed.load(std::memory_order_relaxed)) {
     const uint64_t done = completed.load(std::memory_order_relaxed);
     if (done >= prepared.node_count) break;
-    if (done >= last_report + 250000) {
+    if (done >= last_report + kProgressInterval) {
       last_report = done;
       const double percent =
           prepared.node_count == 0
               ? 100.0
-              : 100.0 * double(done) / double(prepared.node_count);
+              : 100.0 * static_cast<double>(done) /
+                    static_cast<double>(prepared.node_count);
       std::cout << "Resolve children: " << done << "/"
                 << prepared.node_count << " (" << std::fixed
                 << std::setprecision(1) << percent << "%), elapsed "
@@ -572,8 +576,8 @@ std::optional<uint32_t> SelectGoteMove(
 
     if (distance < best_distance ||
         (distance == best_distance &&
-         (int(record.eval) > best_exit_eval ||
-          (int(record.eval) == best_exit_eval && best_exit &&
+         (static_cast<int>(record.eval) > best_exit_eval ||
+          (static_cast<int>(record.eval) == best_exit_eval && best_exit &&
            record.move < book.MoveAt(entry, *best_exit).move)))) {
       best_exit = local;
       best_distance = distance;
@@ -617,10 +621,15 @@ OutputStats WriteOutput(const Options& options, const MappedYbb& book,
                         const ExitGraph& graph,
                         const GoteExitSolution& solution) {
   OutputStats stats;
+  std::vector<std::pair<uint32_t, uint32_t>> selected_moves;
+  selected_moves.reserve(graph.NodeCount());
+
   for (uint32_t node = 0; node < graph.NodeCount(); ++node) {
     const auto entry = book.Entry(node);
     if ((entry.packed_sfen.data[0] & 1U) == 0) continue;
-    if (!SelectGoteMove(book, graph, solution, node)) continue;
+    const auto selected = SelectGoteMove(book, graph, solution, node);
+    if (!selected) continue;
+    selected_moves.emplace_back(node, *selected);
     ++stats.positions;
     if (solution.distance[node] == jhbr2::kExitDistanceInfinite) {
       ++stats.fallback;
@@ -646,14 +655,11 @@ OutputStats WriteOutput(const Options& options, const MappedYbb& book,
     throw std::runtime_error("cannot write output header");
   }
 
+  const uint64_t output_move_record_size =
+      jhbr2::YbbMoveRecordSize(jhbr2::kYbbFlagMoveDepth);
   uint64_t output_move_offset = 0;
-  for (uint32_t node = 0; node < graph.NodeCount(); ++node) {
+  for (const auto& [node, local_move] : selected_moves) {
     const auto source = book.Entry(node);
-    if ((source.packed_sfen.data[0] & 1U) == 0) continue;
-    const auto selected =
-        SelectGoteMove(book, graph, solution, node);
-    if (!selected) continue;
-
     YbbIndexEntry output_entry;
     output_entry.packed_sfen = source.packed_sfen;
     output_entry.moves_offset = output_move_offset;
@@ -662,16 +668,12 @@ OutputStats WriteOutput(const Options& options, const MappedYbb& book,
     std::array<uint8_t, 44> bytes{};
     EncodeYbbIndexEntry(output_entry, &bytes);
     output.write(reinterpret_cast<const char*>(bytes.data()), bytes.size());
-    output_move_offset += 6;
+    output_move_offset += output_move_record_size;
   }
 
-  for (uint32_t node = 0; node < graph.NodeCount(); ++node) {
+  for (const auto& [node, local_move] : selected_moves) {
     const auto source = book.Entry(node);
-    if ((source.packed_sfen.data[0] & 1U) == 0) continue;
-    const auto selected =
-        SelectGoteMove(book, graph, solution, node);
-    if (!selected) continue;
-    const auto move = book.MoveAt(source, *selected);
+    const auto move = book.MoveAt(source, local_move);
     std::array<uint8_t, 6> bytes{};
     EncodeYbbMoveRecord(move, &bytes);
     output.write(reinterpret_cast<const char*>(bytes.data()), bytes.size());
