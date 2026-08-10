@@ -517,6 +517,8 @@ def restore_checkpoint_config(checkpoint):
         cfg.norm_type = "layernorm"
     if "ffn_glu" not in saved_cfg:
         cfg.ffn_glu = False
+    if "attn_res" not in saved_cfg:
+        cfg.attn_res = False
     return cfg
 
 
@@ -700,6 +702,10 @@ def train(args):
     cfg.ffn_glu_beta1 = args.ffn_glu_beta1
     cfg.ffn_glu_beta2 = args.ffn_glu_beta2
     cfg.ffn_glu_hidden_ratio = args.ffn_glu_hidden_ratio
+    if args.attn_res:
+        apply_architecture_option(True, "attn_res", "--attn-res")
+        apply_architecture_option(args.attn_res_full, "attn_res_full", "--attn-res-full")
+        apply_architecture_option(args.attn_res_blocks, "attn_res_blocks", "--attn-res-blocks")
 
     model = ShogiBT4v2(cfg).to(device)
 
@@ -1226,6 +1232,15 @@ if __name__ == "__main__":
     parser.add_argument("--ffn-glu-hidden-ratio", type=float, default=2.0/3.0,
                         help="GLU hidden size as a fraction of ffn_hidden "
                              "(default: 2/3)")
+    parser.add_argument("--attn-res", action="store_true",
+                        help="Use Attention Residuals (K3-style) over the "
+                             "encoder stack; implies pre-norm")
+    parser.add_argument("--attn-res-full", action="store_true",
+                        help="Full Attention Residuals attend over every "
+                             "previous layer output (default: block AttnRes)")
+    parser.add_argument("--attn-res-blocks", type=int, default=4,
+                        help="Number of AttnRes blocks (default: 4); ignored "
+                             "with --attn-res-full")
     parser.add_argument("--save-every", type=int, default=5)
     parser.add_argument("--save-dir", default=".", help="Directory for checkpoint files")
     parser.add_argument("--export-onnx", default=None, help="Export ONNX after training")

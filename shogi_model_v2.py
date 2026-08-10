@@ -205,6 +205,14 @@ class ShogiBT4v2Config:
     # (2 matrices: expand, contract) for the same ffn_hidden.
     ffn_glu_hidden_ratio: float = 2.0 / 3.0
 
+    # Attention Residuals (K3 §2.2): replace fixed residual accumulation with
+    # learned depth-wise attention over previous layer/block outputs. Requires
+    # pre-norm. Block mode is the practical default; full mode keeps every
+    # individual layer output as a source.
+    attn_res: bool = False
+    attn_res_full: bool = False
+    attn_res_blocks: int = 4
+
     # Policy head (direction-based, 2187 outputs)
     policy_d_model: int = 256
     policy_size: int = POLICY_SIZE  # 2187
@@ -246,6 +254,25 @@ class ShogiBT4v2Config:
                     f"ffn_glu_hidden_ratio must be in (0, 1], got "
                     f"{self.ffn_glu_hidden_ratio}"
                 )
+        if self.attn_res:
+            if not self.pre_norm:
+                raise ValueError(
+                    "Attention Residuals require pre_norm=True; they replace the "
+                    "residual accumulation path and are not defined for post-norm."
+                )
+            if self.attn_res_full:
+                if self.attn_res_blocks != 4:
+                    raise ValueError(
+                        "attn_res_blocks is ignored when attn_res_full=True"
+                    )
+            else:
+                if self.num_encoders < self.attn_res_blocks:
+                    raise ValueError(
+                        f"num_encoders ({self.num_encoders}) must be >= "
+                        f"attn_res_blocks ({self.attn_res_blocks})"
+                    )
+                if self.attn_res_blocks < 1:
+                    raise ValueError("attn_res_blocks must be positive")
 
     @property
     def ffn_hidden(self) -> int:
@@ -473,16 +500,146 @@ class EncoderBlock(nn.Module):
             out = out * torch.sigmoid(self.gate_proj(a))  # gated attention
         return self.out_proj(out)
 
+    def attn_sub(self, x: torch.Tensor) -> torch.Tensor:
+        """Attention sub-layer transformation (no residual add)."""
+        if self.cfg.pre_norm:
+            return self._attention(self.ln1(x))
+        return self._attention(x)
+
+    def ffn_sub(self, x: torch.Tensor) -> torch.Tensor:
+        """FFN sub-layer transformation (no residual add)."""
+        if self.cfg.pre_norm:
+            return self._ffn_forward(self.ffn_ln(x))
+        return self._ffn_forward(x)
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if self.cfg.pre_norm:
             # Pre-norm: normalize the input, add the raw residual.
-            h = x + self._attention(self.ln1(x))
-            h = h + self._ffn_forward(self.ffn_ln(h))
+            h = x + self.attn_sub(x)
+            h = h + self.ffn_sub(h)
             return h
         # Post-norm (default): normalize after the residual add.
         h = self.ln1(self._attention(x) + x)
         h = self.ffn_ln(self._ffn_forward(h) + h)
         return h
+
+
+# =====================================================================
+# Attention Residuals (K3 §2.2)
+# =====================================================================
+
+class AttnResState:
+    """Mutable state carried through an AttnRes encoder stack.
+
+    In block mode we keep the completed block representations plus the
+    intra-block partial sum.  In full mode we simply keep every previous
+    sub-layer output (including the embedding at index 0).
+    """
+
+    def __init__(self, embedding: torch.Tensor, block_size: int, full: bool):
+        self.full = full
+        self.block_size = block_size
+        if full:
+            # sources[0] = embedding, sources[i] = i-th sub-layer output.
+            self.sources = [embedding]
+        else:
+            self.blocks: list[torch.Tensor] = [embedding]  # b0 = embedding
+            self.partial: torch.Tensor | None = None
+            self.layer_in_block = 0
+
+
+class AttnResAggregator(nn.Module):
+    """Compute one AttnRes input given the current state and pseudo-query."""
+
+    def __init__(self, d: int) -> None:
+        super().__init__()
+        # Zero-initialized pseudo-query gives uniform attention at init,
+        # reducing to an equal-weight average (standard-residual-like).
+        self.query = nn.Parameter(torch.zeros(d))
+        self.norm = _RMSNorm(d)
+
+    def forward(self, state: AttnResState) -> torch.Tensor:
+        if state.full:
+            # V: (L+1, B, T, d)
+            V = torch.stack(state.sources)
+        else:
+            # V: (N_completed_blocks + maybe partial, B, T, d)
+            srcs = list(state.blocks)
+            if state.partial is not None:
+                srcs.append(state.partial)
+            V = torch.stack(srcs)
+        K = self.norm(V)  # RMSNorm on the last dim
+        # logits: (num_sources, B, T)
+        logits = torch.einsum("d,n b t d -> n b t", self.query, K)
+        alpha = F.softmax(logits, dim=0)
+        # weighted sum: (B, T, d)
+        return torch.einsum("n b t,n b t d -> b t d", alpha, V)
+
+
+class AttnResEncoderStack(nn.Module):
+    """Encoder stack using Attention Residuals instead of fixed residuals.
+
+    Each transformer block is split into attention and FFN sub-layers.  Before
+    each sub-layer we compute an AttnRes input by attending over previous block
+    (or layer) outputs with a learned pseudo-query.  Intra-block outputs are
+    accumulated with standard addition; inter-block aggregation is attention.
+
+    Requires ``cfg.pre_norm=True``.
+    """
+
+    def __init__(self, cfg: ShogiBT4v2Config, global_gen: nn.Linear) -> None:
+        super().__init__()
+        self.cfg = cfg
+        self.layers = nn.ModuleList([
+            EncoderBlock(cfg, global_gen) for _ in range(cfg.num_encoders)
+        ])
+        if cfg.attn_res_full:
+            self.block_size = 1  # every layer is its own block
+            self.num_blocks = cfg.num_encoders
+        else:
+            self.num_blocks = cfg.attn_res_blocks
+            # Integer division; the last block absorbs any remainder.
+            self.block_size = cfg.num_encoders // cfg.attn_res_blocks
+        # One aggregator per sub-layer (attention + ffn) per encoder block.
+        self.agg_attn = nn.ModuleList([
+            AttnResAggregator(cfg.embedding_size) for _ in range(cfg.num_encoders)
+        ])
+        self.agg_ffn = nn.ModuleList([
+            AttnResAggregator(cfg.embedding_size) for _ in range(cfg.num_encoders)
+        ])
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        state = AttnResState(x, self.block_size, self.cfg.attn_res_full)
+        for idx, layer in enumerate(self.layers):
+            # Attention sub-layer.
+            h = self.agg_attn[idx](state)
+            attn_out = layer.attn_sub(h)
+            if state.full:
+                state.sources.append(attn_out)
+            else:
+                state.partial = attn_out if state.partial is None else state.partial + attn_out
+                state.layer_in_block += 1
+
+            # FFN sub-layer.
+            h = self.agg_ffn[idx](state)
+            ffn_out = layer.ffn_sub(h)
+            if state.full:
+                state.sources.append(ffn_out)
+            else:
+                state.partial = state.partial + ffn_out
+
+                # Block boundary: finalize this block.
+                if state.layer_in_block == self.block_size:
+                    state.blocks.append(state.partial)
+                    state.partial = None
+                    state.layer_in_block = 0
+
+        if state.full:
+            # Last source is the final sub-layer output; embedding is sources[0].
+            return state.sources[-1]
+        if state.partial is not None:
+            return state.partial
+        return state.blocks[-1]
 
 
 # =====================================================================
@@ -677,10 +834,13 @@ class ShogiBT4v2(nn.Module):
 
         self.embedding = InputEmbedding(cfg)
         self.smolgen_global = nn.Linear(cfg.smolgen_gen_size, 81 * 81, bias=False)
-        self.encoders = nn.ModuleList([
-            EncoderBlock(cfg, self.smolgen_global)
-            for _ in range(cfg.num_encoders)
-        ])
+        if cfg.attn_res:
+            self.encoders = AttnResEncoderStack(cfg, self.smolgen_global)
+        else:
+            self.encoders = nn.ModuleList([
+                EncoderBlock(cfg, self.smolgen_global)
+                for _ in range(cfg.num_encoders)
+            ])
         # Pre-norm leaves the residual stream unnormalized after the last block,
         # so normalize once before the heads.
         self.final_norm = make_norm(cfg.embedding_size, cfg) if cfg.pre_norm else None
@@ -701,7 +861,12 @@ class ShogiBT4v2(nn.Module):
         # Start attention gates near "open" (sigmoid(3)≈0.95) so gated attention
         # begins as a near-identity change and only learns to close where useful.
         if cfg.gated_attention:
-            for enc in self.encoders:
+            encoder_layers = (
+                self.encoders.layers
+                if isinstance(self.encoders, AttnResEncoderStack)
+                else self.encoders
+            )
+            for enc in encoder_layers:
                 nn.init.constant_(enc.gate_proj.bias, 3.0)
 
     def _init_weights(self) -> None:
@@ -718,16 +883,21 @@ class ShogiBT4v2(nn.Module):
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         h = self.embedding(x)
-        for enc in self.encoders:
-            checkpoint_this_block = (
-                self.gradient_checkpointing
-                and self.training
-                and any(parameter.requires_grad for parameter in enc.parameters())
-            )
-            if checkpoint_this_block:
-                h = torch.utils.checkpoint.checkpoint(enc, h, use_reentrant=False)
-            else:
-                h = enc(h)
+        if isinstance(self.encoders, AttnResEncoderStack):
+            # AttnRes already carries its own recurrent state; whole-stack
+            # checkpointing would require special handling.  Disable it here.
+            h = self.encoders(h)
+        else:
+            for enc in self.encoders:
+                checkpoint_this_block = (
+                    self.gradient_checkpointing
+                    and self.training
+                    and any(parameter.requires_grad for parameter in enc.parameters())
+                )
+                if checkpoint_this_block:
+                    h = torch.utils.checkpoint.checkpoint(enc, h, use_reentrant=False)
+                else:
+                    h = enc(h)
         if self.final_norm is not None:
             h = self.final_norm(h)
         policy = self.policy_head(h)
