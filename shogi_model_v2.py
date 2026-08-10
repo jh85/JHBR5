@@ -568,7 +568,6 @@ class DirectionPolicyHead(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """x: (B, 81, d_model) → (B, 2187) policy logits"""
         d = self.cfg.policy_d_model
-        B = x.shape[0]
 
         pe = self.act(self.embed(x))
         Q = self.wq(pe)  # (B, 81, d)
@@ -579,13 +578,12 @@ class DirectionPolicyHead(nn.Module):
         board_logits = torch.matmul(Q, K.transpose(-2, -1)) * scale
         board_flat = board_logits.flatten(1)  # (B, 6561)
 
-        # Gather candidate logits for each policy slot using torch.gather.
+        # Gather candidate logits for each policy slot.  Using advanced indexing
+        # on dim 1 keeps the batch dimension symbolic for ONNX export; the older
+        # .expand(B, ...) pattern froze the batch size at export time and made
+        # TensorRT build static engines.
         # gather_idx: (2187, max_sources), gather_mask: (2187, max_sources)
-        # Expanding board_flat on the trailing dim lets us gather all source
-        # slots in one call instead of looping over index_select.
-        gather_idx_expanded = self.gather_idx.unsqueeze(0).expand(B, -1, -1)  # (B, 2187, max_sources)
-        board_flat_expanded = board_flat.unsqueeze(-1).expand(-1, -1, self.max_sources)  # (B, 6561, max_sources)
-        gathered = torch.gather(board_flat_expanded, 1, gather_idx_expanded)  # (B, 2187, max_sources)
+        gathered = board_flat[:, self.gather_idx]  # (B, 2187, max_sources)
 
         mask = self.gather_mask.unsqueeze(0)  # (1, 2187, max_sources)
         gathered = gathered * mask + (1.0 - mask) * (-1e4)
