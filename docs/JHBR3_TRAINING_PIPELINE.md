@@ -159,7 +159,6 @@ torchrun --nproc_per_node=8 shogi_train.py \
   --warmup-steps 4000 \
   --grad-clip 0.5 \
   --bf16 \
-  --pre-norm \
   --gated-attention \
   --d-model 1024 \
   --encoders 20 \
@@ -180,7 +179,9 @@ This configuration means:
 - Gradient accumulation of 1.
 - Global batch size `128 * 8 * 1 = 1,024`.
 - BF16 autocast without an FP16 gradient scaler.
-- Pre-normalized transformer residual blocks.
+- Pre-normalized transformer residual blocks (default since v2.1).
+- RMSNorm (default since v2.1; use `--norm-type layernorm` for legacy).
+- SiTU-GLU feed-forward network (default since v2.1; use `--no-ffn-glu` for legacy).
 - Gated attention.
 - Model width 1,024, 20 encoder blocks, and 16 attention heads.
 - Linear learning-rate warmup followed by per-step cosine decay.
@@ -193,6 +194,35 @@ contention becomes excessive.
 `--compile` can optionally improve training throughput, but the first batches
 are slower while compilation occurs. It can be omitted when stability and
 simple debugging are more important.
+
+### v2.1 architecture flags
+
+The trainer now defaults to the K3-style stack:
+
+| Flag | Default | Meaning |
+|------|---------|---------|
+| `--norm-type` | `rmsnorm` | Normalization type (`rmsnorm` or `layernorm`) |
+| `--no-ffn-glu` | off | Disable SiTU-GLU and use the legacy two-layer FFN |
+| `--ffn-glu-beta1` | 4.0 | SiTU gate softcap |
+| `--ffn-glu-beta2` | 25.0 | SiTU up-branch softcap |
+| `--ffn-glu-hidden-ratio` | 2/3 | GLU hidden size fraction |
+| `--post-norm` | off | Use post-norm residuals (legacy) |
+
+### Attention Residuals
+
+To train the new from-scratch architecture with Attention Residuals, add:
+
+```bash
+  --attn-res \
+  --attn-res-blocks 4
+```
+
+Block AttnRes partitions the 20 encoders into 4 blocks of 5 layers each;
+within a block outputs are summed normally, and across blocks the input to
+each sub-layer is computed by attending over block summaries with a learned
+pseudo-query. For very deep stacks `--attn-res-full` attends over every
+previous sub-layer output instead of block summaries. Attention Residuals
+require pre-norm (the default).
 
 ### Checkpoints
 
@@ -278,6 +308,10 @@ mkdir -p promotion-finetune/stage1
   --log-file promotion-finetune/stage1/run.log
 ```
 
+`--finetune-from` restores the saved architecture (post-norm/LayerNorm for an
+epoch-3 checkpoint). Do not add `--attn-res` here; it is only for from-scratch
+training.
+
 The transformer is frozen, so activation checkpointing is unnecessary. The
 step-limited run writes `shogi_bt4_step12000.pt`. A partial-epoch checkpoint
 has no saved data cursor and deliberately cannot be passed to `--resume`; it
@@ -313,6 +347,9 @@ mkdir -p promotion-finetune/stage2
   --log-csv promotion-finetune/stage2/run.csv \
   --log-file promotion-finetune/stage2/run.log
 ```
+
+As with stage 1, `--finetune-from` keeps the checkpoint's original architecture.
+Do not mix `--attn-res` with fine-tuning from a non-AttnRes checkpoint.
 
 Here the effective global batch remains
 `32 × 2 GPUs × 4 accumulation = 256`. Reduce the micro-batch and increase
