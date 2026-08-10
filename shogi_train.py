@@ -14,7 +14,7 @@ Usage:
 Multi-GPU (DDP, one process per GPU; e.g. 8x RTX 5090):
     torchrun --nproc_per_node=8 shogi_train.py \
         --data ../shards2/aggshard --epochs 1 --lr 3e-4 --warmup-steps 4000 \
-        --grad-clip 0.5 --bf16 --pre-norm --gated-attention \
+        --grad-clip 0.5 --bf16 --gated-attention \
         --d-model 1024 --encoders 20 --heads 16 \
         --batch 256 --grad-accum 1 --workers 12 --compile \
         --save-dir checkpoints/ --save-every 1 \
@@ -504,9 +504,19 @@ def load_training_checkpoint(path):
 def restore_checkpoint_config(checkpoint):
     """Construct the exact model configuration recorded in a checkpoint."""
     cfg = ShogiBT4v2Config()
-    for key, value in checkpoint.get("cfg", {}).items():
+    saved_cfg = checkpoint.get("cfg", {})
+    for key, value in saved_cfg.items():
         if hasattr(cfg, key):
             setattr(cfg, key, value)
+    # Backward compatibility: older checkpoints were trained before SiTU-GLU and
+    # pre-norm/RMSNorm became the default.  If those keys are missing, fall back
+    # to the legacy behavior so the saved weights load correctly.
+    if "pre_norm" not in saved_cfg:
+        cfg.pre_norm = False
+    if "norm_type" not in saved_cfg:
+        cfg.norm_type = "layernorm"
+    if "ffn_glu" not in saved_cfg:
+        cfg.ffn_glu = False
     return cfg
 
 
@@ -681,8 +691,15 @@ def train(args):
     apply_architecture_option(args.heads, "num_heads", "--heads")
     if args.gated_attention:
         apply_architecture_option(True, "gated_attention", "--gated-attention")
-    if args.pre_norm:
-        apply_architecture_option(True, "pre_norm", "--pre-norm")
+    # pre-norm is now the default; --post-norm opts out.
+    if args.post_norm:
+        apply_architecture_option(False, "pre_norm", "--post-norm")
+    apply_architecture_option(args.norm_type, "norm_type", "--norm-type")
+    if args.no_ffn_glu:
+        apply_architecture_option(False, "ffn_glu", "--no-ffn-glu")
+    cfg.ffn_glu_beta1 = args.ffn_glu_beta1
+    cfg.ffn_glu_beta2 = args.ffn_glu_beta2
+    cfg.ffn_glu_hidden_ratio = args.ffn_glu_hidden_ratio
 
     model = ShogiBT4v2(cfg).to(device)
 
@@ -1193,9 +1210,22 @@ if __name__ == "__main__":
     parser.add_argument("--gated-attention", action="store_true",
                         help="Sigmoid-gate the attention output (Qwen-style); "
                              "improves deep-training stability")
-    parser.add_argument("--pre-norm", action="store_true",
-                        help="Pre-norm residuals instead of post-norm; much more "
-                             "stable for deep encoder stacks")
+    parser.add_argument("--post-norm", action="store_true",
+                        help="Use post-norm residuals instead of the default "
+                             "pre-norm (legacy behavior)")
+    parser.add_argument("--norm-type", choices=["rmsnorm", "layernorm"],
+                        default="rmsnorm",
+                        help="Normalization type (default: rmsnorm)")
+    parser.add_argument("--no-ffn-glu", action="store_true",
+                        help="Use the legacy two-layer FFN instead of the "
+                             "default SiTU-GLU feed-forward network")
+    parser.add_argument("--ffn-glu-beta1", type=float, default=4.0,
+                        help="SiTU gate softcap beta1 (default: 4.0)")
+    parser.add_argument("--ffn-glu-beta2", type=float, default=25.0,
+                        help="SiTU up-branch softcap beta2 (default: 25.0)")
+    parser.add_argument("--ffn-glu-hidden-ratio", type=float, default=2.0/3.0,
+                        help="GLU hidden size as a fraction of ffn_hidden "
+                             "(default: 2/3)")
     parser.add_argument("--save-every", type=int, default=5)
     parser.add_argument("--save-dir", default=".", help="Directory for checkpoint files")
     parser.add_argument("--export-onnx", default=None, help="Export ONNX after training")

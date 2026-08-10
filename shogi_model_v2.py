@@ -13,8 +13,9 @@ Changes from v1:
 Architecture:
   - PE-Dense input embedding v2 revision: raw piece planes are compressed with
     a dense projection before being concatenated with the non-piece planes.
-  - Encoder stack with multi-head attention + smolgen; optional pre-norm and
-    gated attention (post-norm by default). v1 DeepNorm scaling is not used.
+  - Encoder stack with multi-head attention + smolgen; pre-norm + RMSNorm by
+    default with optional SiTU-GLU feed-forward network (K3-style). v1
+    DeepNorm scaling is not used.
   - NEW: Direction-based attention policy head (81 × 27 = 2187 moves)
   - WDL value head
   - Moves-left head
@@ -191,8 +192,18 @@ class ShogiBT4v2Config:
     # sinks / massive activations → more stable deep training. Off by default.
     gated_attention: bool = False
     # Pre-norm residuals (norm the input, add the raw residual) instead of the
-    # default post-norm. Much more stable for deep stacks. Off by default.
-    pre_norm: bool = False
+    # default post-norm. Much more stable for deep stacks. On by default (K3).
+    pre_norm: bool = True
+
+    # Feed-forward network style. SiTU-GLU (K3 §2.3.2) replaces the two-layer
+    # MLP with a gated-up FFN that is bounded and trains more stably.
+    ffn_glu: bool = True
+    ffn_glu_beta1: float = 4.0
+    ffn_glu_beta2: float = 25.0
+    # Hidden size of the GLU branch as a fraction of ffn_hidden. 2/3 keeps the
+    # parameter count (3 matrices: gate, up, down) equal to the dense FFN
+    # (2 matrices: expand, contract) for the same ffn_hidden.
+    ffn_glu_hidden_ratio: float = 2.0 / 3.0
 
     # Policy head (direction-based, 2187 outputs)
     policy_d_model: int = 256
@@ -207,7 +218,7 @@ class ShogiBT4v2Config:
     mlh_hidden: int = 64
 
     # Normalization
-    norm_type: str = "layernorm"
+    norm_type: str = "rmsnorm"
     no_qkv_bias: bool = True
 
     def __post_init__(self) -> None:
@@ -224,6 +235,17 @@ class ShogiBT4v2Config:
                 f"policy_d_model ({self.policy_d_model}) must be divisible by "
                 f"num_heads ({self.num_heads})"
             )
+        if self.ffn_glu:
+            if self.ffn_glu_beta1 <= 0 or self.ffn_glu_beta2 <= 0:
+                raise ValueError(
+                    f"SiTU beta values must be positive, got beta1={self.ffn_glu_beta1} "
+                    f"beta2={self.ffn_glu_beta2}"
+                )
+            if not 0 < self.ffn_glu_hidden_ratio <= 1.0:
+                raise ValueError(
+                    f"ffn_glu_hidden_ratio must be in (0, 1], got "
+                    f"{self.ffn_glu_hidden_ratio}"
+                )
 
     @property
     def ffn_hidden(self) -> int:
@@ -241,8 +263,87 @@ def get_activation(name: str) -> nn.Module:
     return activations[name]
 
 
+class _RMSNorm(nn.Module):
+    """ONNX-exportable RMSNorm.
+
+    PyTorch's native ``nn.RMSNorm`` is fast for training but uses
+    ``aten::rms_norm`` which the legacy ONNX exporter does not support.  This
+    module computes the same normalization with primitive ops, so it exports
+    cleanly while staying numerically identical to ``nn.RMSNorm``.
+    """
+
+    def __init__(self, d: int, eps: float = 1e-5) -> None:
+        super().__init__()
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(d))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # ONNX-friendly decomposition of RMSNorm.
+        norm = torch.rsqrt(torch.mean(x * x, dim=-1, keepdim=True) + self.eps)
+        return x * norm * self.weight
+
+
 def make_norm(d: int, cfg: ShogiBT4v2Config) -> nn.Module:
-    return nn.RMSNorm(d) if cfg.norm_type == "rmsnorm" else nn.LayerNorm(d)
+    return _RMSNorm(d) if cfg.norm_type == "rmsnorm" else nn.LayerNorm(d)
+
+
+class SiTUGLU(nn.Module):
+    """Sigmoid Tanh Unit GLU from Kimi K3 (§2.3.2).
+
+    Compared with SwiGLU, SiTU is bounded: |output| ≤ beta1 * beta2.  This
+    suppresses activation outliers during low-precision training while keeping
+    the same local response as SwiGLU near the origin.
+
+    Inputs ``gate`` and ``up`` must have the same shape.  The gate projection
+    is used for both the sigmoid gate and the tanh-smoothed gate; ``up`` is
+    the value/up projection.
+    """
+
+    def __init__(self, beta1: float = 4.0, beta2: float = 25.0) -> None:
+        super().__init__()
+        self.beta1 = beta1
+        self.beta2 = beta2
+
+    def forward(self, gate: torch.Tensor, up: torch.Tensor) -> torch.Tensor:
+        # Bounded gate: beta1 * tanh(gate / beta1) * sigmoid(gate)
+        gated = self.beta1 * torch.tanh(gate / self.beta1) * torch.sigmoid(gate)
+        # Bounded up branch
+        upped = self.beta2 * torch.tanh(up / self.beta2)
+        return gated * upped
+
+
+class GluFeedForward(nn.Module):
+    """SiTU-GLU feed-forward network.
+
+    Three matrices: gate (d -> h), up (d -> h), down (h -> d).  With
+    h = (2/3) * ffn_hidden this has the same parameter count as a dense
+    d -> ffn_hidden -> d FFN.
+    """
+
+    def __init__(self, cfg: ShogiBT4v2Config) -> None:
+        super().__init__()
+        d = cfg.embedding_size
+        h = int(cfg.ffn_hidden * cfg.ffn_glu_hidden_ratio)
+        self.gate_proj = nn.Linear(d, h)
+        self.up_proj = nn.Linear(d, h)
+        self.down_proj = nn.Linear(h, d)
+        self.glu = SiTUGLU(cfg.ffn_glu_beta1, cfg.ffn_glu_beta2)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.down_proj(self.glu(self.gate_proj(x), self.up_proj(x)))
+
+
+class DenseFeedForward(nn.Module):
+    """Original two-layer FFN with activation after each linear."""
+
+    def __init__(self, cfg: ShogiBT4v2Config) -> None:
+        super().__init__()
+        self.ffn1 = nn.Linear(cfg.embedding_size, cfg.ffn_hidden)
+        self.ffn2 = nn.Linear(cfg.ffn_hidden, cfg.embedding_size)
+        self.act = get_activation(cfg.activation)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.act(self.ffn2(self.act(self.ffn1(x))))
 
 
 class InputEmbedding(nn.Module):
@@ -268,9 +369,19 @@ class InputEmbedding(nn.Module):
         self.preproc = nn.Linear(sq * pp, sq * ds)
         self.embed = nn.Linear(cfg.input_planes - pp + ds, d)
         self.ln = make_norm(d, cfg)
-        self.ffn1 = nn.Linear(d, cfg.ffn_hidden)
-        self.ffn2 = nn.Linear(cfg.ffn_hidden, d)
         self.act = get_activation(cfg.activation)
+        if cfg.ffn_glu:
+            self.ffn = GluFeedForward(cfg)
+        else:
+            # Keep the legacy two-layer FFN fields directly on this module so
+            # older checkpoints load without key renaming.
+            self.ffn1 = nn.Linear(d, cfg.ffn_hidden)
+            self.ffn2 = nn.Linear(cfg.ffn_hidden, d)
+
+    def _ffn_forward(self, h: torch.Tensor) -> torch.Tensor:
+        if hasattr(self, "ffn"):
+            return self.ffn(h)
+        return self.act(self.ffn2(self.act(self.ffn1(h))))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         piece_planes = torch.flatten(x[:, : self.num_piece_planes], 1)
@@ -280,7 +391,7 @@ class InputEmbedding(nn.Module):
         h = self.act(self.embed(combined))
         h = h * self.mult_gate + self.add_gate
         h = self.ln(h)
-        h = h + self.act(self.ffn2(self.act(self.ffn1(h))))
+        h = h + self._ffn_forward(h)
         return h
 
 
@@ -312,10 +423,10 @@ class Smolgen(nn.Module):
 class EncoderBlock(nn.Module):
     """Transformer encoder block with smolgen and optional gated attention.
 
-    Post-normalization is used by default.  When ``cfg.pre_norm`` is set, the
-    block uses pre-normalization residuals instead.  ``cfg.gated_attention``
-    enables a sigmoid gate on the attention output.  v1 DeepNorm scaling is not
-    used.
+    Pre-normalization with RMSNorm is used by default (K3-style).  Set
+    ``cfg.pre_norm=False`` and ``cfg.norm_type='layernorm'`` to recover the
+    legacy post-norm behavior.  ``cfg.gated_attention`` enables a sigmoid gate
+    on the attention output.  v1 DeepNorm scaling is not used.
     """
 
     def __init__(self, cfg: ShogiBT4v2Config, global_gen: nn.Linear) -> None:
@@ -330,11 +441,21 @@ class EncoderBlock(nn.Module):
         self.gate_proj = nn.Linear(d, d) if cfg.gated_attention else None
         self.ln1 = make_norm(d, cfg)
         self.smolgen = Smolgen(cfg, global_gen)
-        self.ffn1 = nn.Linear(d, cfg.ffn_hidden)
-        self.ffn2 = nn.Linear(cfg.ffn_hidden, d)
-        self.ffn_act = get_activation(cfg.activation)
+        if cfg.ffn_glu:
+            self.ffn = GluFeedForward(cfg)
+        else:
+            # Keep legacy FFN fields directly on the encoder for checkpoint
+            # compatibility with older models.
+            self.ffn1 = nn.Linear(d, cfg.ffn_hidden)
+            self.ffn2 = nn.Linear(cfg.ffn_hidden, d)
+            self.ffn_act = get_activation(cfg.activation)
         self.ffn_ln = make_norm(d, cfg)
         self.cfg = cfg
+
+    def _ffn_forward(self, h: torch.Tensor) -> torch.Tensor:
+        if hasattr(self, "ffn"):
+            return self.ffn(h)
+        return self.ffn_act(self.ffn2(self.ffn_act(self.ffn1(h))))
 
     def _attention(self, a: torch.Tensor) -> torch.Tensor:
         """Multi-head attention (+ smolgen bias, + optional gate) on input `a`.
@@ -356,12 +477,11 @@ class EncoderBlock(nn.Module):
         if self.cfg.pre_norm:
             # Pre-norm: normalize the input, add the raw residual.
             h = x + self._attention(self.ln1(x))
-            h = h + self.ffn2(self.ffn_act(self.ffn1(self.ffn_ln(h))))
+            h = h + self._ffn_forward(self.ffn_ln(h))
             return h
         # Post-norm (default): normalize after the residual add.
         h = self.ln1(self._attention(x) + x)
-        f = self.ffn_act(self.ffn1(h))
-        h = self.ffn_ln(self.ffn2(f) + h)
+        h = self.ffn_ln(self._ffn_forward(h) + h)
         return h
 
 

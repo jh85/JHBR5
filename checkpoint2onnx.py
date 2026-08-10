@@ -4,9 +4,9 @@ from pathlib import Path
 import torch
 from shogi_model_v2 import (
     ShogiBT4v2,
-    ShogiBT4v2Config,
     load_state_dict_with_promotion_migration,
 )
+from shogi_train import restore_checkpoint_config
 
 def main():
     if len(sys.argv) < 3:
@@ -21,10 +21,7 @@ def main():
         onnx_name = Path(pt_name).stem + f"_b{batch_size}.onnx"
 
     ckpt = torch.load(pt_name, map_location="cpu", weights_only=False)
-    cfg = ShogiBT4v2Config()
-    for k,v in ckpt["cfg"].items():
-        if hasattr(cfg,k):
-            setattr(cfg,k,v)
+    cfg = restore_checkpoint_config(ckpt)
     model = ShogiBT4v2(cfg)
     legacy = load_state_dict_with_promotion_migration(model, ckpt["model"])
     if legacy:
