@@ -1,0 +1,96 @@
+diff --git a/mcts/uct_search.cc b/mcts/uct_search.cc
+index 8b74470..7631ec2 100644
+--- a/mcts/uct_search.cc
++++ b/mcts/uct_search.cc
+@@ -988,7 +988,14 @@ SearchResult Search::BuildResult() const {
+   }
+   if (safe_wp < config_.resign_threshold) result.best_move = Move();
+   result.score_cp = QToCentipawns(safe_wp);
++  result.root_q = safe_wp;
+   result.pv = GetPV();
++  result.root_visits.reserve(root_->child_num);
++  for (int i = 0; i < root_->child_num; ++i) {
++    const auto& c = root_->child[i];
++    result.root_visits.emplace_back(
++        c.move, std::max(0, c.move_count.load(std::memory_order_acquire)));
++  }
+   return result;
+ }
+ 
+diff --git a/mcts/uct_search.h b/mcts/uct_search.h
+index 0758929..58382a4 100644
+--- a/mcts/uct_search.h
++++ b/mcts/uct_search.h
+@@ -7,6 +7,7 @@
+ #include <functional>
+ #include <memory>
+ #include <mutex>
++#include <utility>
+ #include <vector>
+ 
+ #include "mcts/search_primitives.h"
+@@ -79,6 +80,9 @@ struct SearchResult {
+   jhbr2::TimeBudget time_budget;
+   jhbr2::AdaptiveTimeDecision time_decision;
+   bool root_guard_cancelled = false;
++  // JHBR5 teacher support: root children (move, visits) and best child Q.
++  std::vector<std::pair<lczero::Move, int>> root_visits;
++  float root_q = 0.5f;
+ };
+ 
+ class Search;
+diff --git a/usi/usi_engine.cc b/usi/usi_engine.cc
+index 986ff88..267aed2 100644
+--- a/usi/usi_engine.cc
++++ b/usi/usi_engine.cc
+@@ -280,6 +280,7 @@ void USIEngine::CmdUsi() {
+   Send("option name NNCacheSize type spin default 0 min 0 max 100000000");
+   Send("option name NumGPUs type spin default 1 min 1 max 8");
+   Send("option name MaxMovesToDraw type spin default 100000 min 1 max 100000");
++  Send("option name RootDistOutput type check default false");
+   Send("option name UseMovesLeft type check default false");
+   Send("option name MovesLeftMaxEffect type string default 0.0345");
+   Send("option name MovesLeftThreshold type string default 0.8");
+@@ -602,6 +603,12 @@ void USIEngine::RegisterOptionParsers() {
+         return OptionSetResult::kSetAndLog;
+       };
+ 
++  option_parsers_["rootdistoutput"] =
++      [this](const std::string& /*name*/, const std::string& value) {
++        root_dist_output_ = ToLower(value) == "true" || value == "1";
++        return OptionSetResult::kSetAndLog;
++      };
++
+   option_parsers_["maxmovestodraw"] =
+       [this, reset_search](const std::string& /*name*/,
+                            const std::string& value) {
+@@ -1109,6 +1116,17 @@ void USIEngine::SelectAndReportBestMove(
+       !root_mate.mate_move.is_null() &&
+       !MateDfpnSolver::IsNoMate(root_mate.mate_move);
+ 
++  // JHBR5 teacher: root visit distribution before any bestmove (opt-in).
++  if (root_dist_output_ && !result.root_visits.empty()) {
++    std::ostringstream out;
++    out << "info string rootdist";
++    for (const auto& [move, visits] : result.root_visits) {
++      out << " " << move.ToString() << ":" << visits;
++    }
++    Send(out.str());
++    Log("rootq " + std::to_string(result.root_q));
++  }
++
+   // --- Choose result ---
+   bool use_mate = root_mate_is_mate;
+ 
+diff --git a/usi/usi_engine.h b/usi/usi_engine.h
+index 6d42d5a..d769fc5 100644
+--- a/usi/usi_engine.h
++++ b/usi/usi_engine.h
+@@ -126,6 +126,7 @@ class USIEngine {
+   int max_nodes_ = 800;
+   int num_gpus_ = 1;
+   bool use_gpu_ = true;
++  bool root_dist_output_ = false;  // JHBR5 teacher: print root visit distribution
+   bool root_mate_solver_bns_ = true;
+   int max_move_time_ms_ = 0;
+   int max_move_time_1m_ms_ = 0;

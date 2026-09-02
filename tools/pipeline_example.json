@@ -1,0 +1,27 @@
+{
+  "root": "/data/jhbr5-runs",
+  "build": "build",
+  "seed": 1,
+  "openings": "build-strength/openings-512.txt",
+  "generate": {
+    "games": 20000,
+    "threads": 16,
+    "nodes": 800,
+    "extra": {"random-plies": 8, "leaf-mate-depth": 3, "max-ply": 320}
+  },
+  "train": {
+    "data": ["{root}/imported/*.rec"],
+    "replay_generations": 5,
+    "workers": 6,
+    "value": {"l1": 1024, "steps": 100000, "batch_size": 16384, "lr": 0.001, "wdl_lambda": 0.5},
+    "policy": {"l1": 4096, "steps": 100000, "batch_size": 8192, "lr": 0.001}
+  },
+  "test": {
+    "bench_nodes": 20000,
+    "threads": 4,
+    "pairs": 100,
+    "nodes": 5000,
+    "promote_score": 0.52,
+    "engine_options": {"LeafMateDepth": "3"}
+  }
+}
