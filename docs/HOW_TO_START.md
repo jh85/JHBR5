@@ -1,202 +1,55 @@
-# HOW TO START
+# How to start JHBR5
 
-This document assumes you have:
+## Requirements
 
-- CMake and a C++20 compiler, such as `g++` or `clang++`
-- CUDA installed at `$CUDA_PATH`
-- TensorRT installed at `$TENSORRT_PATH`
-- cuDNN installed at `$CUDNN_PATH`
-- `model.onnx`
-- a fresh checkout of the JHBR3 repo
+- CMake ≥ 3.18, a C++20 compiler (GCC 13 or Clang 18 tested), an x86-64 CPU
+  with AVX2 (or use `-DJHBR5_ISA=scalar`).
+- Two network files (`docs/NNUE_FORMAT.md`). Until trained networks exist,
+  `make_random_net` produces deterministic placeholders that exercise every
+  code path but play random shogi.
 
-The native TensorRT build does not load ONNX directly at runtime. Build the
-`jhbr3` binary first, then convert the ONNX model to a TensorRT `.engine` file
-with `trtexec`.
-
-## 1. Set Paths
+## Build
 
 ```bash
-export CUDA_PATH=/path/to/cuda
-export TENSORRT_PATH=/path/to/TensorRT
-export CUDNN_PATH=/path/to/cudnn
-export MODEL_ONNX=/path/to/model.onnx
-
-export LD_LIBRARY_PATH=$TENSORRT_PATH/lib:$CUDNN_PATH/lib:$CUDA_PATH/lib64:$LD_LIBRARY_PATH
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DJHBR5_ISA=avx2
+cmake --build build -j
+ctest --test-dir build          # all tests, including the USI bench smoke test
 ```
 
-If your cuDNN package uses `lib64` instead of `lib`, replace
-`$CUDNN_PATH/lib` with `$CUDNN_PATH/lib64`.
-
-Quick checks:
+## Run
 
 ```bash
-$CUDA_PATH/bin/nvcc --version
-$TENSORRT_PATH/bin/trtexec --version
-ls "$MODEL_ONNX"
+mkdir -p nets
+build/make_random_net value  nets/value.nn  --l1 1024     # placeholder
+build/make_random_net policy nets/policy.nn --l1 4096     # placeholder
+build/jhbr5
 ```
 
-## 2. Configure
+Then over USI:
 
-From the repo root:
-
-```bash
-cd /path/to/JHBR3
-
-cmake -S . -B build-trt -DCMAKE_BUILD_TYPE=Release -DUSE_TENSORRT=ON \
-  -DCUDAToolkit_ROOT="$CUDA_PATH" \
-  -DTENSORRT_ROOT="$TENSORRT_PATH" \
-  -DCUDNN_ROOT="$CUDNN_PATH"
+```
+usi
+setoption name Threads value 8
+isready
+position startpos
+go btime 60000 wtime 60000 byoyomi 1000
 ```
 
-If you want a specific compiler:
+`isready` loads the networks (about 0.5 s for the M profile, 470 MB) and
+clears the tree, value cache and history table.
 
-```bash
-CC=gcc CXX=g++ cmake -S . -B build-trt -DCMAKE_BUILD_TYPE=Release -DUSE_TENSORRT=ON \
-  -DCUDAToolkit_ROOT="$CUDA_PATH" \
-  -DTENSORRT_ROOT="$TENSORRT_PATH" \
-  -DCUDNN_ROOT="$CUDNN_PATH"
+## Benchmark
+
+```
+bench [nodes] [threads]
 ```
 
-or:
+runs ten fixed positions and prints nodes/s, evaluations/s, expansions/s and
+value-cache hits. With no networks loaded it generates random M-profile
+networks in `/tmp`. `build/bench_nnue test/legal100.sfens` benchmarks the
+networks alone.
 
-```bash
-CC=clang CXX=clang++ cmake -S . -B build-trt -DCMAKE_BUILD_TYPE=Release -DUSE_TENSORRT=ON \
-  -DCUDAToolkit_ROOT="$CUDA_PATH" \
-  -DTENSORRT_ROOT="$TENSORRT_PATH" \
-  -DCUDNN_ROOT="$CUDNN_PATH"
-```
+## Strength testing
 
-## 3. Build
-
-```bash
-cmake --build build-trt -j"$(nproc)"
-```
-
-The binary should be:
-
-```bash
-build-trt/jhbr3
-```
-
-Check dynamic libraries:
-
-```bash
-ldd build-trt/jhbr3 | grep -E 'nvinfer|cudart|not found'
-```
-
-There should be no `not found` lines. `libnvinfer` should resolve from
-`$TENSORRT_PATH/lib`.
-
-## 4. Run Basic Tests
-
-```bash
-./build-trt/test_movegen test/positions.txt
-./build-trt/test_check_movegen
-./build-trt/test_shallow_mate
-```
-
-## 5. Build A TensorRT Engine
-
-Create an engine for the JHBR3 model:
-
-```bash
-mkdir -p engines
-
-$TENSORRT_PATH/bin/trtexec \
-  --onnx="$MODEL_ONNX" \
-  --saveEngine=engines/model_b256.engine \
-  --fp16 \
-  --minShapes=input_planes:1x148x9x9 \
-  --optShapes=input_planes:128x148x9x9 \
-  --maxShapes=input_planes:256x148x9x9 \
-  --memPoolSize=workspace:4096M
-```
-
-If engine build fails because of memory, retry with a smaller profile:
-
-```bash
-$TENSORRT_PATH/bin/trtexec \
-  --onnx="$MODEL_ONNX" \
-  --saveEngine=engines/model_b128.engine \
-  --fp16 \
-  --minShapes=input_planes:1x148x9x9 \
-  --optShapes=input_planes:128x148x9x9 \
-  --maxShapes=input_planes:128x148x9x9 \
-  --memPoolSize=workspace:2048M
-```
-
-TensorRT engines are machine-specific. Rebuild the `.engine` file when you move
-to a different GPU architecture, TensorRT version, CUDA stack, or driver stack.
-
-## 6. USI Smoke Test
-
-Use the engine path from the previous step:
-
-```bash
-ENGINE=/path/to/JHBR3/engines/model_b256.engine
-
-printf 'usi\nsetoption name OnnxModel value %s\nsetoption name ModelFormat value jhbr2\nsetoption name NumGPUs value 1\nsetoption name WorkersPerGpu value 2\nsetoption name MinibatchSize value 128\nisready\nposition startpos\ngo nodes 256\nquit\n' "$ENGINE" \
-| ./build-trt/jhbr3
-```
-
-Expected:
-
-- `usiok`
-- `readyok`
-- TensorRT log line showing the engine loaded
-- a legal `bestmove`
-
-The option name `OnnxModel` is historical. In a native TensorRT build, pass the
-serialized TensorRT `.engine` file there.
-
-## 7. Multi-GPU Run
-
-For a two-GPU machine:
-
-```bash
-ENGINE=/path/to/JHBR3/engines/model_b256.engine
-
-printf 'usi\nsetoption name OnnxModel value %s\nsetoption name ModelFormat value jhbr2\nsetoption name NumGPUs value 2\nsetoption name WorkersPerGpu value 2\nsetoption name MinibatchSize value 128\nisready\nposition startpos\ngo byoyomi 1000\nquit\n' "$ENGINE" \
-| ./build-trt/jhbr3
-```
-
-`MinibatchSize` is the per-worker search batch. The TensorRT engine's
-`maxShapes` profile is its hard inference limit; larger worker batches are
-split automatically at that limit.
-
-## 8. Optional ONNX Runtime Fallback
-
-The fallback build accepts one JHBR3 ONNX model using the inherited `jhbr2`
-model format whose batch dimension is dynamic. Fixed-batch models and
-`_bN.onnx` sidecar models are not supported.
-
-```bash
-cmake -S . -B build-ort -DCMAKE_BUILD_TYPE=Release \
-  -DUSE_TENSORRT=OFF \
-  -DONNXRUNTIME_ROOT=/path/to/onnxruntime
-cmake --build build-ort -j"$(nproc)"
-```
-
-With `UseGPU=true`, ONNX Runtime tries its CUDA provider on the requested GPU
-and falls back to CPU if a CUDA session cannot be created. Set `UseGPU=false`
-to select CPU directly. This build is intended for validation and fallback;
-use the native TensorRT build for production play.
-
-## Troubleshooting
-
-If CMake cannot find TensorRT:
-
-```bash
-ls "$TENSORRT_PATH/include/NvInfer.h"
-ls "$TENSORRT_PATH/lib/libnvinfer.so"*
-```
-
-If runtime loading fails:
-
-```bash
-export LD_LIBRARY_PATH=$TENSORRT_PATH/lib:$CUDNN_PATH/lib:$CUDA_PATH/lib64:$LD_LIBRARY_PATH
-ldd build-trt/jhbr3 | grep 'not found'
-```
-
-If TensorRT says the engine is incompatible, rebuild the engine on the same
-machine where you will run JHBR3.
+See `docs/STRENGTH_TESTING.md` (inherited harness). JHBR5 is a CPU engine:
+pass `--engine-option Threads=N` and ignore the GPU-topology sections.

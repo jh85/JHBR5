@@ -1,6 +1,45 @@
 # JHBR5 changelog
 
-## Unreleased — Phase 1 (CPU NNUE inference backend)
+## Unreleased — Phase 2 (search integration)
+
+* `mcts/uct_search.{h,cc}` rewritten for synchronous CPU evaluation: no leaf
+  batching, no GPU worker groups. Node state machine `kFresh → kEvaluated
+  (value net, first visit) → kExpanded (movegen + policy, second visit)`;
+  the iteration that expands a node keeps descending (Monty `perform_one`).
+  Per-thread `Evaluator`, per-thread board with make/undo instead of a root
+  copy per playout, hashed position mutexes kept for expansion.
+* Kept unchanged: PUCT/FPU (`SelectPuctChild`), proven win/loss/draw
+  propagation, virtual loss, repetition/declaration/ply-cap handling, shallow
+  leaf mate probe, root df-pn/BNS guard, tree reuse, time management, USI
+  protocol and info output.
+* New: `nnue/eval_cache.h` (8-byte lock-free WDL cache), `mcts/butterfly.h`
+  (history bonus), Monty policy temperature and draw-share adjustment, all
+  behind USI options and **off by default**; `TreeMemoryMB` limit with a new
+  `tree_full` stop reason; live tree memory accounting in `uct_node.cc`.
+* USI: `ValueNet`, `PolicyNet`, `Threads` (1..256), `EvalCacheMB`,
+  `TreeMemoryMB`, `UseButterfly`, `ButterflyDivisor`, `ButterflyReduction`,
+  `UsePolicyTemperature`, `Pst{Root,Depth,WinThreshold,WinMax,Base}`,
+  `DrawScale`, `DrawQuadratic`; `bench [nodes] [threads]` command; engine name
+  `JHBR5`; binary `jhbr5`. Retired GPU/MLH options are accepted and ignored.
+  **`MaxNodes` default raised from 800 to 100,000,000** so timed searches are
+  clock limited.
+* Removed: `inference/` (TensorRT, ONNX Runtime, NN cache), the 148-plane
+  encoder and CUDA unpack kernel, `pyext/`, `batch_eval.cpp`, the JHBR3
+  Python model/training/shard scripts, MLH head and moves-left search term,
+  ONNX/TensorRT CMake blocks. `-march=native` stays replaced by `JHBR5_ISA`.
+* Tests: `test_lockfree_search` rewritten on random networks (threaded search
+  and reuse, single-thread determinism, deferred expansion, optional Monty
+  features, tree memory limit, leaf mate detection without solvers, adaptive
+  deadline, external stop, root mate worker); `test_search_primitives` without
+  MLH; `ctest` now also runs tree reuse, time manager, search info, BNS,
+  mate-in-1 and a `bench` smoke test through the real binary.
+* Measured (dev machine, random M nets, `bench 20000`): 1 thread 50k
+  playouts/s (32k net evals/s + cache hits, 35k expansions/s), 4 threads
+  175k, 8 threads 281k (5.6×). The depth-5 shallow mate probe costs ~25% of
+  single-thread throughput (65k playouts/s with `LeafMateMode off`, 61k at
+  depth 3); the default stays 5 pending strength tests.
+
+## Phase 1 (CPU NNUE inference backend)
 
 Decisions taken from the Phase 0 review (`docs/open_questions.txt`): follow
 Monty where applicable, otherwise the simpler option. Concretely: one

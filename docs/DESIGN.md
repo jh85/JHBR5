@@ -32,6 +32,15 @@ eval) and 106k policy expansions/s (9.5 µs); scalar kernels 112k / 66k.
 These beat the estimates in §5.5 by 2×, mostly because group-B rows are
 fewer than budgeted and hardware prefetch handles the row streams well.
 
+Phase 2 (search integration) measured with random M nets, `bench 20000`:
+50k playouts/s on one thread, 175k on four, 281k on eight (the estimate in
+§5.5 was 12k–30k per thread; the shallow mate probe at depth 5 costs about a
+quarter of single-thread throughput). `MaxNodes` now defaults to 100,000,000
+so timed searches are clock limited (JHBR3 defaulted to 800 for GPU
+self-play). Per-thread boards use make/undo (§7.7); the value cache is the
+8-byte Monty-style table (§7.5); `TreeMemoryMB` counts live nodes exactly
+(§7.6) rather than per-search allocation.
+
 ## 0. Summary of the recommendation
 
 | Topic | Recommendation |

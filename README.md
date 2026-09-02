@@ -1,50 +1,73 @@
-# JHBR3
+# JHBR5
 
-JHBR3 is a GPU-accelerated USI shogi engine using a dlshogi-style MCTS search,
-neural-network evaluation, shallow mate search, and a parallel root df-pn
-solver.
+JHBR5 is a USI shogi engine that runs AlphaZero/Monty-style MCTS (PUCT with a
+learned policy prior and a WDL value) **entirely on CPU**, using NNUE-style
+sparse-input networks for both value and policy. It is a fork of JHBR3 (dlshogi-
+style MCTS, shallow mate search, parallel root df-pn/BNS solver, USI, time
+management) with the GPU evaluation backend replaced by CPU NNUE inference.
 
-This repository started from JHBR2 commit
-`3e444c358118ef6941a02c512dfcf7d8fc293ac8` on
-`feat/dlshogi-nyugyoku-148planes`. The corresponding baseline is tagged
-`jhbr3-base` here and `jhbr2-final` in the JHBR2 repository. Full development
-history is preserved.
+Licence: GPL-3.0 (inherited from JHBR3 / Leela Chess Zero); see
+`THIRD_PARTY.md` for the origin of every borrowed idea.
 
 ## Build
 
-The production backend uses CUDA and TensorRT:
+Requires CMake ≥ 3.18 and a C++20 compiler. No CUDA, TensorRT or ONNX.
 
 ```bash
-cmake -S . -B build-trt -DCMAKE_BUILD_TYPE=Release -DUSE_TENSORRT=ON \
-  -DCUDAToolkit_ROOT="$CUDA_PATH" \
-  -DTENSORRT_ROOT="$TENSORRT_PATH" \
-  -DCUDNN_ROOT="$CUDNN_PATH"
-cmake --build build-trt -j"$(nproc)"
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DJHBR5_ISA=avx2
+cmake --build build -j
+ctest --test-dir build
 ```
 
-The resulting USI executable is `build-trt/jhbr3`. See
-[`docs/HOW_TO_START.md`](docs/HOW_TO_START.md) for model conversion and runtime
-configuration.
+`JHBR5_ISA` selects the SIMD level: `avx2` (default), `scalar` (reference
+kernels, used to validate the SIMD code), or `avx512` (stub; fails to compile
+until implemented on an AVX-512 host).
 
-CPU-only core and search tests can be built without a working CUDA driver:
+The executable is `build/jhbr5`.
+
+## Networks
+
+The engine loads two files, set with the `ValueNet` and `PolicyNet` USI
+options (defaults `nets/value.nn`, `nets/policy.nn`). The file format is
+documented in `docs/NNUE_FORMAT.md`; trained networks come from the Phase 3
+trainer. For testing without trained networks:
 
 ```bash
-cmake -S . -B build-cpu -DCMAKE_BUILD_TYPE=Release -DUSE_TENSORRT=OFF
-cmake --build build-cpu --target \
-  test_search_repetition test_dfpn_repetition test_shallow_mate -j"$(nproc)"
+build/make_random_net value  nets/value.nn  --l1 1024
+build/make_random_net policy nets/policy.nn --l1 4096
 ```
 
-## Compatibility
+## Quick check
 
-JHBR3 retains the internal C++ namespace `jhbr2`, Python encoder module name
-`jhbr2_encoder`, and USI model-format value `jhbr2`. These identify the
-inherited software/model interface and remain unchanged so existing 148-plane
-models, scripts, and serialized TensorRT engines continue to work.
+```bash
+printf 'bench 20000 4\nquit\n' | build/jhbr5      # nodes/s, evals/s, expansions/s
+build/bench_nnue test/legal100.sfens               # raw network throughput
+```
+
+## USI options
+
+| Option | Default | Meaning |
+|---|---|---|
+| `ValueNet`, `PolicyNet` | `nets/*.nn` | network files |
+| `Threads` | 1 | search threads (tree parallelism) |
+| `MaxNodes` | 100000000 | playout cap per move |
+| `EvalCacheMB` | 64 | value cache (position hash → WDL) |
+| `TreeMemoryMB` | 4096 | stop the search when live tree nodes exceed this |
+| `CInit`, `CBase`, `FpuReduction` (+`Root` variants) | 1.25, 19652, 0.27 | PUCT |
+| `LeafMateMode`, `LeafMateDepth`, `RootMateDepth`, `RootMateSolver` | shallow, 5, 7, bns | mate integration |
+| `UseButterfly`, `ButterflyDivisor`, `ButterflyReduction` | false | Monty history bonus on policy logits |
+| `UsePolicyTemperature`, `Pst*` | false | Monty depth/Q policy softmax temperature |
+| `DrawScale`, `DrawQuadratic` | 0 | Monty draw-share adjustment |
+| `DrawValueBlack/White`, `ResignThreshold`, `MaxMovesToDraw` | 0.5, 0.01, 100000 | as JHBR3 |
+| time management options (`TimeManagement`, `MoveOverheadMs`, …) | as JHBR3 | see `docs/` |
+
+Retired JHBR3 options (`OnnxModel`, `UseGPU`, `WorkersPerGpu`, `MinibatchSize`,
+`NumGPUs`, `NNCacheSize`, `UseMovesLeft`, …) are accepted and ignored.
 
 ## Documentation
 
-- [`docs/HOW_TO_START.md`](docs/HOW_TO_START.md): build and run the engine
-- [`docs/HOW_TO_TRAIN.md`](docs/HOW_TO_TRAIN.md): train and export a network
-- [`docs/STRENGTH_TESTING.md`](docs/STRENGTH_TESTING.md): reproducible A/B tests
-- [`docs/ENGINE_STRENGTH_ROADMAP.md`](docs/ENGINE_STRENGTH_ROADMAP.md):
-  inherited improvement roadmap and technical history
+- `docs/DESIGN.md` — architecture and review decisions
+- `docs/MONTY_NOTES.md`, `docs/YANEURAOU_NNUE_NOTES.md` — study notes
+- `docs/NNUE_FORMAT.md` — weight file format
+- `docs/CHANGELOG.md` — per-phase changes and decisions
+- `docs/STRENGTH_TESTING.md` — A/B testing harness (inherited from JHBR3)

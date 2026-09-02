@@ -1,3 +1,7 @@
+> **Superseded.** This page describes the JHBR3 148-plane CNN pipeline, which
+> JHBR5 removed. The JHBR5 trainer (PyTorch, sparse NNUE inputs) arrives in
+> Phase 3 and will replace this document. Kept for reference only.
+
 # HOW TO TRAIN
 
 End-to-end recipe for training the **148-plane JHBR2 model** (dlshogi-style
