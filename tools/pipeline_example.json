@@ -19,8 +19,10 @@
   "test": {
     "bench_nodes": 20000,
     "threads": 4,
-    "pairs": 100,
     "nodes": 5000,
+    "gate": "sprt",
+    "sprt": {"elo0": 0, "elo1": 5, "round_pairs": 25},
+    "pairs": 400,
     "promote_score": 0.52,
     "engine_options": {"LeafMateDepth": "3"}
   }

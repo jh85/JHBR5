@@ -119,20 +119,29 @@ def main():
         result = {"score": None}
         if have_incumbent:
             match_dir = os.path.join(gen, "test", "match")
-            cmd = [sys.executable, os.path.join(REPO, "tools", "strength_test.py"),
-                   "--engine-a", engine, "--engine-b", engine, "--openings", cfg["openings"],
-                   "--pairs", str(t.get("pairs", 100)), "--nodes", str(t.get("nodes", 5000)), "--seed", str(seed),
-                   "--output", match_dir,
-                   "--option-a", f"ValueNet={os.path.join(best, 'value.nn')}", "--option-a", f"PolicyNet={os.path.join(best, 'policy.nn')}",
-                   "--option-b", f"ValueNet={cand_v}", "--option-b", f"PolicyNet={cand_p}",
-                   "--option-a", f"Threads={t.get('threads', 4)}", "--option-b", f"Threads={t.get('threads', 4)}"]
+            common = ["--engine-a", engine, "--engine-b", engine, "--openings", cfg["openings"],
+                      "--nodes", str(t.get("nodes", 5000)), "--seed", str(seed), "--output", match_dir,
+                      "--option-a", f"ValueNet={os.path.join(best, 'value.nn')}", "--option-a", f"PolicyNet={os.path.join(best, 'policy.nn')}",
+                      "--option-b", f"ValueNet={cand_v}", "--option-b", f"PolicyNet={cand_p}",
+                      "--option-a", f"Threads={t.get('threads', 4)}", "--option-b", f"Threads={t.get('threads', 4)}"]
             for k, v in t.get("engine_options", {}).items():
-                cmd += ["--option-a", f"{k}={v}", "--option-b", f"{k}={v}"]
-            run(cmd, log=log)
-            summary = json.load(open(os.path.join(match_dir, "summary.json")))
-            # strength_test.py reports the score of engine A (the incumbent).
-            result["score"] = 1.0 - float(summary["score"])
-            result["summary"] = summary
+                common += ["--option-a", f"{k}={v}", "--option-b", f"{k}={v}"]
+            if t.get("gate", "score") == "sprt":
+                s = t.get("sprt", {})
+                cmd = [sys.executable, os.path.join(REPO, "tools", "sprt_match.py")] + common + [
+                    "--elo0", str(s.get("elo0", 0)), "--elo1", str(s.get("elo1", 5)),
+                    "--round-pairs", str(s.get("round_pairs", 25)), "--max-pairs", str(t.get("pairs", 400))]
+                rc = subprocess.run(cmd, env=ENV).returncode
+                result["sprt"] = json.load(open(os.path.join(match_dir, "sprt.json")))["sprt"]
+                result["sprt_accepted"] = rc == 0
+                result["score"] = result["sprt"]["score"]
+            else:
+                run(common[:0] + [sys.executable, os.path.join(REPO, "tools", "strength_test.py")] + common +
+                    ["--pairs", str(t.get("pairs", 100))], log=log)
+                summary = json.load(open(os.path.join(match_dir, "summary.json")))
+                # strength_test.py reports the score of engine A (the incumbent).
+                result["score"] = 1.0 - float(summary["score"])
+                result["summary"] = summary
         json.dump(result, open(os.path.join(gen, "test", "result.json"), "w"), indent=2)
         print("test result:", result.get("score"))
 
@@ -141,7 +150,10 @@ def main():
         res_path = os.path.join(gen, "test", "result.json")
         result = json.load(open(res_path)) if os.path.exists(res_path) else {"score": None}
         gate = float(t.get("promote_score", 0.52))
-        ok = not have_incumbent or (result.get("score") is not None and result["score"] >= gate)
+        if t.get("gate", "score") == "sprt":
+            ok = not have_incumbent or bool(result.get("sprt_accepted"))
+        else:
+            ok = not have_incumbent or (result.get("score") is not None and result["score"] >= gate)
         if not ok:
             print(f"not promoted: score {result.get('score')} < {gate}")
             return 1

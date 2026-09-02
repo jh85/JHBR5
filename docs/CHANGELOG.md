@@ -1,6 +1,23 @@
 # JHBR5 changelog
 
-## Unreleased — Phase 4 (data pipeline)
+## Unreleased — Phase 5 (testing) and first training
+
+* `tools/sprt.py` (pentanomial GSPRT), `tools/sprt_match.py` (rounds of
+  paired games until the SPRT decides), `tools/match_vs_jhbr3.sh` (equal
+  nodes), `tools/match_vs_yaneuraou.sh` (equal clock and threads),
+  `tools/thread_scaling.sh`; `pipeline.py` gains `"gate": "sprt"`;
+  `docs/STRENGTH_TESTING.md` gains a JHBR5 section; `tools/cloud_setup.sh`.
+* Trainer: policy target falls back to the played move for game records
+  without a distribution (`--policy-target auto`); chunked, checkpointed
+  policy readout (batch 8192 × 108 legal moves now needs 1.3 GB instead of
+  3.4 GB); `BatchReader` interleaves 16 shards for mixing.
+* Data: 80 pack files (`../training_data`) imported to `../data/pack`
+  (1.02 billion positions from the first 45 files; the rest importing).
+* First networks (S profile) trained on the RTX 2060: value L1 512 at 52k
+  positions/s, policy L1 2048; installed in `../nets/` for floodgate via
+  `../shgterm/my-config.yaml`.
+
+## Phase 4 (data pipeline)
 
 * `tools/import_pack.py`: YaneuraOu `.pack` game records → `.rec` shards via
   cshogi (Apery HCP start positions, move16), multiprocess, ~230–600k

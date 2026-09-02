@@ -1,4 +1,32 @@
-# Reliable strength testing
+# Strength testing
+
+## JHBR5 (CPU engine)
+
+The harness below is inherited from JHBR3 and works unchanged for JHBR5:
+`tools/strength_test.py` drives two USI engines over an opening suite in
+colour-reversed pairs and writes `summary.json` (score of engine A, Elo with a
+95% interval, pentanomial pair counts). GPU-topology sections do not apply;
+pass `Threads=N` through `--option-a/--option-b`.
+
+Scripts added for JHBR5 (docs/DESIGN.md §11):
+
+| Script | Purpose |
+|---|---|
+| `tools/match_vs_jhbr3.sh JHBR3 MODEL OPENINGS [pairs] [nodes]` | JHBR5 vs JHBR3 at equal nodes per move: isolates network quality from speed. |
+| `tools/match_vs_yaneuraou.sh YANE EVALDIR OPENINGS [pairs] [byoyomi_ms] [threads]` | JHBR5 vs YaneuraOu at equal clock and threads: MCTS vs alpha-beta. |
+| `tools/sprt_match.py --engine-a … --engine-b … --openings … --nodes …` | JHBR5 vs JHBR5 in rounds of pairs until the SPRT (`tools/sprt.py`, pentanomial GSPRT, default bounds [0, 5] Elo, α = β = 0.05) accepts or rejects the candidate (engine B). Exit 0/1/2 = accepted/rejected/undecided. |
+| `tools/sprt.py --summary summary.json [--for-b]` | LLR and verdict for an existing match. |
+| `tools/thread_scaling.sh ENGINE VALUE POLICY [nodes] [threads…]` | nodes/s at 1/2/4/8 threads via the `bench` command. |
+| `tools/pipeline.py` with `"gate": "sprt"` | promotion by SPRT instead of a score threshold. |
+
+Use fixed nodes for network and search-parameter comparisons and a clock
+for speed-inclusive comparisons, as below. The SPRT bounds for
+non-regression tests are `--elo0 -5 --elo1 0`.
+
+---
+
+# JHBR3 harness (inherited)
+
 
 `tools/run_strength_test.sh` provides a portable A/B match environment for two
 USI engines. It installs `cshogi` into `build-strength/venv` when necessary,
