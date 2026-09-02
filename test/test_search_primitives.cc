@@ -9,9 +9,7 @@
 namespace {
 
 using dlshogi_mcts::BackupTrajectory;
-using dlshogi_mcts::ComputeMovesLeftUtility;
 using dlshogi_mcts::EdgeOutcome;
-using dlshogi_mcts::MovesLeftParameters;
 using dlshogi_mcts::PuctParameters;
 using dlshogi_mcts::ResolveTerminalEdge;
 using dlshogi_mcts::SelectPuctChild;
@@ -86,7 +84,7 @@ void TestTerminalBackupAlternatesOncePerEdge() {
 
   const std::vector<trajectory_t> path = {
       {&root, 0}, {&middle, 0}, {&leaf_parent, 0}};
-  BackupTrajectory(path, 1.0f, 4.0f);
+  BackupTrajectory(path, 1.0f);
 
   Check("last edge receives terminal parent win",
         Near(leaf_parent.child[0].win.load(), 1.0f));
@@ -94,76 +92,13 @@ void TestTerminalBackupAlternatesOncePerEdge() {
         Near(middle.child[0].win.load(), 0.0f));
   Check("root edge receives two perspective flips",
         Near(root.child[0].win.load(), 1.0f));
-  Check("leaf moves-left is stored on last edge",
-        Near(leaf_parent.child[0].sum_m.load(), 4.0f));
-  Check("moves-left increments toward root",
-        Near(middle.child[0].sum_m.load(), 5.0f) &&
-            Near(root.child[0].sum_m.load(), 6.0f));
-  Check("node moves-left includes the traversed edge",
-        Near(leaf_parent.MeanMovesLeft(), 5.0f) &&
-            Near(middle.MeanMovesLeft(), 6.0f) &&
-            Near(root.MeanMovesLeft(), 7.0f));
   Check("backup resolves virtual visits exactly once",
         root.child[0].move_count.load() == 1 &&
             middle.child[0].move_count.load() == 1 &&
             leaf_parent.child[0].move_count.load() == 1);
 }
 
-void TestLc0MovesLeftUtility() {
-  MovesLeftParameters params;
-  params.enabled = true;
 
-  Check("MLH is zero at the parent Q threshold",
-        Near(ComputeMovesLeftUtility(params, 0.9f, 40.0f,
-                                     1.0f, 20.0f),
-             0.0f));
-  Check("MLH prefers a capped shorter forced win",
-        Near(ComputeMovesLeftUtility(params, 0.95f, 40.0f,
-                                     1.0f, 20.0f),
-             0.01725f));
-  Check("MLH prefers a capped longer forced loss",
-        Near(ComputeMovesLeftUtility(params, 0.05f, 40.0f,
-                                     0.0f, 60.0f),
-             0.01725f));
-
-  params.enabled = false;
-  Check("MLH master switch is a no-op",
-        Near(ComputeMovesLeftUtility(params, 0.95f, 40.0f,
-                                     1.0f, 20.0f),
-             0.0f));
-}
-
-void TestSelectionUsesAveragedMovesLeft() {
-  uct_node_t node;
-  InitNode(&node, 2);
-  node.move_count.store(20, std::memory_order_relaxed);
-  node.win.store(19.0f, std::memory_order_relaxed);
-  node.sum_m.store(840.0f, std::memory_order_relaxed);
-  // One NN evaluation plus 20 completed backups; parent M = 40.
-  node.m_visits.store(21, std::memory_order_relaxed);
-
-  for (int i = 0; i < 2; ++i) {
-    node.child[i].move_count.store(10, std::memory_order_relaxed);
-    node.child[i].win.store(9.5f, std::memory_order_relaxed);
-    node.child[i].nnrate = 0.0f;
-    node.child[i].m_visits.store(10, std::memory_order_relaxed);
-  }
-  node.child[0].sum_m.store(200.0f, std::memory_order_relaxed);  // M = 20
-  node.child[1].sum_m.store(600.0f, std::memory_order_relaxed);  // M = 60
-
-  PuctParameters params;
-  params.c_init = 0.0f;
-  params.c_base = 3.0e30f;
-  params.moves_left.enabled = true;
-  Check("winning selection prefers the shorter searched line",
-        SelectPuctChild(nullptr, &node, params) == 0);
-
-  node.win.store(1.0f, std::memory_order_relaxed);
-  node.child[0].win.store(0.5f, std::memory_order_relaxed);
-  node.child[1].win.store(0.5f, std::memory_order_relaxed);
-  Check("losing selection prefers the longer searched line",
-        SelectPuctChild(nullptr, &node, params) == 1);
-}
 
 void TestInvalidBackupIsContained() {
   uct_node_t root;
@@ -277,8 +212,6 @@ int main() {
   TestTerminalEdgeConvention();
   TestTerminalBackupAlternatesOncePerEdge();
   TestInvalidBackupIsContained();
-  TestLc0MovesLeftUtility();
-  TestSelectionUsesAveragedMovesLeft();
   TestParentQFpuForUnvisitedChildren();
   TestSelectedPriorAccumulatesForFpu();
   TestDlshogiExplorationConstant();
