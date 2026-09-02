@@ -1,6 +1,46 @@
 # JHBR5 changelog
 
-## Unreleased — Phase 2 (search integration)
+## Unreleased — Phase 3 (training)
+
+Decision (after reviewing BulletOu, MIT, Rust/CUDA): keep a PyTorch trainer
+that covers both networks and runs CPU tests; BulletOu stays a reference and
+a possible later accelerator for the value net under the same `.nn` header
+contract. Rationale in the Phase 3 discussion of the session and
+`docs/HOW_TO_TRAIN.md`.
+
+* `nnue/record.{h,cc}` + `docs/DATA_FORMAT.md`: training record format
+  (44-byte head whose first 40 bytes are a YaneuraOu `PackedSfenValue`, then
+  `(move16, visits)` pairs), reader/writer, `test_record_io`.
+* `pyext/jhbr5_py.cc`: pybind11 module `jhbr5` exposing the engine's
+  mappings (`value_features`, `policy_features`, `move_bucket`, `see_good`,
+  `legal_moves`, `feature_set_id`, `bucket_table_id`), packed-sfen codec,
+  CRC-32C, `write_net` (the engine's own file writer), `RecordWriter`, and
+  `BatchReader` (C++ shard reader with shuffle buffer that emits EmbeddingBag
+  index/offset arrays and per-legal-move bucket/visit arrays; ~100k
+  positions/s per thread including legal moves and SEE buckets).
+* `train/`: `model.py` (`ValueNet` with three sparse groups, shared group-A
+  table, slot-only factoriser, PST skip on group B; `PolicyNet` with
+  per-legal-move gathered readout; segment softmax; λ-blended WDL target with
+  the nnue-pytorch score→WDL shape; weight clipping to the integer ranges),
+  `data.py` (IterableDataset over shards, one C++ reader per worker),
+  `train.py` (AdamW, warmup + exponential decay, checkpoints, resume, export),
+  `export.py` (factoriser fold, calibrated QB, rounding, `.nn` via
+  `jhbr5.write_net`), `quantized.py` (NumPy reference of the engine's integer
+  forward pass and the QB calibration).
+* Tools/tests: `eval_positions` (prints WDL and per-move logits);
+  `test_net_roundtrip.py` (PyTorch → `.nn` → C++ evaluator equals the integer
+  reference within 6e-8 WDL / 5e-7 logits; quantisation error vs the float
+  model 2e-3 / 2e-2 on random weights); `test_train_smoke.py` (synthetic
+  shard → train value and policy nets on CPU → export → engine loads);
+  both registered in `ctest` and skipped (code 77) when torch/pybind11 are
+  missing. `CMAKE_POSITION_INDEPENDENT_CODE ON` for the module.
+* Not done in this phase: the `KPrel` virtual feature (only the slot-only
+  factoriser is implemented); a Triton/CUDA kernel for the policy readout
+  (the gathered-matmul formulation caps batch size at a few thousand on
+  large L1); `bench` of trainer throughput on a GPU (no GPU on the dev
+  machine).
+
+## Phase 2 (search integration)
 
 * `mcts/uct_search.{h,cc}` rewritten for synchronous CPU evaluation: no leaf
   batching, no GPU worker groups. Node state machine `kFresh → kEvaluated

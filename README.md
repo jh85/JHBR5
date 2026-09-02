@@ -11,7 +11,9 @@ Licence: GPL-3.0 (inherited from JHBR3 / Leela Chess Zero); see
 
 ## Build
 
-Requires CMake ≥ 3.18 and a C++20 compiler. No CUDA, TensorRT or ONNX.
+Requires CMake ≥ 3.18 and a C++20 compiler. No CUDA, TensorRT or ONNX. With
+`pybind11` installed (`python3 -m pip install pybind11`) the build also
+produces the `jhbr5` Python module used by the trainer.
 
 ```bash
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DJHBR5_ISA=avx2
@@ -69,5 +71,7 @@ Retired JHBR3 options (`OnnxModel`, `UseGPU`, `WorkersPerGpu`, `MinibatchSize`,
 - `docs/DESIGN.md` — architecture and review decisions
 - `docs/MONTY_NOTES.md`, `docs/YANEURAOU_NNUE_NOTES.md` — study notes
 - `docs/NNUE_FORMAT.md` — weight file format
+- `docs/DATA_FORMAT.md` — training record format
+- `docs/HOW_TO_TRAIN.md` — PyTorch trainer, export and round-trip verification
 - `docs/CHANGELOG.md` — per-phase changes and decisions
 - `docs/STRENGTH_TESTING.md` — A/B testing harness (inherited from JHBR3)

@@ -32,6 +32,14 @@ eval) and 106k policy expansions/s (9.5 µs); scalar kernels 112k / 66k.
 These beat the estimates in §5.5 by 2×, mostly because group-B rows are
 fewer than budgeted and hardware prefetch handles the row streams well.
 
+Phase 3 (training): implemented as specified in §9 with these deviations:
+the factoriser is slot-only (no king-relative offset table yet); the policy
+readout is a gathered matmul rather than a custom kernel; the record format
+stores visits scaled to a 65535 maximum and the trainer assigns zero visits
+to legal moves absent from the distribution. BulletOu (yaneurao's bullet
+fork, MIT) was evaluated and kept as a reference/possible value-net
+accelerator; see `docs/CHANGELOG.md` Phase 3.
+
 Phase 2 (search integration) measured with random M nets, `bench 20000`:
 50k playouts/s on one thread, 175k on four, 281k on eight (the estimate in
 §5.5 was 12k–30k per thread; the shallow mate probe at depth 5 costs about a

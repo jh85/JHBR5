@@ -1,195 +1,83 @@
-> **Superseded.** This page describes the JHBR3 148-plane CNN pipeline, which
-> JHBR5 removed. The JHBR5 trainer (PyTorch, sparse NNUE inputs) arrives in
-> Phase 3 and will replace this document. Kept for reference only.
+# How to train JHBR5 networks
 
-# HOW TO TRAIN
+The trainer is PyTorch (`train/`). All feature indices, move buckets and SEE
+come from the engine's C++ through the `jhbr5` Python module built by CMake;
+the trainer contains no second implementation of any mapping
+(`docs/DESIGN.md` §9).
 
-End-to-end recipe for training the **148-plane JHBR2 model** (dlshogi-style
-input + WDL value + MLH moves-left head) from YaneuraOu `.pack` files, and
-turning the result into a TensorRT engine the `jhbr3` binary can run.
+## Requirements
 
-Pipeline:
+- `python3 -m pip install torch numpy pybind11` (CUDA build of torch for real
+  training; the CPU build runs the tests).
+- Build the engine with the Python module: `cmake -S . -B build && cmake
+  --build build -j`. The module is `build/jhbr5.cpython-*.so`; put `build/` on
+  `PYTHONPATH` (the scripts also accept it implicitly when run from `build/`).
 
+## Data
+
+Training reads shard files in the format of `docs/DATA_FORMAT.md` (`.rec`).
+Phase 4 provides the tools that produce them (PSV/pack import, JHBR3
+teacher, self-play). `jhbr5.RecordWriter` writes them from Python:
+
+```python
+import jhbr5
+w = jhbr5.RecordWriter("shard.rec")
+w.write(sfen, score_cp, best_move_usi, ply, result, [(usi, visits), ...], flags)
+w.close()
 ```
-.pack files ──► gen_pack_shards.py ──► .npz shards ──► shogi_train.py ──► .onnx ──► trtexec ──► .engine
-```
 
-Two scripts do the work: **`gen_pack_shards.py`** (data) and
-**`shogi_train.py`** (training). `trtexec` builds the engine. See
-`docs/nyugyoku_dlshogi_features.md` for the plane layout and `HOW_TO_START.md`
-for building/running the engine.
-
----
-
-## 0. Prerequisites
-
-- Python with PyTorch (CUDA build), NumPy, and `cshogi`.
-- A CUDA GPU for training (CPU works but is only useful for a tiny smoke test).
-- For the engine step: CUDA + TensorRT (see `HOW_TO_START.md`).
-
----
-
-## 1. Pack files → training shards
-
-Point `--pack-dir` at the directory holding **all** your `.pack` files; they
-are processed in parallel.
+## Train
 
 ```bash
-python gen_pack_shards.py \
-    --pack-dir /path/to/all_packs/ \
-    --output-dir /workspace/pack_shards/ \
-    --shard-size 500000 \
-    --workers 16 \
-    --eval-coef 600.0
+export PYTHONPATH=build
+python3 train/train.py --net value  --shards data/*.rec --l1 1024 --batch-size 16384 \
+    --steps 200000 --wdl-lambda 0.7 --out runs/value1 --export nets/value.nn
+python3 train/train.py --net policy --shards data/*.rec --l1 4096 --batch-size 16384 \
+    --steps 200000 --out runs/policy1 --export nets/policy.nn
 ```
 
-Output: `/workspace/pack_shards/shard_000000.npz, shard_000001.npz, …`. Each
-shard holds `planes (N,148,9,9) f16`, `policy int32` (∈[0,2187)), `wdl (N,3) f16`,
-and `mlh int16` (remaining plies to game end — the MLH target).
+| Option | Meaning |
+|---|---|
+| `--net value\|policy` | which network; the policy trainer skips records without a visit distribution |
+| `--l1` | accumulator width (value 1024 = "M", 512 = "S"; policy 4096 / 2048); must be a multiple of 256 |
+| `--wdl-lambda` | weight of the score-derived WDL vs the game result (0.7 for PSV, 0.5 for self-play) |
+| `--score-scale`, `--score-offset` | `w = σ((s−offset)/scale)`, `l = σ((−s−offset)/scale)`, `d = 1−w−l`; defaults 340 / 270 (nnue-pytorch/BulletOu shape) |
+| `--no-see` | policy bucket table without SEE doubling (the engine reads which one from the file) |
+| `--no-factoriser` | disable the slot-only factoriser on group A |
+| `--lr`, `--lr-final`, `--warmup`, `--weight-decay` | AdamW, exponential decay after warmup |
+| `--shuffle-buffer`, `--workers` | per-worker C++ shuffle buffer (records) and DataLoader workers |
+| `--resume ckpt.pt` | continue from a checkpoint (optimizer state included) |
+| `--export path.nn` | quantise and write the engine file at the end |
 
-Sanity-check first (a couple thousand positions, one worker):
+Weights are clipped after every step to the ranges the integer formats can
+hold (`train/model.py`), so export is a rounding, not a projection.
+
+## Export and verify
 
 ```bash
-python gen_pack_shards.py --pack-dir data --output-dir /tmp/probe \
-    --limit 2000 --workers 1
+python3 train/export.py --checkpoint runs/value1/ckpt_last.pt --out nets/value.nn --calib-sfens positions.txt
+python3 train/export.py --checkpoint runs/policy1/ckpt_last.pt --out nets/policy.nn
+build/eval_positions nets/value.nn nets/policy.nn test/legal100.sfens | head
 ```
 
-> **Shard size vs. RAM.** Under DDP every GPU process loads a full shard into
-> RAM, so peak ≈ `shard_size × ~24 KB × num_gpus`. For an 8-GPU run, prefer
-> `--shard-size 100000` (~2.4 GB/shard → ~19 GB across 8 ranks) over 500k.
-> Generate shards **once** and reuse them for every training run.
+`export.py` folds the factoriser into the group-A table, calibrates the L2
+scale `QB` (largest power of two ≤ 1024 with an 8× overflow margin on the
+calibration positions), rounds to the integer types and writes the file
+through the engine's own writer (`jhbr5.write_net`), so the header carries
+the compiled `feature_set_id` / `bucket_table_id`.
 
-`gen_pack_shards.py` is pure-Python (~900 pos/s/worker); 16 workers ≈ 14k/s, so
-~100M positions ≈ 2 h. (Other generators — `pack_to_shards.py`, `psv_to_shards.py`
-— also produce 148-plane shards, but `gen_pack_shards.py` is the canonical,
-verified one for packs.)
+`ctest -R net_roundtrip` checks that the C++ evaluator reproduces the
+trainer's integer reference bit-for-bit (differences are float rounding,
+about 1e-7) and reports the quantisation error against the float model
+(about 2e-3 in WDL, 2e-2 in policy logits for random weights).
+`ctest -R train_smoke` writes a synthetic shard, trains both nets for a few
+steps on CPU, exports, and loads the result in the engine.
 
----
+## Speed
 
-## 2. Train
-
-The model is already configured for 148 planes + MLH; "from scratch" just means
-**don't pass `--resume`**.
-
-> ⚠️ **`--data` is a file PREFIX, not a directory.** The trainer detects shards
-> by globbing `{--data}_*.npz`, so use `…/pack_shards/shard` (matches
-> `…/pack_shards/shard_*.npz`). Passing the folder silently trains on synthetic
-> data instead.
-
-### Single GPU
-
-```bash
-python shogi_train.py \
-    --data /workspace/pack_shards/shard \
-    --epochs 20 --batch 1024 --lr 1e-3 \
-    --save-dir checkpoints/ --save-every 1 --workers 8 \
-    --export-onnx model_148.onnx
-```
-
-### Multiple GPUs (recommended: DDP via torchrun)
-
-DDP runs one process per GPU with NCCL all-reduce — far better scaling than the
-single-process `DataParallel` fallback. Just launch with `torchrun`; the script
-auto-detects it.
-
-```bash
-# 2× GPU (e.g. test box)
-torchrun --nproc_per_node=2 shogi_train.py \
-    --data /workspace/pack_shards/shard \
-    --epochs 20 --batch 2048 --lr 1e-3 \
-    --save-dir checkpoints/ --save-every 1 --workers 8 \
-    --export-onnx model_148.onnx
-
-# 8× GPU
-torchrun --nproc_per_node=8 shogi_train.py \
-    --data /workspace/pack_shards/shard \
-    --epochs 20 --batch 8192 --lr 2e-3 \
-    --save-dir checkpoints/ --save-every 1 --workers 8 \
-    --export-onnx model_148.onnx
-```
-
-- **`--batch` is per-GPU under DDP**, so global batch = `batch × nproc`. Keep
-  ~1024/GPU and scale `--lr` up as the global batch grows.
-- Pick GPUs with `CUDA_VISIBLE_DEVICES=0,1 torchrun …`.
-- Only rank 0 logs, checkpoints, and exports. Checkpoints have no `module.`
-  prefix issues — `--resume` handles them.
-
-### Losses (what to watch)
-
-The per-epoch line reports all three heads; **all should trend down**:
-
-```
-Epoch 3/20  loss=…  policy=…  value=…  mlh=…  lr=…  speed=… samples/sec
-```
-
-- `policy` — cross-entropy over the 2187 move labels.
-- `value`  — cross-entropy over WDL.
-- `mlh`    — Huber loss on clipped remaining plies. Tunable:
-  - `--mlh-weight` (default `0.1`; set `0` to disable MLH training),
-  - `--mlh-clip` (default `80` plies).
-
-Add `--log-csv run.csv` to record per-epoch metrics.
-
----
-
-## 3. Export → TensorRT engine
-
-`--export-onnx` writes the ONNX at the end of training (or run
-`checkpoint2onnx.py` on a checkpoint). It emits the tensor names the native
-backend expects: `input_planes` / `policy` / `wdl` / `mlh`, dynamic batch,
-148 channels.
-
-Build the engine — **note `148`, not `48`** (the templates in `HOW_TO_START.md`
-predate the 148-plane encoder):
-
-```bash
-$TENSORRT_PATH/bin/trtexec \
-  --onnx=model_148.onnx \
-  --saveEngine=engines/model_148.engine \
-  --fp16 \
-  --minShapes=input_planes:1x148x9x9 \
-  --optShapes=input_planes:128x148x9x9 \
-  --maxShapes=input_planes:128x148x9x9 \
-  --memPoolSize=workspace:8192M
-```
-
----
-
-## 4. Run
-
-```
-setoption name OnnxModel value /path/to/engines/model_148.engine
-```
-
-The backend reads the engine's tensor names, auto-detects the **JHBR2** format,
-and uses the packed-bits + GPU-unpack input path. (`ModelFormat` defaults to
-`auto`; the `dlshogi` value is for the separate external-net validation path.)
-
-### Optional: enable the moves-left (MLH) effect in search
-
-Off by default. Once you've trained a model with the MLH head, you can have MCTS
-prefer shorter wins / longer losses. The parameter shape and values below match
-lc0; they are not yet strength-tuned for Shogi:
-
-```
-setoption name UseMovesLeft value true
-# Optional overrides of the lc0-shaped defaults:
-setoption name MovesLeftMaxEffect value 0.0345
-setoption name MovesLeftThreshold value 0.8
-setoption name MovesLeftSlope value 0.0027
-```
-
-Tune with paired games against `UseMovesLeft=false`; too much effect can cost
-strength. See `docs/MLH.md` for semantics and the lc0 comparison.
-
----
-
-## Quick reference
-
-| Step | Command |
-|------|---------|
-| Shards | `python gen_pack_shards.py --pack-dir P --output-dir S --workers 16` |
-| Train (1 GPU) | `python shogi_train.py --data S/shard --epochs 20 --batch 1024 --export-onnx m.onnx` |
-| Train (N GPU) | `torchrun --nproc_per_node=N shogi_train.py --data S/shard --batch 1024×perGPU …` |
-| Engine | `trtexec --onnx=m.onnx --saveEngine=m.engine --fp16 --*Shapes=input_planes:…x148x9x9` |
-| Run | `setoption name OnnxModel value m.engine` |
+Throughput is dominated by the sparse first layer. With the C++ batch reader
+(feature extraction, legal moves, buckets with SEE) a DataLoader worker
+produces roughly 30–60k positions/s; use `--workers 4..8`. On a GPU the M
+profile trains at a few hundred thousand positions/s with `nn.EmbeddingBag`;
+if that becomes the bottleneck, the value net can be moved to BulletOu under
+the same header contract (see the Phase 3 discussion in `docs/CHANGELOG.md`).
