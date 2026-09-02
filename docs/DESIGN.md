@@ -1,7 +1,36 @@
 # JHBR5 design proposal
 
-Status: **draft for review (end of Phase 0)**. Nothing below is implemented.
-Companion notes: `MONTY_NOTES.md`, `YANEURAOU_NNUE_NOTES.md`.
+Status: **reviewed 2026-09-02; Phase 1 implemented**. Companion notes:
+`MONTY_NOTES.md`, `YANEURAOU_NNUE_NOTES.md`; the review answers are in
+`open_questions.txt`.
+
+## Review decisions (supersede the text below where they differ)
+
+| # | Question | Decision |
+|---|---|---|
+| 1 | Shared vs separate group-A tables | **Shared** (closest to Monty's single table, simpler). Consequence: the PST skip connection is attached to group B only, because a shared table cannot carry a signed PST for both frames. |
+| 2 | S or M profile | **M** (value L1 1024, policy L1 4096) as defaults; widths are header fields so S nets load unchanged. |
+| 3 | Threat pairs in v1 | **Yes** (Monty has them). |
+| 4 | SEE doubling | **On** (Monty has it); the header records which table a net uses. |
+| 5 | Records store move16 | **Yes** (Monty stores moves). |
+| 6 | JHBR3 `info string rootdist` patch | Allowed, opt-in only, no impact on JHBR3 performance. |
+| 7 | Expansion on the second visit | **Monty's way**; `MaxNodes` keeps counting iterations. |
+| 8 | MLH head | **Dropped**. |
+| 9 | Butterfly / policy temperature | **Off** by default until SPRT. |
+| 10 | Data | `../2000000/*.pack` (YaneuraOu pack game records, 155 MB) for Phase 4. |
+| 11 | Target machines | Ryzen 9 9955HX 32 GB (M profile fits); EPYC 9115 750 GB available briefly. |
+| 12 | LICENSE file | Not now. |
+
+Implementation deviations recorded during Phase 1: L1 and policy-readout
+biases are i16 (Monty: i8) for headroom; positions without a king (test
+sfens) use king square 0; SEE captures with the lowest-square attacker among
+equal types, which is not frame invariant in rare double-attacker positions.
+
+Measured on the dev machine (one thread, AVX2, random M nets, 8-ply random
+walks): 172k value evals/s (5.8 µs, 14.5 group-A + 66 group-B rows per
+eval) and 106k policy expansions/s (9.5 µs); scalar kernels 112k / 66k.
+These beat the estimates in §5.5 by 2×, mostly because group-B rows are
+fewer than budgeted and hardware prefetch handles the row streams well.
 
 ## 0. Summary of the recommendation
 

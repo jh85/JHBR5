@@ -1,0 +1,44 @@
+For the question 1 to 5, please follow the approach that most closely matches Monty’s implementation. If it’s unclear which approach is closer, just use the simpler one.
+
+1. Share the HalfKP table between `A_us` and `A_them` (YaneuraOu style, halves
+   the value net) or keep two tables (proposed)?
+2. Start with the "S" profile (L1 512 / L1p 2048) or go straight to "M"?
+3. Threat pairs in v1 (proposed) or ship v1 with groups A + absolute slots
+   only and add threats as v2 once the pipeline works end to end?
+4. SEE doubling of the bucket table on from the start (proposed) or off?
+5. Records store `move16` rather than bucket ids (proposed) — acceptable?
+
+
+6. May I add an opt-in `info string rootdist` output to JHBR3 for the teacher
+   tool, or do you prefer a Python driver that reconstructs distributions
+   from `MultiPV` output / another route?
+
+This sounds like a good idea to me. Please do so if this degradates the performance.
+
+7. Expansion on the second visit (Monty) — OK with the change to node
+   accounting?
+
+I want to stick to the way Monty does. But if you think it's better to change to node accounting, please explain.
+
+8. Drop the MLH head entirely in v1 (proposed)?
+
+Agreed. Let's drop the MLH head entirely.
+
+9. Butterfly and policy temperature default **off** until SPRT (proposed).
+
+Agreed.
+
+10. Which PSV corpora are available for stage 0 (paths, sizes, teacher
+    depths)? Any ban on using YaneuraOu-generated data for the final nets?
+
+Are you talking about training data? If so, I just put some of my training data under 2000000 directory. They are shogi game records in YaneuraOu's pack format.
+
+11. Target AVX-512 machine: RAM and core count, to size the "M"/"L" profiles.
+
+CPU: Ryzen 9 9955HX, RAM: 32GB.
+CPU: Epyc 9115, RAM: 750GB (currently this machine is in use for another project. We can use this only a short time if necessary)
+
+12. Licence: JHBR3 has no top-level LICENSE file although its headers say
+    GPL-3.0; shall I add `LICENSE` (GPL-3.0) to JHBR5?
+
+No. LICENSE file is not necessary at this point.

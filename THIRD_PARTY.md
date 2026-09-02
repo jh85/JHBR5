@@ -28,9 +28,12 @@ v3** (see the licence headers in `shogi/*.h` and `mate/*.h`).
 | `mate/shallow_mate.h` (inherited from JHBR3) | dlshogi `usi/mate.h` | GPL-3.0 | port, see header |
 | `mcts/*` (inherited from JHBR3) | dlshogi `usi/UctSearch.cpp`, lc0 | GPL-3.0 | port/adaptation |
 
-Entries for Phase 1+ (NNUE kernels, SEE, feature sets, trainer) will be added
-as they are written. The intent is that every Phase 1+ entry reads
-"re-implemented from notes".
+| `nnue/see.cc` | swap-list SEE algorithm as in Stockfish/YaneuraOu `see_ge` | GPL-3.0 (algorithm) | re-implemented on JHBR3's board API from the algorithm description; piece values are YaneuraOu's |
+| `nnue/features.cc` (pair prefix-sum indexing), `nnue/move_buckets.cc` | Monty `value/attacks.rs`, `policy/outputs.rs` design | AGPL-3.0 (design only) | re-implemented from `docs/MONTY_NOTES.md`; no code copied |
+| `nnue/value_net.cc` finny cache | Stockfish `AccumulatorCaches` design | GPL-3.0 (design only) | re-implemented from the description in `docs/YANEURAOU_NNUE_NOTES.md` §4 |
+
+Every Phase 1 entry is a re-implementation from notes; no source text was
+copied from Monty, YaneuraOu or Stockfish.
 
 ## References (no code taken)
 
