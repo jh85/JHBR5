@@ -90,7 +90,12 @@ class BatchReader {
   uint64_t records_read() const { return records_read_; }
 
  private:
-  bool OpenNext() {
+  // Up to kOpenReaders shards are read round-robin so that a batch mixes
+  // records from many files (shards are time-ordered chunks of games).
+  static constexpr size_t kOpenReaders = 16;
+
+  // Opens the next shard into slot `slot`; false when no shard is left.
+  bool OpenNextInto(size_t slot) {
     while (true) {
       if (file_index_ >= paths_.size()) {
         if (!loop_ || paths_.empty()) return false;
@@ -99,24 +104,34 @@ class BatchReader {
         ++epoch_;
       }
       std::string err;
-      if (reader_.Open(paths_[file_index_++], &err)) return true;
-      if (file_index_ >= paths_.size() && !loop_) return false;
+      if (readers_[slot].Open(paths_[file_index_++], &err)) return true;
     }
   }
 
   bool ReadOne(data::Record* r) {
-    while (true) {
-      if (!open_ && !(open_ = OpenNext())) return false;
-      if (reader_.Next(r)) {
+    if (readers_.empty()) {
+      std::shuffle(paths_.begin(), paths_.end(), rng_);
+      readers_.resize(std::min(kOpenReaders, paths_.size()));
+      live_.assign(readers_.size(), false);
+      for (size_t i = 0; i < readers_.size(); ++i) live_[i] = OpenNextInto(i);
+    }
+    for (size_t tries = 0; tries < 2 * readers_.size() + 2; ++tries) {
+      const size_t slot = next_slot_++ % readers_.size();
+      if (!live_[slot]) continue;
+      if (readers_[slot].Next(r)) {
         ++records_read_;
         // A record without a distribution can still train the policy on its
         // played move (game records); require_dist without fallback skips it.
-        if (require_dist_ && r->head.n_dist == 0 && !(move_fallback_ && r->head.move != 0)) continue;
+        if (require_dist_ && r->head.n_dist == 0 && !(move_fallback_ && r->head.move != 0)) {
+          --tries;
+          continue;
+        }
         return true;
       }
-      open_ = false;
-      if (file_index_ >= paths_.size() && !loop_) return false;
+      live_[slot] = OpenNextInto(slot);
+      if (std::none_of(live_.begin(), live_.end(), [](bool b) { return b; })) return false;
     }
+    return false;
   }
 
   std::vector<data::Record> Take() {
@@ -230,8 +245,9 @@ class BatchReader {
   bool see_;
   bool loop_;
   bool move_fallback_;
-  data::RecordReader reader_;
-  bool open_ = false;
+  std::vector<data::RecordReader> readers_;
+  std::vector<bool> live_;
+  size_t next_slot_ = 0;
   size_t file_index_ = 0;
   int epoch_ = 0;
   bool exhausted_ = false;
