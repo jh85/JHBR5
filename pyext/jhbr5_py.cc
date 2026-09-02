@@ -64,14 +64,15 @@ py::array_t<T> Vec(const std::vector<T>& v) {
 class BatchReader {
  public:
   BatchReader(std::vector<std::string> paths, int batch_size, int shuffle_buffer,
-              uint64_t seed, bool require_dist, bool see, bool loop)
+              uint64_t seed, bool require_dist, bool see, bool loop, bool move_fallback)
       : paths_(std::move(paths)),
         batch_size_(batch_size),
         shuffle_buffer_(std::max(shuffle_buffer, batch_size)),
         rng_(seed),
         require_dist_(require_dist),
         see_(see),
-        loop_(loop) {
+        loop_(loop),
+        move_fallback_(move_fallback) {
     EnsureInit();
     if (paths_.empty()) throw std::invalid_argument("no shard paths");
   }
@@ -108,7 +109,9 @@ class BatchReader {
       if (!open_ && !(open_ = OpenNext())) return false;
       if (reader_.Next(r)) {
         ++records_read_;
-        if (require_dist_ && r->head.n_dist == 0) continue;
+        // A record without a distribution can still train the policy on its
+        // played move (game records); require_dist without fallback skips it.
+        if (require_dist_ && r->head.n_dist == 0 && !(move_fallback_ && r->head.move != 0)) continue;
         return true;
       }
       open_ = false;
@@ -173,7 +176,7 @@ class BatchReader {
         score[i] = static_cast<float>(r.head.score);
         result[i] = static_cast<float>(r.head.result);
         ply[i] = r.head.game_ply;
-        has_dist[i] = r.head.n_dist > 0;
+        has_dist[i] = r.head.n_dist > 0 || (move_fallback_ && r.head.move != 0);
 
         // Policy target: every legal move gets a bucket; visits from the
         // distribution (0 if absent).
@@ -183,10 +186,14 @@ class BatchReader {
           mv_bucket.push_back(see_ ? nnue::MoveBucketSee(board, moves[m])
                                    : nnue::MoveBucket(board, moves[m]));
           float visits = 0.0f;
-          for (const auto& d : r.dist) {
-            if (d.move == moves[m].raw()) {
-              visits = static_cast<float>(d.visits);
-              break;
+          if (r.dist.empty()) {
+            if (move_fallback_ && r.head.move == moves[m].raw()) visits = 1.0f;
+          } else {
+            for (const auto& d : r.dist) {
+              if (d.move == moves[m].raw()) {
+                visits = static_cast<float>(d.visits);
+                break;
+              }
             }
           }
           mv_visits.push_back(visits);
@@ -222,6 +229,7 @@ class BatchReader {
   bool require_dist_;
   bool see_;
   bool loop_;
+  bool move_fallback_;
   data::RecordReader reader_;
   bool open_ = false;
   size_t file_index_ = 0;
@@ -393,10 +401,10 @@ PYBIND11_MODULE(jhbr5, m) {
         "Write a JHBR5 .nn file (header fields + dict of name -> numpy array)");
 
   py::class_<BatchReader>(m, "BatchReader")
-      .def(py::init<std::vector<std::string>, int, int, uint64_t, bool, bool, bool>(),
+      .def(py::init<std::vector<std::string>, int, int, uint64_t, bool, bool, bool, bool>(),
            py::arg("paths"), py::arg("batch_size"), py::arg("shuffle_buffer") = 100000,
            py::arg("seed") = 1, py::arg("require_dist") = false, py::arg("see") = true,
-           py::arg("loop") = false)
+           py::arg("loop") = false, py::arg("move_fallback") = false)
       .def("next", &BatchReader::Next, "Next batch as a dict of numpy arrays, or None")
       .def_property_readonly("records_read", &BatchReader::records_read);
 

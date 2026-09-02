@@ -38,6 +38,8 @@ def parse_args():
     ap.add_argument("--score-scale", type=float, default=340.0)
     ap.add_argument("--score-offset", type=float, default=270.0)
     ap.add_argument("--no-see", action="store_true", help="policy: bucket table without SEE doubling")
+    ap.add_argument("--policy-target", choices=["dist", "auto"], default="auto",
+                    help="policy: 'dist' uses only records with a visit distribution; 'auto' also uses the played move of game records as a one-hot target")
     ap.add_argument("--no-factoriser", action="store_true")
     ap.add_argument("--shuffle-buffer", type=int, default=200000)
     ap.add_argument("--workers", type=int, default=4)
@@ -81,7 +83,8 @@ def main():
         print(f"resumed from {args.resume} at step {step}")
 
     ds = RecordDataset(args.shards, args.batch_size, args.shuffle_buffer, args.seed,
-                       require_dist=(args.net == "policy"), see=see, loop=True)
+                       require_dist=(args.net == "policy"), see=see, loop=True,
+                       move_fallback=(args.net == "policy" and args.policy_target == "auto"))
     loader = DataLoader(ds, batch_size=None, num_workers=args.workers, pin_memory=device.type == "cuda",
                         persistent_workers=args.workers > 0)
     print(f"{args.net} net l1={l1} params={sum(p.numel() for p in model.parameters())/1e6:.1f}M "
