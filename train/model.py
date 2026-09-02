@@ -16,6 +16,7 @@ import math
 
 import torch
 import torch.nn as nn
+import torch.utils.checkpoint
 
 import jhbr5
 
@@ -114,13 +115,28 @@ class PolicyNet(nn.Module):
         nn.init.uniform_(self.out_w.weight, -1.0 / math.sqrt(l1 // 2), 1.0 / math.sqrt(l1 // 2))
         nn.init.zeros_(self.out_b.weight)
 
+    # Moves per checkpointed chunk of the readout. The gathered rows
+    # (chunk x l1/2 floats) are recomputed in backward, so peak memory is
+    # bounded by the chunk instead of batch x legal moves.
+    readout_chunk = 32768
+
+    def _readout(self, buckets, hl, seg):
+        return (self.out_w(buckets) * hl[seg]).sum(dim=1) + self.out_b(buckets).squeeze(1)
+
     def forward(self, batch):
         """Returns flat logits over all legal moves of the batch and the segment id per move."""
         hl = pairwise(self.hidden(batch["p_idx"], batch["p_off"]))
         seg = batch["mv_seg"]
-        w = self.out_w(batch["mv_bucket"])
-        logits = (w * hl[seg]).sum(dim=1) + self.out_b(batch["mv_bucket"]).squeeze(1)
-        return logits, seg
+        buckets = batch["mv_bucket"]
+        total = buckets.shape[0]
+        if not self.training or total <= self.readout_chunk:
+            return self._readout(buckets, hl, seg), seg
+        parts = []
+        for start in range(0, total, self.readout_chunk):
+            end = min(start + self.readout_chunk, total)
+            parts.append(torch.utils.checkpoint.checkpoint(
+                self._readout, buckets[start:end], hl, seg[start:end], use_reentrant=False))
+        return torch.cat(parts), seg
 
     @torch.no_grad()
     def clip_weights(self):
