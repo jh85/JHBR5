@@ -39,6 +39,12 @@ build/make_random_net value  nets/value.nn  --l1 1024
 build/make_random_net policy nets/policy.nn --l1 4096
 ```
 
+## Self-play data
+
+```bash
+build/jhbr5 datagen --value nets/value.nn --policy nets/policy.nn --out selfplay.rec --games 1000 --threads 8 --nodes 800
+```
+
 ## Quick check
 
 ```bash
@@ -73,5 +79,6 @@ Retired JHBR3 options (`OnnxModel`, `UseGPU`, `WorkersPerGpu`, `MinibatchSize`,
 - `docs/NNUE_FORMAT.md` — weight file format
 - `docs/DATA_FORMAT.md` — training record format
 - `docs/HOW_TO_TRAIN.md` — PyTorch trainer, export and round-trip verification
+- `docs/DATA_PIPELINE.md` — importers, teacher labelling, `datagen`, generation loop
 - `docs/CHANGELOG.md` — per-phase changes and decisions
 - `docs/STRENGTH_TESTING.md` — A/B testing harness (inherited from JHBR3)

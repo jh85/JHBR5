@@ -40,6 +40,10 @@ to legal moves absent from the distribution. BulletOu (yaneurao's bullet
 fork, MIT) was evaluated and kept as a reference/possible value-net
 accelerator; see `docs/CHANGELOG.md` Phase 3.
 
+Phase 4 (data): implemented per §10 with `docs/DATA_PIPELINE.md` as the
+operational guide. The teacher tool talks USI to JHBR3 (patched, opt-in
+`RootDistOutput`) or JHBR5; datagen is in-engine and threaded.
+
 Phase 2 (search integration) measured with random M nets, `bench 20000`:
 50k playouts/s on one thread, 175k on four, 281k on eight (the estimate in
 §5.5 was 12k–30k per thread; the shallow mate probe at depth 5 costs about a

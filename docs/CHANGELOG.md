@@ -1,6 +1,40 @@
 # JHBR5 changelog
 
-## Unreleased — Phase 3 (training)
+## Unreleased — Phase 4 (data pipeline)
+
+* `tools/import_pack.py`: YaneuraOu `.pack` game records → `.rec` shards via
+  cshogi (Apery HCP start positions, move16), multiprocess, ~230–600k
+  positions/s per worker. The five available packs (304,841 games, 37.7M
+  positions) import in about two minutes.
+* `tools/import_psv.py`: PSV/`.bin` → `.rec` by re-framing (numpy, no decode).
+* `jhbr5 datagen` (`datagen/datagen.cc`): multi-threaded in-engine self-play
+  writing records with root visit distributions, root score and result;
+  random opening plies or a book, root Dirichlet noise (new `SearchConfig`
+  fields + `Search::ApplyRootNoise`), temperature sampling with decay,
+  resignation with a no-resign control fraction, repetition (4th
+  occurrence / perpetual check), declaration and ply-cap adjudication.
+  `SearchResult` now carries `root_visits` and `root_q`.
+* USI option `RootDistOutput` (default off): prints `info string rootdist
+  move:visits …` and `rootq` before `bestmove`.
+* `tools/jhbr3_rootdist.patch` and branch `jhbr5-teacher` in the JHBR3
+  checkout: the same opt-in option for JHBR3 (compile-checked with the
+  ONNX Runtime build). Default off, no effect on JHBR3 when unused.
+* `tools/teacher.py`: labels positions (sfen file, existing shards keeping
+  their results, or teacher self-play via cshogi) with any engine printing
+  `rootdist`; one engine process per worker, `<out>.partK.rec` shards.
+* `tools/pipeline.py` + `tools/pipeline_example.json`: generate → train →
+  export → test (eval_positions, bench, fixed-nodes match with
+  `strength_test.py`) → promote (`nets/best`, `nets/manifest.json` with
+  SHA-256). Exercised end to end for generations 0 and 1 with tiny settings.
+* `docs/DATA_PIPELINE.md`; ctest `datagen_smoke` and `teacher_smoke`.
+* Deviations/decisions: datagen uses threads inside one process (a driver
+  can launch several processes); records store visits scaled to 65535;
+  imported pack positions keep YaneuraOu's ±32000 mate scores (the score→WDL
+  sigmoid saturates them); the promotion gate is a plain score threshold
+  until Phase 5 adds SPRT; KLD-gain early stopping from Monty's datagen is
+  not implemented (fixed nodes per move).
+
+## Phase 3 (training)
 
 Decision (after reviewing BulletOu, MIT, Rust/CUDA): keep a PyTorch trainer
 that covers both networks and runs CPU tests; BulletOu stays a reference and
