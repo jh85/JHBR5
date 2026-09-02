@@ -126,6 +126,19 @@ class ShogiBoard {
                        Color attacker) const;
   Bitboard AttackersTo(Square sq) const { return AttackersTo(sq, occupied()); }
 
+  // Attack bitboards of a single piece (public for the NNUE feature
+  // extractor; see nnue/features.cc).
+  static Bitboard StepAttacks(PieceType pt, Color c, Square sq);
+  Bitboard SlidingAttacks(PieceType pt, Color c, Square sq,
+                          const Bitboard& occ) const;
+  Bitboard PieceAttacks(PieceType pt, Color c, Square sq,
+                        const Bitboard& occ) const;
+
+  // Static exchange evaluation: does the exchange started by `m` on m.to()
+  // come out at least `threshold` (YaneuraOu piece-value scale, pawn = 90)
+  // for the side to move? Implemented in nnue/see.cc.
+  bool SeeGe(Move m, int threshold) const;
+
   // --- Pin detection ---
 
   // Compute bitboard of pieces pinned to the king of the given color.
@@ -393,17 +406,6 @@ class ShogiBoard {
 
   // Generate pseudo-legal drop moves.
   void GenerateDropMoves(MoveList& moves) const;
-
-  // Attack bitboards for non-sliding pieces at a given square.
-  static Bitboard StepAttacks(PieceType pt, Color c, Square sq);
-
-  // Attack bitboard for sliding pieces (lance, bishop, rook, horse, dragon).
-  Bitboard SlidingAttacks(PieceType pt, Color c, Square sq,
-                          const Bitboard& occ) const;
-
-  // Combined attacks for a piece (step + sliding as applicable).
-  Bitboard PieceAttacks(PieceType pt, Color c, Square sq,
-                        const Bitboard& occ) const;
 
   // Fast yes/no attack query. Avoids building a full attackers bitboard.
   bool IsSquareAttacked(Square sq, const Bitboard& occ, Color attacker) const;
