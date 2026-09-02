@@ -1,3 +1,9 @@
+// JHBR5 — Monty-style MCTS on JHBR3's dlshogi tree with CPU NNUE evaluation.
+//
+// One iteration = descend by PUCT, evaluate the leaf synchronously with the
+// value network on its first visit, generate moves + policy priors on its
+// second visit (docs/DESIGN.md §7), back up immediately. No leaf batching.
+
 #pragma once
 
 #include <atomic>
@@ -9,15 +15,12 @@
 #include <mutex>
 #include <vector>
 
+#include "mcts/butterfly.h"
 #include "mcts/search_primitives.h"
 #include "mcts/uct_node.h"
-#include "inference/nn_cache.h"
+#include "nnue/eval_cache.h"
+#include "nnue/evaluator.h"
 #include "usi/time_manager.h"
-#ifdef USE_TENSORRT
-#include "inference/nn_tensorrt.h"
-#else
-#include "inference/nn_eval.h"
-#endif
 
 namespace dlshogi_mcts {
 
@@ -28,7 +31,7 @@ struct SearchInfo {
   int nps = 0;
   int time_ms = 0;
   std::vector<lczero::Move> pv;
-  jhbr2::NNCacheStats nn_cache;
+  jhbr5::nnue::EvalCache::Stats cache;
 };
 using InfoCallback = std::function<void(const SearchInfo&)>;
 using SearchStartedCallback = std::function<void()>;
@@ -43,25 +46,33 @@ struct SearchConfig {
   float draw_value_black = 0.5f;
   float draw_value_white = 0.5f;
   float resign_threshold = 0.01f;
-  int max_nodes = 800;
+  int max_nodes = 100000000;
   float max_time = 0.0f;
   jhbr2::TimeBudget time_budget;
-  int workers_per_gpu = 2;
-  int minibatch_size = 128;
+  int threads = 1;
   int max_moves_to_draw = 100000;
   int leaf_mate_depth = 5;
 
   // Before returning a move, reject root candidates that let the opponent
-  // force mate within this many plies. This makes deeper defensive coverage
-  // affordable without paying for it at every MCTS leaf.
+  // force mate within this many plies.
   int root_mate_depth = 7;
 
-  // Lc0-style moves-left (MLH) effect in selection. Keep opt-in until the
-  // lc0-shaped defaults have been strength-tested for Shogi; enabling is also
-  // gated by every active evaluator actually exposing an MLH output.
-  MovesLeftParameters moves_left;
+  size_t eval_cache_mb = 64;
+  size_t tree_memory_mb = 4096;
 
-  size_t nn_cache_size = 0;
+  // Monty extras, off by default until SPRT-tested (docs/DESIGN.md §7.8).
+  bool use_butterfly = false;
+  int butterfly_divisor = 17179;
+  int butterfly_reduction = 8358;
+  bool use_policy_temperature = false;
+  float pst_root = 0.3349f;
+  float pst_depth = 1.5777f;
+  float pst_win_threshold = 0.5655f;
+  float pst_win_max = 1.6260f;
+  float pst_base = 0.0960f;
+  float draw_scale = 0.0f;
+  float draw_quadratic = 0.0f;
+
   int info_interval_ms = 1000;
   InfoCallback info_callback = nullptr;
 };
@@ -75,38 +86,21 @@ struct SearchResult {
   float nps = 0.0f;
   int score_cp = 0;
   std::vector<lczero::Move> pv;
-  jhbr2::NNCacheStats nn_cache;
+  uint64_t evals = 0;
+  uint64_t expansions = 0;
+  jhbr5::nnue::EvalCache::Stats cache;
   jhbr2::TimeBudget time_budget;
   jhbr2::AdaptiveTimeDecision time_decision;
   bool root_guard_cancelled = false;
 };
 
-class Search;
-
-class UCTSearcherGroup {
- public:
-  UCTSearcherGroup(Search* owner, jhbr2::NNEvaluator* nn, int gpu_id,
-                   int threads, int batch_max);
-  UCTSearcherGroup(UCTSearcherGroup&&) noexcept;
-  UCTSearcherGroup& operator=(UCTSearcherGroup&&) noexcept;
-  ~UCTSearcherGroup();
-
-  void Run();
-  void Join();
-
-  Search* owner = nullptr;
-  jhbr2::NNEvaluator* nn = nullptr;
-  int gpu_id = 0;
-
- private:
-  std::vector<std::unique_ptr<class UCTSearcher>> searchers_;
-};
+class UCTSearcher;
 
 class Search {
  public:
   using Clock = std::chrono::steady_clock;
 
-  Search(std::vector<jhbr2::NNEvaluator*> evaluators, const SearchConfig& config);
+  Search(const jhbr5::nnue::NetworkSet* nets, const SearchConfig& config);
   ~Search();
 
   SearchResult Run(lczero::ShogiBoard board, uint64_t starting_pos_key,
@@ -114,8 +108,7 @@ class Search {
                    Clock::time_point move_start = Clock::now(),
                    SearchStartedCallback on_search_started = nullptr);
   // Called from the acknowledged isready phase. Clears game-specific tree
-  // state and NN entries while preserving GPU evaluators, workers, and cache
-  // bucket allocation.
+  // state, the evaluation cache and the history table.
   void PrepareForNewGame();
   void Stop() { stop_.store(true, std::memory_order_release); }
   void SetMaxTime(float seconds) { config_.max_time = seconds; }
@@ -124,10 +117,10 @@ class Search {
     config_.time_budget = budget;
     config_.max_time = budget.mcts_time_seconds;
   }
+  const SearchConfig& config() const { return config_; }
 
  private:
   friend class UCTSearcher;
-  friend class UCTSearcherGroup;
 
   bool IsSearchActive() const;
   void ExpandRoot();
@@ -141,24 +134,26 @@ class Search {
   void MaybeOutputInfo();
 
   SearchConfig config_;
-  std::vector<jhbr2::NNEvaluator*> evaluators_;
-  std::vector<UCTSearcherGroup> groups_;
+  const jhbr5::nnue::NetworkSet* nets_;
+  std::vector<std::unique_ptr<UCTSearcher>> searchers_;
   NodeTree tree_;
-  jhbr2::NNCache nn_cache_;
+  jhbr5::nnue::EvalCache eval_cache_;
+  ButterflyTable butterfly_;
   lczero::ShogiBoard root_board_;
   uct_node_t* root_ = nullptr;
   bool tree_reused_ = false;
   int root_visits_before_ = 0;
   std::atomic<bool> stop_{false};
   std::atomic<bool> adaptive_stop_{false};
+  std::atomic<bool> tree_full_{false};
   std::atomic<int> playout_count_{0};
+  std::atomic<uint64_t> evals_{0};
+  std::atomic<uint64_t> expansions_{0};
   Timer timer_;
   jhbr2::AdaptiveTimeController time_controller_;
   std::atomic<int> last_time_check_ms_{-1000000};
   std::atomic<bool> time_check_busy_{false};
-  int in_flight_playouts_ = 0;
   bool root_guard_cancelled_ = false;
-  bool moves_left_supported_ = false;
   mutable std::mutex info_mutex_;
   int last_info_ms_ = 0;
 };

@@ -6,7 +6,6 @@
 
 namespace dlshogi_mcts {
 
-constexpr int kNotExpanded = -1;
 constexpr int kVirtualLoss = 1;
 
 template <typename T>

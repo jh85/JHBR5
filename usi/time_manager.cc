@@ -98,6 +98,8 @@ const char* TimeStopReasonName(TimeStopReason reason) {
       return "node_limit";
     case TimeStopReason::kExternal:
       return "external";
+    case TimeStopReason::kTreeFull:
+      return "tree_full";
   }
   return "none";
 }

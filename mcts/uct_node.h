@@ -1,6 +1,8 @@
 #pragma once
 
 #include <atomic>
+#include <cstddef>
+#include <cstdint>
 #include <memory>
 #include <vector>
 
@@ -41,6 +43,9 @@ class child_node_slot_t {
   std::atomic<uct_node_t*> node_{nullptr};
 };
 
+// Edge statistics (dlshogi convention): `win` accumulates results from the
+// perspective of the player who traversed the edge; `move_count` includes
+// in-flight virtual visits.
 struct child_node_t {
   child_node_t() = default;
   explicit child_node_t(lczero::Move m) : move(m) {}
@@ -50,8 +55,6 @@ struct child_node_t {
         nnrate(o.nnrate),
         move_count(o.move_count.load(std::memory_order_relaxed)),
         win(o.win.load(std::memory_order_relaxed)),
-        sum_m(o.sum_m.load(std::memory_order_relaxed)),
-        m_visits(o.m_visits.load(std::memory_order_relaxed)),
         flags(o.flags.load(std::memory_order_relaxed)) {}
 
   child_node_t& operator=(child_node_t&& o) noexcept {
@@ -60,10 +63,6 @@ struct child_node_t {
     move_count.store(o.move_count.load(std::memory_order_relaxed),
                      std::memory_order_relaxed);
     win.store(o.win.load(std::memory_order_relaxed), std::memory_order_relaxed);
-    sum_m.store(o.sum_m.load(std::memory_order_relaxed),
-                std::memory_order_relaxed);
-    m_visits.store(o.m_visits.load(std::memory_order_relaxed),
-                   std::memory_order_relaxed);
     flags.store(o.flags.load(std::memory_order_relaxed),
                 std::memory_order_relaxed);
     return *this;
@@ -83,62 +82,54 @@ struct child_node_t {
   float nnrate = 0.0f;
   std::atomic<int> move_count{0};
   std::atomic<float> win{0.0f};
-  std::atomic<float> sum_m{0.0f};  // sum of subtree moves-left (for MLH M-effect)
-  // Completed M samples are counted separately from move_count, which also
-  // contains in-flight virtual visits.
-  std::atomic<int> m_visits{0};
-
-  float MeanMovesLeft() const {
-    const int visits = m_visits.load(std::memory_order_acquire);
-    return visits > 0
-               ? sum_m.load(std::memory_order_acquire) /
-                     static_cast<float>(visits)
-               : 0.0f;
-  }
 
  private:
   enum : uint8_t { kWin = 1, kLose = 2, kDraw = 4 };
   std::atomic<uint8_t> flags{0};
 };
 
+// Approximate bytes held by live tree nodes (all trees in the process).
+// Maintained by uct_node_t allocation/expansion/destruction.
+struct TreeMemory {
+  static std::atomic<size_t>& Bytes();
+};
+
+// Node state machine (docs/DESIGN.md §7.2):
+//   kFresh      never visited
+//   kEvaluated  value network evaluated on the first visit, no children yet
+//   kExpanded   legal moves generated and policy priors assigned
 struct uct_node_t {
-  uct_node_t() = default;
+  enum : uint8_t { kFresh = 0, kEvaluated = 1, kExpanded = 2 };
+
+  uct_node_t();
+  ~uct_node_t();
 
   bool IsEvaled() const {
-    return move_count.load(std::memory_order_acquire) != kNotExpanded;
+    return state.load(std::memory_order_acquire) != kFresh;
   }
-  void SetEvaled() { move_count.store(0, std::memory_order_release); }
+  bool IsExpanded() const {
+    return state.load(std::memory_order_acquire) == kExpanded;
+  }
+  void SetEvaled() { state.store(kEvaluated, std::memory_order_release); }
+  void SetExpanded() { state.store(kExpanded, std::memory_order_release); }
 
+  // Allocates the child array for the legal moves of `board` (or the given
+  // list). Does not change `state`; the caller publishes with SetExpanded()
+  // after the priors are written.
   void ExpandNode(const lczero::ShogiBoard* board);
+  void ExpandNode(const lczero::MoveList& moves);
   void InitChildNodes();
   uct_node_t* CreateChildNode(int i);
   void CreateSingleChildNode(lczero::Move move);
   uct_node_t* ReleaseChildrenExceptOne(lczero::Move move);
 
-  std::atomic<int> move_count{kNotExpanded};
+  std::atomic<uint8_t> state{kFresh};
+  std::atomic<int> move_count{0};
   std::atomic<float> win{0.0f};
   std::atomic<float> visited_nnrate{0.0f};
-  // Unlike the old one-shot eval_m field, these statistics remain comparable
-  // to a child's searched M average as the tree grows. The NN evaluation is
-  // the first sample; completed descendant playouts add further samples.
-  std::atomic<float> sum_m{0.0f};
-  std::atomic<int> m_visits{0};
   short child_num = 0;
   std::unique_ptr<child_node_t[]> child;
   std::unique_ptr<child_node_slot_t[]> child_nodes;
-
-  void SetMovesLeftEvaluation(float moves_left) {
-    sum_m.store(moves_left, std::memory_order_relaxed);
-    m_visits.store(1, std::memory_order_release);
-  }
-
-  float MeanMovesLeft() const {
-    const int visits = m_visits.load(std::memory_order_acquire);
-    return visits > 0
-               ? sum_m.load(std::memory_order_acquire) /
-                     static_cast<float>(visits)
-               : 0.0f;
-  }
 };
 
 class NodeTree {

@@ -96,6 +96,7 @@ enum class TimeStopReason {
   kLegacyLimit,
   kNodeLimit,
   kExternal,
+  kTreeFull,
 };
 
 struct AdaptiveTimeDecision {

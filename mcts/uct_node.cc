@@ -102,14 +102,40 @@ std::unique_ptr<uct_node_t> child_node_slot_t::Reset(
       node_.exchange(replacement.release(), std::memory_order_acq_rel));
 }
 
+namespace {
+constexpr size_t kChildBytes =
+    sizeof(child_node_t) + sizeof(child_node_slot_t);
+}  // namespace
+
+std::atomic<size_t>& TreeMemory::Bytes() {
+  static std::atomic<size_t> bytes{0};
+  return bytes;
+}
+
+uct_node_t::uct_node_t() {
+  TreeMemory::Bytes().fetch_add(sizeof(uct_node_t), std::memory_order_relaxed);
+}
+
+uct_node_t::~uct_node_t() {
+  TreeMemory::Bytes().fetch_sub(
+      sizeof(uct_node_t) + static_cast<size_t>(std::max<int>(child_num, 0)) * kChildBytes,
+      std::memory_order_relaxed);
+}
+
 void uct_node_t::ExpandNode(const lczero::ShogiBoard* board) {
   auto moves = const_cast<lczero::ShogiBoard*>(board)->GenerateLegalMoves();
+  ExpandNode(moves);
+}
+
+void uct_node_t::ExpandNode(const lczero::MoveList& moves) {
   child_num = static_cast<short>(moves.size());
   child = std::make_unique<child_node_t[]>(child_num);
   for (int i = 0; i < child_num; ++i) {
     child[i].move = moves[i];
   }
   InitChildNodes();
+  TreeMemory::Bytes().fetch_add(static_cast<size_t>(child_num) * kChildBytes,
+                                std::memory_order_relaxed);
 }
 
 void uct_node_t::InitChildNodes() {
@@ -124,6 +150,12 @@ uct_node_t* uct_node_t::CreateChildNode(int i) {
 }
 
 void uct_node_t::CreateSingleChildNode(lczero::Move move) {
+  if (child_num > 1) {
+    TreeMemory::Bytes().fetch_sub(static_cast<size_t>(child_num - 1) * kChildBytes,
+                                  std::memory_order_relaxed);
+  } else if (child_num == 0) {
+    TreeMemory::Bytes().fetch_add(kChildBytes, std::memory_order_relaxed);
+  }
   child_num = 1;
   child = std::make_unique<child_node_t[]>(1);
   child[0].move = move;
@@ -155,6 +187,8 @@ uct_node_t* uct_node_t::ReleaseChildrenExceptOne(lczero::Move move) {
       }
       child = std::move(kept_child);
       child_nodes = std::move(kept_nodes);
+      TreeMemory::Bytes().fetch_sub(static_cast<size_t>(child_num - 1) * kChildBytes,
+                                    std::memory_order_relaxed);
       child_num = 1;
       return selected;
     }
