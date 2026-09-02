@@ -11,6 +11,9 @@
 
 #include "usi/usi_engine.h"
 #include "shogi/bitboard.h"
+#include <string>
+
+#include "datagen/datagen.h"
 #include "nnue/types.h"
 
 #include <csignal>
@@ -27,7 +30,8 @@ static void crash_handler(int sig) {
   _exit(1);
 }
 
-int main(int /*argc*/, char* /*argv*/[]) {
+int main(int argc, char* argv[]) {
+  if (argc > 1 && std::string(argv[1]) == "datagen") return jhbr5::datagen::Run(argc, argv);
   signal(SIGSEGV, crash_handler);
   signal(SIGABRT, crash_handler);
   signal(SIGFPE, crash_handler);

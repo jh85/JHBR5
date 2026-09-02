@@ -124,6 +124,7 @@ class USIEngine {
   std::string value_net_path_ = "nets/value.nn";
   std::string policy_net_path_ = "nets/policy.nn";
   bool nets_are_random_ = false;
+  bool root_dist_output_ = false;
   int max_nodes_ = 100000000;  // CPU search is normally time limited
   bool root_mate_solver_bns_ = true;
   int max_move_time_ms_ = 0;

@@ -13,6 +13,8 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <random>
+#include <utility>
 #include <vector>
 
 #include "mcts/butterfly.h"
@@ -73,6 +75,11 @@ struct SearchConfig {
   float draw_scale = 0.0f;
   float draw_quadratic = 0.0f;
 
+  // Root Dirichlet noise for self-play (datagen); off when epsilon == 0.
+  float dirichlet_alpha = 0.0f;
+  float dirichlet_epsilon = 0.0f;
+  uint64_t seed = 0;  // 0 = nondeterministic
+
   int info_interval_ms = 1000;
   InfoCallback info_callback = nullptr;
 };
@@ -88,6 +95,10 @@ struct SearchResult {
   std::vector<lczero::Move> pv;
   uint64_t evals = 0;
   uint64_t expansions = 0;
+  // Root children (move, completed visits) in child order, and the best
+  // child's Q from the side to move (datagen / RootDistOutput).
+  std::vector<std::pair<lczero::Move, int>> root_visits;
+  float root_q = 0.5f;
   jhbr5::nnue::EvalCache::Stats cache;
   jhbr2::TimeBudget time_budget;
   jhbr2::AdaptiveTimeDecision time_decision;
@@ -124,6 +135,7 @@ class Search {
 
   bool IsSearchActive() const;
   void ExpandRoot();
+  void ApplyRootNoise();
   void RejectRootMates();
   jhbr2::RootSearchSnapshot CaptureRootSnapshot() const;
   void MaybeManageTime(bool force = false);
@@ -139,6 +151,7 @@ class Search {
   NodeTree tree_;
   jhbr5::nnue::EvalCache eval_cache_;
   ButterflyTable butterfly_;
+  std::mt19937_64 rng_;
   lczero::ShogiBoard root_board_;
   uct_node_t* root_ = nullptr;
   bool tree_reused_ = false;

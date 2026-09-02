@@ -105,7 +105,8 @@ class UCTSearcher {
 // ---------------------------------------------------------------------------
 
 Search::Search(const jhbr5::nnue::NetworkSet* nets, const SearchConfig& config)
-    : config_(config), nets_(nets), eval_cache_(config.eval_cache_mb) {
+    : config_(config), nets_(nets), eval_cache_(config.eval_cache_mb),
+      rng_(config.seed ? config.seed : std::random_device{}()) {
   const int threads = std::max(1, config_.threads);
   searchers_.reserve(threads);
   for (int t = 0; t < threads; ++t) {
@@ -161,6 +162,25 @@ void Search::ExpandRoot() {
     for (int i = 0; i < root_->child_num; ++i) moves.push_back(root_->child[i].move);
     searchers_[0]->ComputePriors(root_board_, root_, moves, nullptr, 1);
   }
+  ApplyRootNoise();
+}
+
+void Search::ApplyRootNoise() {
+  const float eps = config_.dirichlet_epsilon;
+  const float alpha = config_.dirichlet_alpha;
+  if (eps <= 0.0f || alpha <= 0.0f || !root_ || root_->child_num <= 1) return;
+  std::gamma_distribution<float> gamma(alpha, 1.0f);
+  std::vector<float> noise(root_->child_num);
+  float sum = 0.0f;
+  for (float& x : noise) {
+    x = gamma(rng_);
+    sum += x;
+  }
+  if (sum <= 0.0f) return;
+  for (int i = 0; i < root_->child_num; ++i) {
+    root_->child[i].nnrate = (1.0f - eps) * root_->child[i].nnrate + eps * noise[i] / sum;
+  }
+  root_->visited_nnrate.store(0.0f, std::memory_order_release);
 }
 
 void Search::RejectRootMates() {
@@ -705,7 +725,13 @@ SearchResult Search::BuildResult() const {
   }
   if (safe_wp < config_.resign_threshold) result.best_move = Move();
   result.score_cp = QToCentipawns(safe_wp);
+  result.root_q = safe_wp;
   result.pv = GetPV();
+  result.root_visits.reserve(root_->child_num);
+  for (int i = 0; i < root_->child_num; ++i) {
+    const auto& c = root_->child[i];
+    result.root_visits.emplace_back(c.move, std::max(0, c.move_count.load(std::memory_order_acquire)));
+  }
   return result;
 }
 

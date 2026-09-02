@@ -117,7 +117,7 @@ add_library(mcts STATIC ${MCTS_SRCS})
 target_include_directories(mcts PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(mcts PUBLIC nnue mate_solver time_manager shogi_core)
 
-add_executable(jhbr5 main.cc ${USI_SRCS})
+add_executable(jhbr5 main.cc datagen/datagen.cc ${USI_SRCS})
 target_link_libraries(jhbr5 PRIVATE mcts mate_solver
                                     opening_book time_manager shogi_core)
 
@@ -274,7 +274,9 @@ if(pybind11_FOUND)
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test/test_train_smoke.py
       --build $<TARGET_FILE_DIR:jhbr5_py> --eval $<TARGET_FILE:eval_positions>
       --sfens ${CMAKE_CURRENT_SOURCE_DIR}/test/legal100.sfens --tmp ${CMAKE_BINARY_DIR})
-  set_tests_properties(net_roundtrip train_smoke PROPERTIES SKIP_RETURN_CODE 77)
+  add_test(NAME teacher_smoke
+    COMMAND sh -c "$<TARGET_FILE:make_random_net> value ${CMAKE_BINARY_DIR}/dg_value.nn --l1 256 && $<TARGET_FILE:make_random_net> policy ${CMAKE_BINARY_DIR}/dg_policy.nn --l1 512 && ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tools/teacher.py --engine $<TARGET_FILE:jhbr5> --engine-option ValueNet=${CMAKE_BINARY_DIR}/dg_value.nn --engine-option PolicyNet=${CMAKE_BINARY_DIR}/dg_policy.nn --sfens ${CMAKE_CURRENT_SOURCE_DIR}/test/teacher.sfens --nodes 100 --workers 1 --out ${CMAKE_BINARY_DIR}/teach --build $<TARGET_FILE_DIR:jhbr5_py> | grep -q 'done: 3 records'")
+  set_tests_properties(net_roundtrip train_smoke teacher_smoke PROPERTIES SKIP_RETURN_CODE 77)
 else()
   message(STATUS "pybind11 not found: Python module and trainer tests disabled")
 endif()
@@ -324,4 +326,6 @@ add_test(NAME time_manager COMMAND test_time_manager)
 add_test(NAME search_info COMMAND test_search_info)
 add_test(NAME bns COMMAND test_bns)
 add_test(NAME mate1 COMMAND test_mate1 WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
+add_test(NAME datagen_smoke
+  COMMAND sh -c "$<TARGET_FILE:make_random_net> value ${CMAKE_BINARY_DIR}/dg_value.nn --l1 256 && $<TARGET_FILE:make_random_net> policy ${CMAKE_BINARY_DIR}/dg_policy.nn --l1 512 && $<TARGET_FILE:jhbr5> datagen --value ${CMAKE_BINARY_DIR}/dg_value.nn --policy ${CMAKE_BINARY_DIR}/dg_policy.nn --out ${CMAKE_BINARY_DIR}/dg_smoke.rec --games 4 --threads 2 --nodes 100 --max-ply 60 --seed 1 && $<TARGET_FILE:test_record_io> ${CMAKE_BINARY_DIR}")
 add_test(NAME usi_bench COMMAND sh -c "printf 'bench 2000 2\\nquit\\n' | $<TARGET_FILE:jhbr5>")

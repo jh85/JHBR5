@@ -246,6 +246,7 @@ void USIEngine::CmdUsi() {
   Send("option name PstBase type string default 0.0960");
   Send("option name DrawScale type string default 0.0");
   Send("option name DrawQuadratic type string default 0.0");
+  Send("option name RootDistOutput type check default false");
   Send("option name CInit type string default 1.25");
   Send("option name CBase type string default 19652.0");
   Send("option name FpuReduction type string default 0.27");
@@ -398,6 +399,11 @@ void USIEngine::RegisterOptionParsers() {
       return OptionSetResult::kSetAndLog;
     };
   };
+  option_parsers_["rootdistoutput"] =
+      [this](const std::string& /*name*/, const std::string& value) {
+        root_dist_output_ = ToLower(value) == "true" || value == "1";
+        return OptionSetResult::kSetAndLog;
+      };
   option_parsers_["usebutterfly"] = bool_option(&dlshogi_mcts::SearchConfig::use_butterfly);
   option_parsers_["butterflydivisor"] = int_option(&dlshogi_mcts::SearchConfig::butterfly_divisor, 1, 131072);
   option_parsers_["butterflyreduction"] = int_option(&dlshogi_mcts::SearchConfig::butterfly_reduction, 1, 65536);
@@ -1006,6 +1012,17 @@ void USIEngine::SelectAndReportBestMove(
   const bool root_mate_is_mate =
       !root_mate.mate_move.is_null() &&
       !MateDfpnSolver::IsNoMate(root_mate.mate_move);
+
+  // Teacher/datagen consumers: root visit distribution before any bestmove.
+  if (root_dist_output_ && !result.root_visits.empty()) {
+    std::ostringstream out;
+    out << "info string rootdist";
+    for (const auto& [move, visits] : result.root_visits) {
+      out << " " << move.ToString() << ":" << visits;
+    }
+    Send(out.str());
+    Log("rootq " + std::to_string(result.root_q));
+  }
 
   // --- Choose result ---
   bool use_mate = root_mate_is_mate;
