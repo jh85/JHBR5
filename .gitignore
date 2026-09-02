@@ -25,3 +25,5 @@ venv/
 *.ybb
 build-*/
 *.nn
+*.rec
+runs/

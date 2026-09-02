@@ -3,6 +3,7 @@ project(jhbr5 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
 # Temporary one-shot diagnostics for tracing non-finite NN/MCTS values.  The
 # validation and containment remain compiled in when this is disabled.
@@ -105,6 +106,7 @@ set(NNUE_SRCS
   nnue/policy_net.cc
   nnue/simd.cc
   nnue/random_net.cc
+  nnue/record.cc
 )
 add_library(nnue STATIC ${NNUE_SRCS})
 target_include_directories(nnue PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
@@ -241,6 +243,41 @@ target_link_libraries(make_random_net PRIVATE nnue)
 
 add_executable(dump_nnue_features tools/dump_nnue_features.cc)
 target_link_libraries(dump_nnue_features PRIVATE nnue)
+
+add_executable(eval_positions tools/eval_positions.cc)
+target_link_libraries(eval_positions PRIVATE nnue)
+
+add_executable(test_record_io test/test_record_io.cc)
+target_link_libraries(test_record_io PRIVATE nnue)
+add_test(NAME record_io COMMAND test_record_io ${CMAKE_BINARY_DIR})
+
+# ---- Python bindings (pybind11 from pip: python3 -m pip install pybind11) ----
+find_package(Python3 COMPONENTS Interpreter Development.Module QUIET)
+if(Python3_Interpreter_FOUND AND NOT pybind11_DIR)
+  execute_process(COMMAND ${Python3_EXECUTABLE} -m pybind11 --cmakedir
+    OUTPUT_VARIABLE _pybind11_dir OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
+  if(_pybind11_dir)
+    set(pybind11_DIR ${_pybind11_dir})
+  endif()
+endif()
+find_package(pybind11 CONFIG QUIET)
+if(pybind11_FOUND)
+  message(STATUS "pybind11 ${pybind11_VERSION}: building the jhbr5 Python module")
+  pybind11_add_module(jhbr5_py pyext/jhbr5_py.cc)
+  target_link_libraries(jhbr5_py PRIVATE nnue)
+  set_target_properties(jhbr5_py PROPERTIES OUTPUT_NAME jhbr5)
+  add_test(NAME net_roundtrip
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test/test_net_roundtrip.py
+      --build $<TARGET_FILE_DIR:jhbr5_py> --eval $<TARGET_FILE:eval_positions>
+      --sfens ${CMAKE_CURRENT_SOURCE_DIR}/test/legal100.sfens --tmp ${CMAKE_BINARY_DIR})
+  add_test(NAME train_smoke
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test/test_train_smoke.py
+      --build $<TARGET_FILE_DIR:jhbr5_py> --eval $<TARGET_FILE:eval_positions>
+      --sfens ${CMAKE_CURRENT_SOURCE_DIR}/test/legal100.sfens --tmp ${CMAKE_BINARY_DIR})
+  set_tests_properties(net_roundtrip train_smoke PROPERTIES SKIP_RETURN_CODE 77)
+else()
+  message(STATUS "pybind11 not found: Python module and trainer tests disabled")
+endif()
 
 # ---- Bench ----
 add_executable(bench_nnue test/bench_nnue.cc)
