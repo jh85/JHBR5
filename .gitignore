@@ -23,3 +23,5 @@ venv/
 *.so
 *.engine
 *.ybb
+build-*/
+*.nn
