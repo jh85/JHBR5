@@ -24,7 +24,8 @@
 #include "book/book_selection.h"
 #include "mate/bns.h"
 #include "mate/dfpn.h"
-#include "shogi/encoder.h"
+#include "nnue/random_net.h"
+#include "nnue/types.h"
 #include "usi/root_mate_state.h"
 #include "usi/search_info.h"
 #include "usi/time_manager.h"
@@ -39,7 +40,7 @@ namespace {
 // Production has successfully used 16 workers/GPU on RTX 5090. Keep a
 // generous USI safety ceiling so higher-end hardware can be benchmarked,
 // while still preventing an accidental unbounded allocation.
-constexpr int kMaxWorkersPerGpu = 64;
+constexpr int kMaxThreads = 256;
 
 // Search-wide counters are signed 32-bit integers. One billion leaves ample
 // overflow headroom while making MaxNodes an effectively non-binding safety
@@ -127,13 +128,6 @@ static float ParseFiniteFloat(const std::string& value) {
   return parsed;
 }
 
-static ModelFormat ParseModelFormat(const std::string& s) {
-  std::string v = ToLower(s);
-  if (v == "dlshogi" || v == "dlshogimodel") return ModelFormat::kDlshogi;
-  if (v == "jhbr2" || v == "default") return ModelFormat::kJHBR2;
-  return ModelFormat::kAuto;
-}
-
 static TimeManagementMode ParseTimeManagementMode(const std::string& s) {
   const std::string value = ToLower(s);
   if (value == "off") return TimeManagementMode::kOff;
@@ -142,50 +136,17 @@ static TimeManagementMode ParseTimeManagementMode(const std::string& s) {
   throw std::invalid_argument("expected off, shadow, or on");
 }
 
-static std::string ModelFormatToString(ModelFormat format) {
-  switch (format) {
-    case ModelFormat::kAuto:
-      return "auto";
-    case ModelFormat::kJHBR2:
-      return "jhbr2";
-    case ModelFormat::kDlshogi:
-      return "dlshogi";
-  }
-  return "auto";
-}
-
-static std::string FormatNNCacheStats(const NNCacheStats& stats) {
+static std::string FormatEvalCacheStats(
+    const jhbr5::nnue::EvalCache::Stats& stats) {
   const double hit_rate = stats.lookups == 0
                               ? 0.0
                               : 100.0 * static_cast<double>(stats.hits) /
                                     static_cast<double>(stats.lookups);
-  const double reuse_rate =
-      stats.lookups == 0
-          ? 0.0
-          : 100.0 * static_cast<double>(stats.hits + stats.in_flight_waits) /
-                static_cast<double>(stats.lookups);
   std::ostringstream out;
-  out << "nncache size " << stats.size << "/" << stats.capacity
-      << " probes " << stats.lookups << " hits " << stats.hits
-      << " hitrate " << std::fixed << std::setprecision(1) << hit_rate << "%"
-      << " reuse_rate " << reuse_rate << "%"
-      << " inserts " << stats.inserts
-      << " duplicate_inserts " << stats.duplicate_inserts
-      << " evictions " << stats.evictions
-      << " in_flight_owners " << stats.in_flight_owners
-      << " in_flight_waits " << stats.in_flight_waits
-      << " lock_contentions " << stats.lock_contentions
-      << " lock_wait_us " << stats.lock_wait_ns / 1000;
+  out << "evalcache occupied " << stats.occupied << "/" << stats.capacity
+      << " probes " << stats.lookups << " hits " << stats.hits << " hitrate "
+      << std::fixed << std::setprecision(1) << hit_rate << "%";
   return out.str();
-}
-
-// USI hashfull is expressed in permill. JHBR3 does not have a fixed-size
-// MCTS node arena like dlshogi, so its bounded NN position cache is the only
-// meaningful hash-table occupancy to report.
-static int NNCacheHashfull(const NNCacheStats& stats) {
-  if (stats.capacity == 0) return 0;
-  const size_t used = std::min(stats.size, stats.capacity);
-  return static_cast<int>(used * 1000 / stats.capacity);
 }
 
 // =====================================================================
@@ -224,6 +185,7 @@ void USIEngine::Run() {
     else if (cmd == "quit")       break;
     else if (cmd == "gameover")   CmdGameOver(parts);
     else if (cmd == "d")          CmdDebug();
+    else if (cmd == "bench")      CmdBench(parts);
   }
 }
 
@@ -240,30 +202,50 @@ void USIEngine::Log(const std::string& msg) {
 }
 
 void USIEngine::EnsureSearch() {
-  if (search_ || evaluators_.empty()) return;
+  if (search_ || !nets_) return;
+  search_ = std::make_unique<dlshogi_mcts::Search>(nets_.get(), search_config_);
+}
 
-  std::vector<jhbr2::NNEvaluator*> eval_ptrs;
-  eval_ptrs.reserve(evaluators_.size());
-  for (auto& evaluator : evaluators_) eval_ptrs.push_back(evaluator.get());
-  search_ =
-      std::make_unique<dlshogi_mcts::Search>(eval_ptrs, search_config_);
+bool USIEngine::EnsureNetworks() {
+  if (nets_) return true;
+  auto nets = std::make_unique<jhbr5::nnue::NetworkSet>();
+  std::string err;
+  if (!nets->Load(value_net_path_, policy_net_path_, &err)) {
+    Log("Network load failed: " + err);
+    return false;
+  }
+  Log("Networks loaded: value " + value_net_path_ + " (l1=" +
+      std::to_string(nets->value.l1()) + "), policy " + policy_net_path_ +
+      " (l1=" + std::to_string(nets->policy.l1()) + ", see=" +
+      (nets->policy.see_doubling() ? "on" : "off") + ")");
+  nets_ = std::move(nets);
+  nets_are_random_ = false;
+  return true;
 }
 
 void USIEngine::CmdUsi() {
   Send(std::string("id name ") + ENGINE_NAME);
   Send(std::string("id author ") + ENGINE_AUTHOR);
 
-  Send("option name MaxNodes type spin default 800 min 1 max " +
+  Send("option name MaxNodes type spin default 100000000 min 1 max " +
        std::to_string(kMaxMctsNodes));
   Send("option name RootMateSolver type combo default bns var bns var dfpn");
-  Send("option name OnnxModel type string default shogi_bt4.onnx");
-  Send("option name ModelFormat type combo default auto var auto var jhbr2 var dlshogi");
-  Send("option name DlshogiModel type check default false");
-  Send("option name UseGPU type check default true");
-  // Threads is kept as an alias for WorkersPerGpu (backward compat).
-  Send("option name Threads type spin default 2 min 1 max 64");
-  Send("option name WorkersPerGpu type spin default 2 min 1 max 64");
-  Send("option name MinibatchSize type spin default 128 min 1 max 4096");
+  Send("option name ValueNet type string default nets/value.nn");
+  Send("option name PolicyNet type string default nets/policy.nn");
+  Send("option name Threads type spin default 1 min 1 max 256");
+  Send("option name EvalCacheMB type spin default 64 min 0 max 65536");
+  Send("option name TreeMemoryMB type spin default 4096 min 16 max 1048576");
+  Send("option name UseButterfly type check default false");
+  Send("option name ButterflyDivisor type spin default 17179 min 1 max 131072");
+  Send("option name ButterflyReduction type spin default 8358 min 1 max 65536");
+  Send("option name UsePolicyTemperature type check default false");
+  Send("option name PstRoot type string default 0.3349");
+  Send("option name PstDepth type string default 1.5777");
+  Send("option name PstWinThreshold type string default 0.5655");
+  Send("option name PstWinMax type string default 1.6260");
+  Send("option name PstBase type string default 0.0960");
+  Send("option name DrawScale type string default 0.0");
+  Send("option name DrawQuadratic type string default 0.0");
   Send("option name CInit type string default 1.25");
   Send("option name CBase type string default 19652.0");
   Send("option name FpuReduction type string default 0.27");
@@ -277,16 +259,7 @@ void USIEngine::CmdUsi() {
   Send("option name LeafMateMode type combo default shallow var off var shallow");
   Send("option name LeafMateDepth type spin default 5 min 1 max 7");
   Send("option name RootMateDepth type spin default 7 min 0 max 7");
-  Send("option name NNCacheSize type spin default 0 min 0 max 100000000");
-  Send("option name NumGPUs type spin default 1 min 1 max 8");
   Send("option name MaxMovesToDraw type spin default 100000 min 1 max 100000");
-  Send("option name UseMovesLeft type check default false");
-  Send("option name MovesLeftMaxEffect type string default 0.0345");
-  Send("option name MovesLeftThreshold type string default 0.8");
-  Send("option name MovesLeftSlope type string default 0.0027");
-  Send("option name MovesLeftConstantFactor type string default 0.0");
-  Send("option name MovesLeftScaledFactor type string default 1.6521");
-  Send("option name MovesLeftQuadraticFactor type string default -0.6521");
   Send("option name MaxMoveTime type spin default 0 min 0 max 300000");
   Send("option name MaxMoveTime1m type spin default 0 min 0 max 60000");
   Send("option name TimeManagement type combo default shadow var off var shadow var on");
@@ -302,43 +275,13 @@ void USIEngine::CmdUsi() {
 }
 
 void USIEngine::CmdIsReady() {
-  if (evaluators_.empty()) {
-    ShogiEncoderTables::Init();
-
-    try {
-      for (int g = 0; g < num_gpus_; g++) {
-        Log("Loading model on GPU " + std::to_string(g) + ": " + onnx_path_);
-        auto evaluator =
-            std::make_unique<NNEvaluator>(onnx_path_, use_gpu_, g,
-                                          search_config_.workers_per_gpu,
-                                          model_format_);
-        if (evaluator->num_slots() == 0) {
-          throw std::runtime_error("inference backend created no worker slots");
-        }
-        evaluators_.push_back(std::move(evaluator));
-      }
-    } catch (const std::exception& error) {
-      evaluators_.clear();
-      Log("Model load failed: " + std::string(error.what()));
+  if (!nets_) {
+    if (!EnsureNetworks()) {
       Send("readyok");
       return;
     }
-
-    const bool has_moves_left =
-        !evaluators_.empty() &&
-        std::all_of(evaluators_.begin(), evaluators_.end(),
-                    [](const auto& evaluator) {
-                      return evaluator && evaluator->has_moves_left();
-                    });
-    Log("Model loaded, GPUs=" + std::to_string(num_gpus_) +
-        ", format=" + ModelFormatToString(model_format_) +
-        ", mlh=" + (has_moves_left ? "yes" : "no") +
-        ", max_nodes=" + std::to_string(max_nodes_));
-    if (search_config_.moves_left.enabled && !has_moves_left) {
-      Log("UseMovesLeft requested, but the loaded model has no MLH output; "
-          "the search effect is disabled");
-    }
-
+    Log("max_nodes=" + std::to_string(max_nodes_) +
+        " threads=" + std::to_string(search_config_.threads));
   }
 
   // isready is the acknowledged per-game preparation barrier. Reuse the
@@ -386,7 +329,7 @@ void USIEngine::RegisterOptionParsers() {
   const auto reset_search = [this]() { search_.reset(); };
   const auto reset_inference = [this]() {
     search_.reset();
-    evaluators_.clear();
+    nets_.reset();
   };
 
   option_parsers_["maxnodes"] =
@@ -398,57 +341,74 @@ void USIEngine::RegisterOptionParsers() {
         return OptionSetResult::kAlreadyLogged;
       };
 
-  option_parsers_["onnxmodel"] =
-      [this, reset_inference](const std::string& /*name*/,
-                              const std::string& value) {
-        onnx_path_ = value;
-        reset_inference();
-        return OptionSetResult::kSetAndLog;
-      };
-
-  option_parsers_["modelformat"] =
-      [this, reset_inference](const std::string& /*name*/,
-                              const std::string& value) {
-        model_format_ = ParseModelFormat(value);
-        reset_inference();
-        return OptionSetResult::kSetAndLog;
-      };
-
-  option_parsers_["dlshogimodel"] =
-      [this, reset_inference](const std::string& /*name*/,
-                              const std::string& value) {
-        model_format_ = ToLower(value) == "true" ? ModelFormat::kDlshogi
-                                                  : ModelFormat::kAuto;
-        reset_inference();
-        return OptionSetResult::kSetAndLog;
-      };
-
-  option_parsers_["usegpu"] =
-      [this, reset_inference](const std::string& /*name*/,
-                              const std::string& value) {
-        use_gpu_ = ToLower(value) == "true" || value == "1";
-        reset_inference();
-        return OptionSetResult::kSetAndLog;
-      };
-
-  option_parsers_["threads"] = option_parsers_["workerspergpu"] =
-      [this, reset_inference](const std::string& /*name*/,
-                              const std::string& value) {
-        search_config_.workers_per_gpu =
-            std::clamp(ParseInt(value), 1, kMaxWorkersPerGpu);
-        // TensorRT allocates one execution slot per worker.
-        reset_inference();
-        return OptionSetResult::kSetAndLog;
-      };
-
-  option_parsers_["minibatchsize"] =
+  option_parsers_["threads"] =
       [this, reset_search](const std::string& /*name*/,
                            const std::string& value) {
-        search_config_.minibatch_size =
-            std::clamp(ParseInt(value), 1, 4096);
+        search_config_.threads = std::clamp(ParseInt(value), 1, kMaxThreads);
         reset_search();
         return OptionSetResult::kSetAndLog;
       };
+
+  option_parsers_["valuenet"] =
+      [this, reset_inference](const std::string& /*name*/,
+                              const std::string& value) {
+        value_net_path_ = value;
+        reset_inference();
+        return OptionSetResult::kSetAndLog;
+      };
+
+  option_parsers_["policynet"] =
+      [this, reset_inference](const std::string& /*name*/,
+                              const std::string& value) {
+        policy_net_path_ = value;
+        reset_inference();
+        return OptionSetResult::kSetAndLog;
+      };
+
+  option_parsers_["treememorymb"] =
+      [this, reset_search](const std::string& /*name*/,
+                           const std::string& value) {
+        search_config_.tree_memory_mb =
+            std::clamp<std::size_t>(ParseSize(value), 16, 1048576);
+        reset_search();
+        return OptionSetResult::kSetAndLog;
+      };
+
+  const auto bool_option = [this, reset_search](bool dlshogi_mcts::SearchConfig::*field) {
+    return [this, reset_search, field](const std::string& /*name*/,
+                                       const std::string& value) {
+      search_config_.*field = ToLower(value) == "true" || value == "1";
+      reset_search();
+      return OptionSetResult::kSetAndLog;
+    };
+  };
+  const auto int_option = [this, reset_search](int dlshogi_mcts::SearchConfig::*field, int lo, int hi) {
+    return [this, reset_search, field, lo, hi](const std::string& /*name*/,
+                                               const std::string& value) {
+      search_config_.*field = std::clamp(ParseInt(value), lo, hi);
+      reset_search();
+      return OptionSetResult::kSetAndLog;
+    };
+  };
+  const auto float_option = [this, reset_search](float dlshogi_mcts::SearchConfig::*field, float lo, float hi) {
+    return [this, reset_search, field, lo, hi](const std::string& /*name*/,
+                                               const std::string& value) {
+      search_config_.*field = std::clamp(ParseFiniteFloat(value), lo, hi);
+      reset_search();
+      return OptionSetResult::kSetAndLog;
+    };
+  };
+  option_parsers_["usebutterfly"] = bool_option(&dlshogi_mcts::SearchConfig::use_butterfly);
+  option_parsers_["butterflydivisor"] = int_option(&dlshogi_mcts::SearchConfig::butterfly_divisor, 1, 131072);
+  option_parsers_["butterflyreduction"] = int_option(&dlshogi_mcts::SearchConfig::butterfly_reduction, 1, 65536);
+  option_parsers_["usepolicytemperature"] = bool_option(&dlshogi_mcts::SearchConfig::use_policy_temperature);
+  option_parsers_["pstroot"] = float_option(&dlshogi_mcts::SearchConfig::pst_root, 0.01f, 1.0f);
+  option_parsers_["pstdepth"] = float_option(&dlshogi_mcts::SearchConfig::pst_depth, 0.1f, 10.0f);
+  option_parsers_["pstwinthreshold"] = float_option(&dlshogi_mcts::SearchConfig::pst_win_threshold, 0.0f, 1.0f);
+  option_parsers_["pstwinmax"] = float_option(&dlshogi_mcts::SearchConfig::pst_win_max, 0.1f, 10.0f);
+  option_parsers_["pstbase"] = float_option(&dlshogi_mcts::SearchConfig::pst_base, 0.01f, 1.0f);
+  option_parsers_["drawscale"] = float_option(&dlshogi_mcts::SearchConfig::draw_scale, 0.0f, 5.0f);
+  option_parsers_["drawquadratic"] = float_option(&dlshogi_mcts::SearchConfig::draw_quadratic, -5.0f, 5.0f);
 
   option_parsers_["cinit"] = option_parsers_["c_init"] =
       [this, reset_search](const std::string& /*name*/,
@@ -585,20 +545,12 @@ void USIEngine::RegisterOptionParsers() {
         return OptionSetResult::kSetAndLog;
       };
 
-  option_parsers_["nncachesize"] =
+  option_parsers_["evalcachemb"] =
       [this, reset_search](const std::string& /*name*/,
                            const std::string& value) {
-        search_config_.nn_cache_size =
-            std::min<std::size_t>(ParseSize(value), 100000000);
+        search_config_.eval_cache_mb =
+            std::min<std::size_t>(ParseSize(value), 65536);
         reset_search();
-        return OptionSetResult::kSetAndLog;
-      };
-
-  option_parsers_["numgpus"] =
-      [this, reset_inference](const std::string& /*name*/,
-                              const std::string& value) {
-        num_gpus_ = std::clamp(ParseInt(value), 1, 8);
-        reset_inference();
         return OptionSetResult::kSetAndLog;
       };
 
@@ -607,69 +559,6 @@ void USIEngine::RegisterOptionParsers() {
                            const std::string& value) {
         search_config_.max_moves_to_draw =
             std::clamp(ParseInt(value), 1, 100000);
-        reset_search();
-        return OptionSetResult::kSetAndLog;
-      };
-
-  option_parsers_["usemovesleft"] =
-      [this, reset_search](const std::string& /*name*/,
-                           const std::string& value) {
-        search_config_.moves_left.enabled =
-            ToLower(value) == "true" || value == "1";
-        reset_search();
-        return OptionSetResult::kSetAndLog;
-      };
-
-  option_parsers_["movesleftmaxeffect"] =
-      [this, reset_search](const std::string& /*name*/,
-                           const std::string& value) {
-        search_config_.moves_left.max_effect =
-            std::clamp(ParseFiniteFloat(value), 0.0f, 1.0f);
-        reset_search();
-        return OptionSetResult::kSetAndLog;
-      };
-
-  option_parsers_["movesleftthreshold"] =
-      [this, reset_search](const std::string& /*name*/,
-                           const std::string& value) {
-        search_config_.moves_left.threshold =
-            std::clamp(ParseFiniteFloat(value), 0.0f, 1.0f);
-        reset_search();
-        return OptionSetResult::kSetAndLog;
-      };
-
-  option_parsers_["movesleftslope"] =
-      [this, reset_search](const std::string& /*name*/,
-                           const std::string& value) {
-        search_config_.moves_left.slope =
-            std::clamp(ParseFiniteFloat(value), 0.0f, 1.0f);
-        reset_search();
-        return OptionSetResult::kSetAndLog;
-      };
-
-  option_parsers_["movesleftconstantfactor"] =
-      [this, reset_search](const std::string& /*name*/,
-                           const std::string& value) {
-        search_config_.moves_left.constant_factor =
-            std::clamp(ParseFiniteFloat(value), -1.0f, 1.0f);
-        reset_search();
-        return OptionSetResult::kSetAndLog;
-      };
-
-  option_parsers_["movesleftscaledfactor"] =
-      [this, reset_search](const std::string& /*name*/,
-                           const std::string& value) {
-        search_config_.moves_left.scaled_factor =
-            std::clamp(ParseFiniteFloat(value), -2.0f, 2.0f);
-        reset_search();
-        return OptionSetResult::kSetAndLog;
-      };
-
-  option_parsers_["movesleftquadraticfactor"] =
-      [this, reset_search](const std::string& /*name*/,
-                           const std::string& value) {
-        search_config_.moves_left.quadratic_factor =
-            std::clamp(ParseFiniteFloat(value), -1.0f, 1.0f);
         reset_search();
         return OptionSetResult::kSetAndLog;
       };
@@ -761,6 +650,15 @@ void USIEngine::RegisterOptionParsers() {
   option_parsers_["leafdfpnnodes"] = retired_option;
   option_parsers_["virtuallossweight"] = retired_option;
   option_parsers_["maxgpubatch"] = retired_option;
+  option_parsers_["onnxmodel"] = retired_option;
+  option_parsers_["modelformat"] = retired_option;
+  option_parsers_["dlshogimodel"] = retired_option;
+  option_parsers_["usegpu"] = retired_option;
+  option_parsers_["workerspergpu"] = retired_option;
+  option_parsers_["minibatchsize"] = retired_option;
+  option_parsers_["numgpus"] = retired_option;
+  option_parsers_["nncachesize"] = retired_option;
+  option_parsers_["usemovesleft"] = retired_option;
   option_parsers_["movesleftweight"] = retired_option;
   option_parsers_["movesleftcap"] = retired_option;
   option_parsers_["bookonthefly"] = retired_option;
@@ -1152,9 +1050,11 @@ void USIEngine::SelectAndReportBestMove(
     return;
   }
 
-  if (result.nn_cache.capacity > 0) {
-    Log(FormatNNCacheStats(result.nn_cache));
+  if (result.cache.capacity > 0) {
+    Log(FormatEvalCacheStats(result.cache));
   }
+  Log("evals " + std::to_string(result.evals) + " expansions " +
+      std::to_string(result.expansions));
 
   USISearchInfo usi_info;
   usi_info.pv = result.pv;
@@ -1164,7 +1064,7 @@ void USIEngine::SelectAndReportBestMove(
   usi_info.score_cp = result.score_cp;
   usi_info.nodes = std::max(result.nodes, 0);
   usi_info.nps = static_cast<std::uint64_t>(std::max(result.nps, 0.0f));
-  usi_info.hashfull = NNCacheHashfull(result.nn_cache);
+  usi_info.hashfull = result.cache.hashfull();
   usi_info.time_ms = static_cast<std::uint64_t>(
       std::max(result.time_sec, 0.0f) * 1000.0f);
   Send(FormatUSISearchInfo(usi_info));
@@ -1179,7 +1079,7 @@ void USIEngine::CmdGo(const std::vector<std::string>& parts) {
   }
 
   const auto move_start_time = std::chrono::steady_clock::now();
-  if (evaluators_.empty()) {
+  if (!nets_ && !EnsureNetworks()) {
     Send("bestmove resign");
     return;
   }
@@ -1218,9 +1118,6 @@ void USIEngine::CmdGo(const std::vector<std::string>& parts) {
     // Keep free-form diagnostics before the structured record.  Some GUIs
     // incorrectly treat `info string` as a new empty analysis record, so the
     // last line in each update must be the complete depth/score/PV record.
-    if (info.nn_cache.capacity > 0) {
-      Log(FormatNNCacheStats(info.nn_cache));
-    }
 
     USISearchInfo usi_info;
     usi_info.depth = info.depth;
@@ -1228,7 +1125,7 @@ void USIEngine::CmdGo(const std::vector<std::string>& parts) {
     usi_info.score_cp = info.score_cp;
     usi_info.nodes = std::max(info.nodes, 0);
     usi_info.nps = std::max(info.nps, 0);
-    usi_info.hashfull = NNCacheHashfull(info.nn_cache);
+    usi_info.hashfull = info.cache.hashfull();
     usi_info.time_ms = std::max(info.time_ms, 0);
     usi_info.pv = info.pv;
     Send(FormatUSISearchInfo(usi_info));
@@ -1367,6 +1264,83 @@ void USIEngine::CmdDebug() {
   Log("Position: " + board_.ToSfen());
   auto moves = board_.GenerateLegalMoves();
   Log("Legal moves: " + std::to_string(moves.size()));
+}
+
+// bench [nodes] [threads]: fixed positions, prints nodes/s, evals/s and
+// expansions/s. Uses the loaded networks, or deterministic random M-profile
+// networks when none are loaded (so the command works in CI).
+void USIEngine::CmdBench(const std::vector<std::string>& parts) {
+  static const char* kBenchSfens[] = {
+      "lnsgkgsnl/1r5b1/ppppppppp/9/9/9/PPPPPPPPP/1B5R1/LNSGKGSNL b - 1",
+      "lnsgkgsnl/1r5b1/p1pppp1pp/1p4p2/9/2P4P1/PP1PPPP1P/1B5R1/LNSGKGSNL b - 1",
+      "ln1g1g1nl/1ks2r1b1/1pppp1spp/p4pp2/9/2P1P4/PPSP1PPPP/1BG1R2S1/LN1GK2NL w - 1",
+      "ln1g3nl/1ks1g1r2/1pppsb1pp/p3pp3/6pP1/2P1P1P2/PPSPBP2P/1KGS1R3/LN1G3NL b - 1",
+      "l2g4l/1ks1g4/2n1s1n2/pp1pppb1p/2p3ppP/P1P1PSP2/1PSP1PN2/1KGB3R1/LN1G4L w Rp 1",
+      "ln4knl/2s1g2g1/p1pp1s1pp/1p2p1p2/4P1P2/2PP1P3/PPS3N1P/2GS3R1/LN1GK3L b BRbp 1",
+      "l3k2nl/6g2/p1ns1p1pp/2ppp1p2/1p7/2PPPP3/PPS2SPPP/2G1K1R2/LN5NL w BGRbgs 1",
+      "4k4/9/4G4/9/9/9/9/9/8K b G 1",
+      "l1r4nl/2g1k1g2/p2pspspp/2p1p1p2/1p7/2P1P4/PP1PSPPPP/2GK2S1R/LN3G1NL b BNbp 1",
+      "ln1gk2nl/1r1s1sgb1/p1ppp1ppp/1p3p3/9/2P1P4/PP1P1PPPP/1BGS1S1R1/LN1GK2NL w - 1",
+  };
+  int nodes = 10000;
+  int threads = search_config_.threads;
+  if (parts.size() > 1) nodes = std::max(1, std::atoi(parts[1].c_str()));
+  if (parts.size() > 2) threads = std::clamp(std::atoi(parts[2].c_str()), 1, kMaxThreads);
+
+  if (!nets_) {
+    if (!EnsureNetworks()) {
+      Log("bench: generating random M-profile networks in /tmp");
+      std::string err;
+      const std::string vpath = "/tmp/jhbr5_bench_value.nn";
+      const std::string ppath = "/tmp/jhbr5_bench_policy.nn";
+      auto nets = std::make_unique<jhbr5::nnue::NetworkSet>();
+      if (!jhbr5::nnue::WriteRandomValueNet(vpath, 1024, 1, &err) ||
+          !jhbr5::nnue::WriteRandomPolicyNet(ppath, 4096, true, 1, &err) ||
+          !nets->Load(vpath, ppath, &err)) {
+        Log("bench: cannot create networks: " + err);
+        return;
+      }
+      nets_ = std::move(nets);
+      nets_are_random_ = true;
+    }
+  }
+
+  dlshogi_mcts::SearchConfig config = search_config_;
+  config.threads = threads;
+  config.max_nodes = nodes;
+  config.max_time = 0.0f;
+  config.time_budget = TimeBudget();
+  config.root_mate_depth = 0;
+  config.info_callback = nullptr;
+  dlshogi_mcts::Search search(nets_.get(), config);
+
+  std::uint64_t total_nodes = 0, total_evals = 0, total_expansions = 0, total_hits = 0;
+  const auto t0 = std::chrono::steady_clock::now();
+  int index = 0;
+  for (const char* sfen : kBenchSfens) {
+    ShogiBoard board;
+    if (!board.SetFromSfen(sfen)) continue;
+    search.PrepareForNewGame();
+    const auto result = search.Run(board, board.Hash(), {});
+    total_nodes += static_cast<std::uint64_t>(std::max(result.nodes, 0));
+    total_evals += result.evals;
+    total_expansions += result.expansions;
+    total_hits += result.cache.hits;
+    Log("bench " + std::to_string(++index) + " nodes " + std::to_string(result.nodes) +
+        " nps " + std::to_string(static_cast<int>(result.nps)) + " bestmove " +
+        result.best_move.ToString() + " cp " + std::to_string(result.score_cp));
+  }
+  const double secs = std::chrono::duration<double>(
+                          std::chrono::steady_clock::now() - t0).count();
+  std::ostringstream out;
+  out << "bench threads " << threads << " nodes " << total_nodes << " time_ms "
+      << static_cast<int>(secs * 1000.0) << " nps " << static_cast<int>(total_nodes / secs)
+      << " evals/s " << static_cast<int>(total_evals / secs) << " expansions/s "
+      << static_cast<int>(total_expansions / secs) << " cache_hits " << total_hits
+      << (nets_are_random_ ? " (random nets)" : "");
+  Log(out.str());
+  Send("bench nodes " + std::to_string(total_nodes) + " nps " +
+       std::to_string(static_cast<int>(total_nodes / secs)));
 }
 
 }  // namespace jhbr2

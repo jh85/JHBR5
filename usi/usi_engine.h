@@ -22,11 +22,7 @@
 #include <unordered_map>
 #include <vector>
 
-#ifdef USE_TENSORRT
-#include "inference/nn_tensorrt.h"
-#else
-#include "inference/nn_eval.h"
-#endif
+#include "nnue/evaluator.h"
 #include "book/opening_book.h"
 #include "mcts/uct_search.h"
 #include "shogi/board.h"
@@ -37,8 +33,8 @@ namespace jhbr2 {
 
 class USIEngine {
  public:
-  static constexpr const char* ENGINE_NAME = "JHBR3";
-  static constexpr const char* ENGINE_AUTHOR = "JHBR3 Team";
+  static constexpr const char* ENGINE_NAME = "JHBR5";
+  static constexpr const char* ENGINE_AUTHOR = "JHBR5 Team";
 
   USIEngine();
 
@@ -57,11 +53,15 @@ class USIEngine {
   void CmdStop();
   void CmdGameOver(const std::vector<std::string>& parts);
   void CmdDebug();
+  void CmdBench(const std::vector<std::string>& parts);
 
   // --- Helpers ---
   void Send(const std::string& msg);
   void Log(const std::string& msg);
   void EnsureSearch();
+  // Loads the networks named by the ValueNet/PolicyNet options; returns
+  // false (and logs) on failure.
+  bool EnsureNetworks();
 
   // Option parsing. Each registered lambda implements one setoption name and
   // may throw std::invalid_argument for malformed values.
@@ -113,7 +113,7 @@ class USIEngine {
 
   // --- Members ---
   lczero::ShogiBoard board_;
-  std::vector<std::unique_ptr<NNEvaluator>> evaluators_;
+  std::unique_ptr<jhbr5::nnue::NetworkSet> nets_;
   std::unique_ptr<dlshogi_mcts::Search> search_;
   dlshogi_mcts::SearchConfig search_config_;
   uint64_t position_start_key_ = 0;
@@ -121,11 +121,10 @@ class USIEngine {
   bool new_game_prepared_ = false;
 
   // Options
-  std::string onnx_path_ = "shogi_bt4.onnx";
-  ModelFormat model_format_ = ModelFormat::kAuto;
-  int max_nodes_ = 800;
-  int num_gpus_ = 1;
-  bool use_gpu_ = true;
+  std::string value_net_path_ = "nets/value.nn";
+  std::string policy_net_path_ = "nets/policy.nn";
+  bool nets_are_random_ = false;
+  int max_nodes_ = 100000000;  // CPU search is normally time limited
   bool root_mate_solver_bns_ = true;
   int max_move_time_ms_ = 0;
   int max_move_time_1m_ms_ = 0;

@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.18)
-project(jhbr3 LANGUAGES CXX)
+project(jhbr5 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -43,93 +43,21 @@ message(STATUS "JHBR5_ISA: ${JHBR5_ISA}")
 enable_testing()
 set(CMAKE_CXX_FLAGS_DEBUG "-g -O0 -fsanitize=address")
 
-# ---- ONNX Runtime ----
-# Download: https://github.com/microsoft/onnxruntime/releases
-# Set ONNXRUNTIME_ROOT to the extracted directory, e.g.:
-#   cmake -DONNXRUNTIME_ROOT=/home/ei/onnxruntime-linux-x64-gpu-1.24.4 ..
-if(NOT ONNXRUNTIME_ROOT)
-  # Try common locations
-  file(GLOB _ort_candidates
-    /home/ei/onnxruntime*
-    /opt/onnxruntime*
-    /usr/local/onnxruntime*
-  )
-  list(LENGTH _ort_candidates _ort_len)
-  if(_ort_len GREATER 0)
-    list(GET _ort_candidates 0 ONNXRUNTIME_ROOT)
-  endif()
-endif()
-
-if(ONNXRUNTIME_ROOT)
-  message(STATUS "ONNX Runtime: ${ONNXRUNTIME_ROOT}")
-  # Support both pre-built release layout and from-source build layout
-  if(EXISTS ${ONNXRUNTIME_ROOT}/include/onnxruntime/core/session/onnxruntime_cxx_api.h)
-    # From-source build: headers are in include/onnxruntime/core/session/
-    set(ORT_INCLUDE ${ONNXRUNTIME_ROOT}/include/onnxruntime/core/session)
-    # Look for the shared library in build/Linux/Release or build/Linux/Debug
-    if(EXISTS ${ONNXRUNTIME_ROOT}/build/Linux/Release/libonnxruntime.so)
-      set(ORT_LIB ${ONNXRUNTIME_ROOT}/build/Linux/Release)
-    elseif(EXISTS ${ONNXRUNTIME_ROOT}/build/Linux/Debug/libonnxruntime.so)
-      set(ORT_LIB ${ONNXRUNTIME_ROOT}/build/Linux/Debug)
-    else()
-      message(FATAL_ERROR "Found ONNX Runtime source tree but no built libraries in build/Linux/")
-    endif()
-  else()
-    # Pre-built release package layout
-    set(ORT_INCLUDE ${ONNXRUNTIME_ROOT}/include)
-    set(ORT_LIB ${ONNXRUNTIME_ROOT}/lib)
-  endif()
-else()
-  if(NOT USE_TENSORRT)
-    message(WARNING "ONNXRUNTIME_ROOT not set. NN evaluator will not build. "
-      "Download from: https://github.com/microsoft/onnxruntime/releases")
-  endif()
-  set(ORT_INCLUDE "")
-  set(ORT_LIB "")
-endif()
-
 # ---- Sources ----
 
-# Shogi engine (board, bitboard, types, encoder)
+# Shogi engine (board, bitboard, types, packed sfen)
 set(SHOGI_ENGINE_SRCS
   shogi/board.cc
   shogi/bitboard.cc
   shogi/mate1ply.cc
   shogi/packed_sfen.cc
-  shogi/encoder.cc
 )
-
-# Search and inference backends
-option(USE_TENSORRT "Use native TensorRT backend (no ONNX Runtime needed)" OFF)
 
 set(MCTS_SRCS
   mcts/search_primitives.cc
   mcts/uct_node.cc
   mcts/uct_search.cc
 )
-
-if(USE_TENSORRT)
-  # The native TRT backend uses a CUDA kernel to expand bit-packed input
-  # features on the GPU (dlshogi-style). Enable the CUDA language before the
-  # nn_backend target consumes the .cu source.
-  enable_language(CUDA)
-  set(CMAKE_CUDA_STANDARD 17)
-  if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
-    if(CMAKE_VERSION VERSION_GREATER_EQUAL 3.24)
-      set(CMAKE_CUDA_ARCHITECTURES native)
-    else()
-      set(CMAKE_CUDA_ARCHITECTURES 70 75 80 86)
-    endif()
-  endif()
-  set(NN_BACKEND_SRCS
-    inference/nn_tensorrt.cc
-    shogi/encoder_unpack.cu
-  )
-else()
-  set(NN_BACKEND_SRCS
-    inference/nn_eval.cc
-  )
-endif()
 
 # Mate solver
 set(MATE_SRCS
@@ -165,67 +93,31 @@ target_include_directories(time_manager PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 add_library(mate_solver STATIC ${MATE_SRCS})
 target_link_libraries(mate_solver PUBLIC shogi_core)
 
-# ---- Library: NN inference backend ----
-add_library(nn_backend STATIC ${NN_BACKEND_SRCS})
-target_include_directories(nn_backend PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
-target_link_libraries(nn_backend PUBLIC shogi_core)
+# =====================================================================
+# JHBR5 — CPU NNUE backend
+# =====================================================================
+set(NNUE_SRCS
+  nnue/features.cc
+  nnue/move_buckets.cc
+  nnue/see.cc
+  nnue/net_format.cc
+  nnue/value_net.cc
+  nnue/policy_net.cc
+  nnue/simd.cc
+  nnue/random_net.cc
+)
+add_library(nnue STATIC ${NNUE_SRCS})
+target_include_directories(nnue PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(nnue PUBLIC shogi_core)
 
 # ---- Library: dlshogi-style MCTS ----
 add_library(mcts STATIC ${MCTS_SRCS})
 target_include_directories(mcts PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
-target_link_libraries(mcts PUBLIC nn_backend mate_solver time_manager shogi_core)
+target_link_libraries(mcts PUBLIC nnue mate_solver time_manager shogi_core)
 
-if(USE_TENSORRT)
-  # Native TensorRT backend.
-  find_package(CUDAToolkit REQUIRED)
-  set(TENSORRT_ROOT "" CACHE PATH "TensorRT installation root")
-  set(CUDNN_ROOT "" CACHE PATH "cuDNN installation root")
-  if(NOT TENSORRT_ROOT)
-    find_path(TENSORRT_INCLUDE_DIR NvInfer.h)
-    find_library(TENSORRT_NVINFER nvinfer)
-  else()
-    find_path(TENSORRT_INCLUDE_DIR NvInfer.h
-      PATHS ${TENSORRT_ROOT}/include NO_DEFAULT_PATH)
-    find_library(TENSORRT_NVINFER nvinfer
-      PATHS ${TENSORRT_ROOT}/lib NO_DEFAULT_PATH)
-  endif()
-  if(NOT TENSORRT_INCLUDE_DIR OR NOT TENSORRT_NVINFER)
-    message(FATAL_ERROR "TensorRT not found. Set -DTENSORRT_ROOT=/path/to/TensorRT")
-  endif()
-  message(STATUS "TensorRT include: ${TENSORRT_INCLUDE_DIR}")
-  message(STATUS "TensorRT nvinfer: ${TENSORRT_NVINFER}")
-  target_compile_definitions(nn_backend PUBLIC USE_TENSORRT=1)
-  target_include_directories(nn_backend PUBLIC
-    ${CUDAToolkit_INCLUDE_DIRS}
-    ${TENSORRT_INCLUDE_DIR}
-  )
-  target_link_libraries(nn_backend PUBLIC ${TENSORRT_NVINFER} CUDA::cudart)
-  if(CUDNN_ROOT)
-    target_include_directories(nn_backend PUBLIC ${CUDNN_ROOT}/include)
-    target_link_directories(nn_backend PUBLIC ${CUDNN_ROOT}/lib)
-    set_target_properties(nn_backend PROPERTIES
-      BUILD_RPATH "${TENSORRT_ROOT}/lib;${CUDNN_ROOT}/lib;${CUDAToolkit_LIBRARY_DIR}"
-    )
-  else()
-    set_target_properties(nn_backend PROPERTIES
-      BUILD_RPATH "${TENSORRT_ROOT}/lib;${CUDAToolkit_LIBRARY_DIR}"
-    )
-  endif()
-elseif(ORT_INCLUDE)
-  # ONNX Runtime backend.
-  target_include_directories(nn_backend PUBLIC ${ORT_INCLUDE})
-  target_link_directories(nn_backend PUBLIC ${ORT_LIB})
-  target_link_libraries(nn_backend PUBLIC onnxruntime)
-  target_compile_definitions(nn_backend PUBLIC HAS_ONNXRUNTIME=1)
-endif()
-
-# ---- Executable ----
-add_executable(jhbr3 main.cc ${USI_SRCS})
-target_link_libraries(jhbr3 PRIVATE mcts nn_backend mate_solver
+add_executable(jhbr5 main.cc ${USI_SRCS})
+target_link_libraries(jhbr5 PRIVATE mcts mate_solver
                                     opening_book time_manager shogi_core)
-if(NOT USE_TENSORRT AND ORT_INCLUDE)
-  target_include_directories(jhbr3 PRIVATE ${ORT_INCLUDE})
-endif()
 
 # ---- Test: move generation correctness ----
 add_executable(test_movegen test/test_movegen.cc)
@@ -235,9 +127,6 @@ target_link_libraries(test_movegen PRIVATE shogi_core)
 add_executable(test_max_legal_moves test/test_max_legal_moves.cc)
 target_link_libraries(test_max_legal_moves PRIVATE shogi_core)
 
-# ---- Test: sharded NN cache ----
-add_executable(test_nn_cache test/test_nn_cache.cc)
-
 # ---- Test: MCTS subtree reuse ----
 add_executable(test_tree_reuse
   test/test_tree_reuse.cc
@@ -245,15 +134,9 @@ add_executable(test_tree_reuse
 )
 target_link_libraries(test_tree_reuse PRIVATE shogi_core)
 
-# ---- Test: lock-free evaluated-node traversal and child publication ----
-# This target supplies a deterministic fake evaluator, so it deliberately does
-# not link nn_backend or inherit USE_TENSORRT.
-add_executable(test_lockfree_search
-  test/test_lockfree_search.cc
-  ${MCTS_SRCS}
-)
-target_link_libraries(test_lockfree_search PRIVATE mate_solver time_manager
-                                                     shogi_core)
+# ---- Test: multi-threaded MCTS with NNUE evaluation ----
+add_executable(test_lockfree_search test/test_lockfree_search.cc)
+target_link_libraries(test_lockfree_search PRIVATE mcts)
 
 # ---- Test: root vs descendant repetition search policy ----
 add_executable(test_search_repetition test/test_search_repetition.cc)
@@ -278,10 +161,6 @@ target_link_libraries(bench_movegen PRIVATE shogi_core)
 # ---- Benchmark: legal move generation from SFEN file ----
 add_executable(bench_legal100 test/bench_legal100.cc)
 target_link_libraries(bench_legal100 PRIVATE shogi_core)
-
-# ---- Benchmark: encoder ----
-add_executable(bench_encoder test/bench_encoder.cc)
-target_link_libraries(bench_encoder PRIVATE shogi_core)
 
 # ---- Test: mate problem solver ----
 add_executable(test_mate test/test_mate.cc)
@@ -356,23 +235,6 @@ target_link_libraries(test_search_info PRIVATE shogi_core)
 add_executable(bench_primitives test/bench_primitives.cc)
 target_link_libraries(bench_primitives PRIVATE shogi_core)
 
-# =====================================================================
-# JHBR5 — CPU NNUE backend
-# =====================================================================
-set(NNUE_SRCS
-  nnue/features.cc
-  nnue/move_buckets.cc
-  nnue/see.cc
-  nnue/net_format.cc
-  nnue/value_net.cc
-  nnue/policy_net.cc
-  nnue/simd.cc
-  nnue/random_net.cc
-)
-add_library(nnue STATIC ${NNUE_SRCS})
-target_include_directories(nnue PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
-target_link_libraries(nnue PUBLIC shogi_core)
-
 # ---- Tools ----
 add_executable(make_random_net tools/make_random_net.cc)
 target_link_libraries(make_random_net PRIVATE nnue)
@@ -419,3 +281,10 @@ add_test(NAME dfpn_repetition COMMAND test_dfpn_repetition)
 add_test(NAME shallow_mate COMMAND test_shallow_mate)
 add_test(NAME search_primitives COMMAND test_search_primitives)
 add_test(NAME packed_sfen COMMAND test_packed_sfen)
+add_test(NAME lockfree_search COMMAND test_lockfree_search ${CMAKE_BINARY_DIR})
+add_test(NAME tree_reuse COMMAND test_tree_reuse)
+add_test(NAME time_manager COMMAND test_time_manager)
+add_test(NAME search_info COMMAND test_search_info)
+add_test(NAME bns COMMAND test_bns)
+add_test(NAME mate1 COMMAND test_mate1 WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
+add_test(NAME usi_bench COMMAND sh -c "printf 'bench 2000 2\\nquit\\n' | $<TARGET_FILE:jhbr5>")

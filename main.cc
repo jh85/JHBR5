@@ -11,7 +11,7 @@
 
 #include "usi/usi_engine.h"
 #include "shogi/bitboard.h"
-#include "shogi/encoder.h"
+#include "nnue/types.h"
 
 #include <csignal>
 #include <cstdio>
@@ -19,7 +19,7 @@
 #include <unistd.h>
 
 static void crash_handler(int sig) {
-  fprintf(stderr, "\n=== JHBR3 CRASH: signal %d ===\n", sig);
+  fprintf(stderr, "\n=== JHBR5 CRASH: signal %d ===\n", sig);
   void* frames[32];
   int n = backtrace(frames, 32);
   backtrace_symbols_fd(frames, n, 2);  // write to stderr
@@ -33,7 +33,7 @@ int main(int /*argc*/, char* /*argv*/[]) {
   signal(SIGFPE, crash_handler);
   // Initialize static tables.
   lczero::ShogiTables::Init();
-  lczero::ShogiEncoderTables::Init();
+  jhbr5::nnue::Init();
 
   // Run USI engine.
   jhbr2::USIEngine engine;
