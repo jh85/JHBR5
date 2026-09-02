@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """SPRT match between two USI engine configurations, in rounds of paired games
-through tools/strength_test.py, stopping when tools/sprt.py decides.
+through tools/strength_test.py (one run directory per round, seeds seed+round),
+aggregating the pentanomial counts and stopping when tools/sprt.py decides.
 
   python tools/sprt_match.py --engine-a build/jhbr5 --engine-b build/jhbr5 \
       --option-a ValueNet=nets/best/value.nn --option-a PolicyNet=nets/best/policy.nn \
@@ -44,12 +45,18 @@ def main():
     args = ap.parse_args()
 
     pairs = 0
+    rnd = 0
+    penta = [0, 0, 0, 0, 0]
+    os.makedirs(args.output, exist_ok=True)
     while pairs < args.max_pairs:
-        pairs = min(pairs + args.round_pairs, args.max_pairs)
+        rnd += 1
+        n = min(args.round_pairs, args.max_pairs - pairs)
+        pairs += n
+        round_dir = os.path.join(args.output, f"round_{rnd:03d}")
         cmd = [sys.executable, os.path.join(HERE, "strength_test.py"), "--engine-a", args.engine_a,
-               "--engine-b", args.engine_b, "--openings", args.openings, "--pairs", str(pairs),
-               "--seed", str(args.seed), "--output", args.output]
-        if os.path.exists(os.path.join(args.output, "config.json")):
+               "--engine-b", args.engine_b, "--openings", args.openings, "--pairs", str(n),
+               "--seed", str(args.seed + rnd), "--output", round_dir]
+        if os.path.exists(os.path.join(round_dir, "config.json")):
             cmd.append("--resume")
         if args.nodes:
             cmd += ["--nodes", str(args.nodes)]
@@ -63,14 +70,16 @@ def main():
             cmd += ["--option-b", o]
         cmd += args.extra
         subprocess.run(cmd, check=True)
-        summary = json.load(open(os.path.join(args.output, "summary.json")))
-        r = subprocess.run([sys.executable, os.path.join(HERE, "sprt.py"), "--summary",
-                            os.path.join(args.output, "summary.json"), "--for-b", "--elo0", str(args.elo0),
-                            "--elo1", str(args.elo1), "--alpha", str(args.alpha), "--beta", str(args.beta)],
+        summary = json.load(open(os.path.join(round_dir, "summary.json")))
+        penta = [x + y for x, y in zip(penta, summary["pentanomial_a_points_0_to_2"])]
+        r = subprocess.run([sys.executable, os.path.join(HERE, "sprt.py"), "--pentanomial"] + [str(c) for c in penta] +
+                           ["--for-b", "--elo0", str(args.elo0), "--elo1", str(args.elo1),
+                            "--alpha", str(args.alpha), "--beta", str(args.beta)],
                            capture_output=True, text=True)
         print(r.stdout.strip(), flush=True)
         verdict = json.loads(r.stdout)
-        json.dump({"sprt": verdict, "summary": summary}, open(os.path.join(args.output, "sprt.json"), "w"), indent=2)
+        json.dump({"sprt": verdict, "rounds": rnd, "pairs": pairs},
+                  open(os.path.join(args.output, "sprt.json"), "w"), indent=2)
         if verdict["result"] == "H1":
             print("SPRT: candidate accepted")
             return 0
