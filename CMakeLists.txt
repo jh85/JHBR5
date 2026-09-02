@@ -16,7 +16,31 @@ if(NOT CMAKE_BUILD_TYPE)
   set(CMAKE_BUILD_TYPE Release)
 endif()
 
-set(CMAKE_CXX_FLAGS_RELEASE "-O3 -DNDEBUG -march=native")
+set(CMAKE_CXX_FLAGS_RELEASE "-O3 -DNDEBUG")
+
+# ---- Instruction set ----
+# JHBR5 selects the SIMD level explicitly (no -march=native) so that binaries
+# for the AVX2 development machine and the AVX-512 target are reproducible.
+# The NNUE kernels (nnue/simd*.h) follow the same option; `scalar` keeps the
+# reference kernels only (SSE4.2 is still assumed for the bitboard code).
+set(JHBR5_ISA "avx2" CACHE STRING "SIMD level: scalar, avx2 or avx512")
+set_property(CACHE JHBR5_ISA PROPERTY STRINGS scalar avx2 avx512)
+if(JHBR5_ISA STREQUAL "avx2")
+  add_compile_options(-msse4.2 -mpopcnt -mavx2 -mfma -mbmi -mbmi2)
+  add_compile_definitions(JHBR5_SIMD_AVX2)
+elseif(JHBR5_ISA STREQUAL "avx512")
+  add_compile_options(-msse4.2 -mpopcnt -mavx2 -mfma -mbmi -mbmi2
+    -mavx512f -mavx512bw -mavx512dq -mavx512vl -mavx512vnni)
+  add_compile_definitions(JHBR5_SIMD_AVX512)
+elseif(JHBR5_ISA STREQUAL "scalar")
+  add_compile_options(-msse4.2 -mpopcnt)
+  add_compile_definitions(JHBR5_SIMD_SCALAR)
+else()
+  message(FATAL_ERROR "JHBR5_ISA must be scalar, avx2 or avx512 (got ${JHBR5_ISA})")
+endif()
+message(STATUS "JHBR5_ISA: ${JHBR5_ISA}")
+
+enable_testing()
 set(CMAKE_CXX_FLAGS_DEBUG "-g -O0 -fsanitize=address")
 
 # ---- ONNX Runtime ----
@@ -331,3 +355,67 @@ target_link_libraries(test_search_info PRIVATE shogi_core)
 # ---- Bench: solver-relevant board primitives ----
 add_executable(bench_primitives test/bench_primitives.cc)
 target_link_libraries(bench_primitives PRIVATE shogi_core)
+
+# =====================================================================
+# JHBR5 — CPU NNUE backend
+# =====================================================================
+set(NNUE_SRCS
+  nnue/features.cc
+  nnue/move_buckets.cc
+  nnue/see.cc
+  nnue/net_format.cc
+  nnue/value_net.cc
+  nnue/policy_net.cc
+  nnue/simd.cc
+  nnue/random_net.cc
+)
+add_library(nnue STATIC ${NNUE_SRCS})
+target_include_directories(nnue PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(nnue PUBLIC shogi_core)
+
+# ---- Tools ----
+add_executable(make_random_net tools/make_random_net.cc)
+target_link_libraries(make_random_net PRIVATE nnue)
+
+add_executable(dump_nnue_features tools/dump_nnue_features.cc)
+target_link_libraries(dump_nnue_features PRIVATE nnue)
+
+# ---- Bench ----
+add_executable(bench_nnue test/bench_nnue.cc)
+target_link_libraries(bench_nnue PRIVATE nnue)
+
+# ---- Tests ----
+add_executable(test_nnue_kernels test/test_nnue_kernels.cc)
+target_link_libraries(test_nnue_kernels PRIVATE nnue)
+add_test(NAME nnue_kernels COMMAND test_nnue_kernels)
+
+add_executable(test_nnue_features test/test_nnue_features.cc)
+target_link_libraries(test_nnue_features PRIVATE nnue)
+add_test(NAME nnue_features
+  COMMAND test_nnue_features ${CMAKE_CURRENT_SOURCE_DIR}/test/legal100.sfens)
+add_test(NAME nnue_features_positions
+  COMMAND test_nnue_features ${CMAKE_CURRENT_SOURCE_DIR}/test/positions.txt)
+
+add_executable(test_see test/test_see.cc)
+target_link_libraries(test_see PRIVATE nnue)
+add_test(NAME see COMMAND test_see)
+
+add_executable(test_nnue_net test/test_nnue_net.cc)
+target_link_libraries(test_nnue_net PRIVATE nnue)
+add_test(NAME nnue_net
+  COMMAND test_nnue_net ${CMAKE_CURRENT_SOURCE_DIR}/test/legal100.sfens ${CMAKE_BINARY_DIR})
+
+find_package(Python3 COMPONENTS Interpreter QUIET)
+if(Python3_Interpreter_FOUND)
+  add_test(NAME nnue_features_python_reference
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test/test_nnue_features_ref.py
+      $<TARGET_FILE:dump_nnue_features> ${CMAKE_CURRENT_SOURCE_DIR}/test/legal100.sfens)
+endif()
+
+# Inherited JHBR3 tests that run without arguments or with checked-in inputs.
+add_test(NAME movegen COMMAND test_movegen ${CMAKE_CURRENT_SOURCE_DIR}/test/positions.txt)
+add_test(NAME search_repetition COMMAND test_search_repetition)
+add_test(NAME dfpn_repetition COMMAND test_dfpn_repetition)
+add_test(NAME shallow_mate COMMAND test_shallow_mate)
+add_test(NAME search_primitives COMMAND test_search_primitives)
+add_test(NAME packed_sfen COMMAND test_packed_sfen)
