@@ -48,7 +48,9 @@ def main():
         pairs = min(pairs + args.round_pairs, args.max_pairs)
         cmd = [sys.executable, os.path.join(HERE, "strength_test.py"), "--engine-a", args.engine_a,
                "--engine-b", args.engine_b, "--openings", args.openings, "--pairs", str(pairs),
-               "--seed", str(args.seed), "--output", args.output, "--resume"]
+               "--seed", str(args.seed), "--output", args.output]
+        if os.path.exists(os.path.join(args.output, "config.json")):
+            cmd.append("--resume")
         if args.nodes:
             cmd += ["--nodes", str(args.nodes)]
         if args.byoyomi_ms:
