@@ -72,6 +72,12 @@ build/bench_nnue test/legal100.sfens               # raw network throughput
 Retired JHBR3 options (`OnnxModel`, `UseGPU`, `WorkersPerGpu`, `MinibatchSize`,
 `NumGPUs`, `NNCacheSize`, `UseMovesLeft`, …) are accepted and ignored.
 
+## Floodgate
+
+`tools/shgterm-config.example.yaml` is a ready-made configuration for the
+`shgterm` USI-to-CSA bridge (engine path, network paths, threads, time
+management); fill in the server account.
+
 ## Documentation
 
 - `docs/DESIGN.md` — architecture and review decisions
