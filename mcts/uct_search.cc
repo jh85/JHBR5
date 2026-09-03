@@ -540,7 +540,7 @@ PlayoutStatus UCTSearcher::UctSearch(ShogiBoard* board, child_node_t* parent,
   child_node_t* edge = &current->child[next];
   AddVirtualLoss(edge, current);
   visitor.trajectories.push_back({current, next});
-  uct_node_t* next_node = current->child_nodes[next].GetOrCreate();
+  uct_node_t* next_node = current->child[next].node.GetOrCreate();
 
   const Move next_move = edge->move;
   const auto undo = board->DoMove(next_move);
@@ -640,8 +640,7 @@ std::vector<Move> Search::GetPV() const {
       break;
     }
     pv.push_back(node->child[idx].move);
-    if (!node->child_nodes) break;
-    node = node->child_nodes[idx].get();
+    node = node->child[idx].node.get();
     if (pv.size() > 256) break;
   }
   return pv;

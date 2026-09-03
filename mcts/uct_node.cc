@@ -103,8 +103,7 @@ std::unique_ptr<uct_node_t> child_node_slot_t::Reset(
 }
 
 namespace {
-constexpr size_t kChildBytes =
-    sizeof(child_node_t) + sizeof(child_node_slot_t);
+constexpr size_t kChildBytes = sizeof(child_node_t);
 }  // namespace
 
 std::atomic<size_t>& TreeMemory::Bytes() {
@@ -133,20 +132,8 @@ void uct_node_t::ExpandNode(const lczero::MoveList& moves) {
   for (int i = 0; i < child_num; ++i) {
     child[i].move = moves[i];
   }
-  InitChildNodes();
   TreeMemory::Bytes().fetch_add(static_cast<size_t>(child_num) * kChildBytes,
                                 std::memory_order_relaxed);
-}
-
-void uct_node_t::InitChildNodes() {
-  if (!child_nodes && child_num > 0) {
-    child_nodes = std::make_unique<child_node_slot_t[]>(child_num);
-  }
-}
-
-uct_node_t* uct_node_t::CreateChildNode(int i) {
-  InitChildNodes();
-  return child_nodes[i].GetOrCreate();
 }
 
 void uct_node_t::CreateSingleChildNode(lczero::Move move) {
@@ -159,34 +146,29 @@ void uct_node_t::CreateSingleChildNode(lczero::Move move) {
   child_num = 1;
   child = std::make_unique<child_node_t[]>(1);
   child[0].move = move;
-  child_nodes = std::make_unique<child_node_slot_t[]>(1);
 }
 
 uct_node_t* uct_node_t::ReleaseChildrenExceptOne(lczero::Move move) {
   if (child_num <= 0 || !child) {
     CreateSingleChildNode(move);
-    return child_nodes[0].GetOrCreate();
+    return child[0].node.GetOrCreate();
   }
 
-  InitChildNodes();
   if (child_num == 1 && child[0].move == move) {
-    return child_nodes[0].GetOrCreate();
+    return child[0].node.GetOrCreate();
   }
 
   for (int i = 0; i < child_num; ++i) {
     if (child[i].move == move) {
-      uct_node_t* selected = child_nodes[i].GetOrCreate();
+      uct_node_t* selected = child[i].node.GetOrCreate();
       auto kept_child = std::make_unique<child_node_t[]>(1);
-      kept_child[0] = std::move(child[i]);
-      auto kept_nodes = std::make_unique<child_node_slot_t[]>(1);
-      kept_nodes[0].Reset(child_nodes[i].Take());
+      kept_child[0] = std::move(child[i]);  // moves the node pointer too
       for (int sibling = 0; sibling < child_num; ++sibling) {
         if (sibling != i) {
-          DeleteSubtreeLater(child_nodes[sibling].Take());
+          DeleteSubtreeLater(child[sibling].node.Take());
         }
       }
       child = std::move(kept_child);
-      child_nodes = std::move(kept_nodes);
       TreeMemory::Bytes().fetch_sub(static_cast<size_t>(child_num - 1) * kChildBytes,
                                     std::memory_order_relaxed);
       child_num = 1;
@@ -195,10 +177,10 @@ uct_node_t* uct_node_t::ReleaseChildrenExceptOne(lczero::Move move) {
   }
 
   for (int i = 0; i < child_num; ++i) {
-    DeleteSubtreeLater(child_nodes[i].Take());
+    DeleteSubtreeLater(child[i].node.Take());
   }
   CreateSingleChildNode(move);
-  return child_nodes[0].GetOrCreate();
+  return child[0].node.GetOrCreate();
 }
 
 NodeTree::NodeTree() { DeallocateTree(); }
@@ -228,10 +210,10 @@ bool NodeTree::ResetToPosition(uint64_t starting_pos_key,
   // played child available from the new root, so restart that head.
   if (same_game && !can_reuse) {
     if (prev_head) {
-      DeleteSubtreeLater(prev_head->child_nodes[0].Take());
+      DeleteSubtreeLater(prev_head->child[0].node.Take());
       auto fresh = std::make_unique<uct_node_t>();
       current_head_ = fresh.get();
-      prev_head->child_nodes[0].Reset(std::move(fresh));
+      prev_head->child[0].node.Reset(std::move(fresh));
     } else {
       DeallocateTree();
     }

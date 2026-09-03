@@ -45,10 +45,8 @@ void TestExtensionAndIdenticalPosition() {
   auto* start = tree.GetCurrentHead();
   auto* node1 = AppendChild(start, move1, 11);
   auto* start_children = start->child.get();
-  auto* start_child_nodes = start->child_nodes.get();
   auto* node2 = AppendChild(node1, move2, 37);
   auto* node1_children = node1->child.get();
-  auto* node1_child_nodes = node1->child_nodes.get();
   node2->win.store(23.0f, std::memory_order_relaxed);
 
   Check("extended position reuses tree",
@@ -59,20 +57,16 @@ void TestExtensionAndIdenticalPosition() {
   Check("extended position retains value",
         node2->win.load(std::memory_order_relaxed) == 23.0f);
   Check("one-child start array is not reallocated",
-        start->child.get() == start_children &&
-            start->child_nodes.get() == start_child_nodes);
+        start->child.get() == start_children);
   Check("one-child history array is not reallocated",
-        node1->child.get() == node1_children &&
-            node1->child_nodes.get() == node1_child_nodes);
+        node1->child.get() == node1_children);
 
   Check("identical position reuses tree",
         tree.ResetToPosition(kStartKey, {move1, move2}));
   Check("identical position retains root", tree.GetCurrentHead() == node2);
   Check("identical traversal remains allocation-free",
         start->child.get() == start_children &&
-            start->child_nodes.get() == start_child_nodes &&
-            node1->child.get() == node1_children &&
-            node1->child_nodes.get() == node1_child_nodes);
+            node1->child.get() == node1_children);
 
   auto* node3 = AppendChild(node2, move3, 19);
   Check("later extension reuses current root",
@@ -164,7 +158,7 @@ void TestConcurrentChildPublication() {
     stable = stable &&
              observed[static_cast<size_t>(thread)] != nullptr &&
              observed[static_cast<size_t>(thread)] ==
-                 node.child_nodes[static_cast<size_t>(target)].get();
+                 node.child[static_cast<size_t>(target)].node.get();
   }
   Check("concurrent child publication returns one stable node per edge",
         stable);

@@ -55,7 +55,9 @@ struct child_node_t {
         nnrate(o.nnrate),
         move_count(o.move_count.load(std::memory_order_relaxed)),
         win(o.win.load(std::memory_order_relaxed)),
-        flags(o.flags.load(std::memory_order_relaxed)) {}
+        flags(o.flags.load(std::memory_order_relaxed)) {
+    node.Reset(o.node.Take());
+  }
 
   child_node_t& operator=(child_node_t&& o) noexcept {
     move = o.move;
@@ -65,6 +67,7 @@ struct child_node_t {
     win.store(o.win.load(std::memory_order_relaxed), std::memory_order_relaxed);
     flags.store(o.flags.load(std::memory_order_relaxed),
                 std::memory_order_relaxed);
+    node.Reset(o.node.Take());
     return *this;
   }
 
@@ -78,15 +81,20 @@ struct child_node_t {
   void SetLose() { flags.fetch_or(kLose, std::memory_order_acq_rel); }
   void SetDraw() { flags.fetch_or(kDraw, std::memory_order_acq_rel); }
 
+  // The child node (lazily created) lives in the edge itself: one array per
+  // expansion, no separate slot array (JHBR5 memory reduction). Field order
+  // packs the struct into 24 bytes; `flags` is public only for that reason.
+  child_node_slot_t node;
   lczero::Move move;
+  std::atomic<uint8_t> flags{0};
   float nnrate = 0.0f;
   std::atomic<int> move_count{0};
   std::atomic<float> win{0.0f};
 
  private:
   enum : uint8_t { kWin = 1, kLose = 2, kDraw = 4 };
-  std::atomic<uint8_t> flags{0};
 };
+static_assert(sizeof(child_node_t) <= 24, "child_node_t grew; check the layout");
 
 // Approximate bytes held by live tree nodes (all trees in the process).
 // Maintained by uct_node_t allocation/expansion/destruction.
@@ -118,8 +126,8 @@ struct uct_node_t {
   // after the priors are written.
   void ExpandNode(const lczero::ShogiBoard* board);
   void ExpandNode(const lczero::MoveList& moves);
-  void InitChildNodes();
-  uct_node_t* CreateChildNode(int i);
+  void InitChildNodes() {}  // kept for API compatibility; slots live in `child`
+  uct_node_t* CreateChildNode(int i) { return child[i].node.GetOrCreate(); }
   void CreateSingleChildNode(lczero::Move move);
   uct_node_t* ReleaseChildrenExceptOne(lczero::Move move);
 
@@ -129,7 +137,6 @@ struct uct_node_t {
   std::atomic<float> visited_nnrate{0.0f};
   short child_num = 0;
   std::unique_ptr<child_node_t[]> child;
-  std::unique_ptr<child_node_slot_t[]> child_nodes;
 };
 
 class NodeTree {

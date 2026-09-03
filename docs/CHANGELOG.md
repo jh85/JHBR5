@@ -2,6 +2,16 @@
 
 ## Unreleased — Phase 5 (testing) and first training
 
+* Pre-rental trainer work (2026-09-03): king-relative factoriser `KPrel`
+  (index computed in C++, `jhbr5.kprel_index`, folded at export),
+  validation loss on held-out shards with `ckpt_best.pt`, `--schedule
+  flat-cosine|cosine|exp`, `tools/train_both.sh` (two GPUs), importer
+  manifest (`imported.json`) with path-based shard names; `docs/TRAINING_PLAN.md`.
+* Tree memory: the lazily created child node pointer now lives inside the
+  edge (`child_node_t` 24 B, `uct_node_t` 32 B, one allocation per expansion
+  instead of two). Floodgate logs showed 56 of ~1000 searches stopping on the
+  8 GB `TreeMemoryMB`; the config now allows 24 GB.
+
 * `tools/sprt.py` (pentanomial GSPRT), `tools/sprt_match.py` (rounds of
   paired games until the SPRT decides), `tools/match_vs_jhbr3.sh` (equal
   nodes), `tools/match_vs_yaneuraou.sh` (equal clock and threads),
