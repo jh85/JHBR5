@@ -1,4 +1,4 @@
-# Training plan: 1.5B+ positions on a rented 1–2 × RTX 5090 box
+# Training plan: 1.9B positions on a rented 1–2 × RTX 5090 box
 
 Written 2026-09-03 for a one-to-two-week rental. Commands assume the repo at
 `~/JHBR5`, shards under `~/data`, and a CUDA torch venv at `~/venv`
@@ -11,7 +11,7 @@ Written 2026-09-03 for a one-to-two-week rental. Commands assume the repo at
 | GPU | 1 × RTX 5090 (2 preferred) | one trains value and policy sequentially; two train them concurrently and leave one for the JHBR3 teacher |
 | CPU | 32 cores | shard reader ≈ 80k positions/s per worker; self-play is CPU-bound (≈ 35k playouts/s per thread) |
 | RAM | 64 GB | 4–6 reader workers with 200k-record shuffle buffers, plus the M-profile optimizer state on the GPU |
-| Disk | 300 GB NVMe | 1.5B positions ≈ 66 GB of `.rec` shards, checkpoints 3–10 GB each |
+| Disk | 300 GB NVMe | current corpus: 79 pack shards (1.42B positions, 57 GB) + 127 PSV shards (500M, 21 GB); checkpoints 3–10 GB each |
 
 ## 1. Setup (day 1, ~2 h)
 
@@ -51,22 +51,22 @@ Steps = epochs × positions / batch.
 Two GPUs, both nets at once:
 
 ```bash
-VALUE_ARGS="--l1 1024 --batch-size 16384 --steps 275000 --wdl-lambda 0.7 --val-shards ~/data/val/*.rec --val-every 2000" \
-POLICY_ARGS="--l1 4096 --batch-size 8192 --steps 250000 --val-shards ~/data/val/kif_*.rec --val-every 2000" \
+VALUE_ARGS="--l1 1024 --batch-size 16384 --steps 350000 --wdl-lambda 0.7 --val-shards ~/data/val/*.rec --val-every 2000" \
+POLICY_ARGS="--l1 4096 --batch-size 8192 --steps 345000 --val-shards ~/data/val/kif_*.rec --val-every 2000" \
 PY=$PY tools/train_both.sh ~/runs/sup1 ~/data/pack ~/data/psv -- --workers 6 --shuffle-buffer 200000 --schedule flat-cosine --flat-frac 0.6 --save-every 10000
 ```
 
-(275k × 16384 ≈ 4.5B samples = 3 epochs over 1.5B; 250k × 8192 ≈ 2B policy
-samples ≈ 2 epochs over the ~1B pack positions.) Expected wall time at
-120–150k and 40–50k positions/s: value ≈ 9–10 h, policy ≈ 12–14 h.
+(350k × 16384 ≈ 5.7B samples = 3 epochs over 1.92B; 345k × 8192 ≈ 2.8B policy
+samples = 2 epochs over the 1.42B pack positions.) Expected wall time at
+120–150k and 40–50k positions/s: value ≈ 11–13 h, policy ≈ 16–20 h.
 
 One GPU, sequential:
 
 ```bash
-$PY train/train.py --net value  --shards ~/data/pack ~/data/psv --l1 1024 --batch-size 16384 --steps 275000 --wdl-lambda 0.7 \
+$PY train/train.py --net value  --shards ~/data/pack ~/data/psv --l1 1024 --batch-size 16384 --steps 350000 --wdl-lambda 0.7 \
     --schedule flat-cosine --flat-frac 0.6 --workers 6 --val-shards ~/data/val/*.rec --val-every 2000 \
     --out ~/runs/sup1/value --export ~/runs/sup1/value.nn
-$PY train/train.py --net policy --shards ~/data/pack --l1 4096 --batch-size 8192 --steps 250000 \
+$PY train/train.py --net policy --shards ~/data/pack --l1 4096 --batch-size 8192 --steps 345000 \
     --schedule flat-cosine --flat-frac 0.6 --workers 6 --val-shards ~/data/val/kif_*.rec --val-every 2000 \
     --out ~/runs/sup1/policy --export ~/runs/sup1/policy.nn
 ```
