@@ -157,6 +157,7 @@ class BatchReader {
   py::dict Prepare(const std::vector<data::Record>& batch) {
     const size_t n = batch.size();
     std::vector<int64_t> a_us, a_them, b, p, a_us_off{0}, a_them_off{0}, b_off{0}, p_off{0};
+    std::vector<int64_t> a_us_kp, a_them_kp;
     std::vector<int64_t> mv_bucket, mv_off{0};
     std::vector<float> mv_visits, score(n), result(n);
     std::vector<int32_t> ply(n), n_moves(n);
@@ -176,10 +177,16 @@ class BatchReader {
         }
         const lczero::Color stm = board.side_to_move();
         nnue::GroupAFeatures(board, stm, &fa);
-        a_us.insert(a_us.end(), fa.idx, fa.idx + fa.n);
+        for (int f = 0; f < fa.n; ++f) {
+          a_us.push_back(fa.idx[f]);
+          a_us_kp.push_back(nnue::KPrelIndex(fa.idx[f]));
+        }
         a_us_off.push_back(static_cast<int64_t>(a_us.size()));
         nnue::GroupAFeatures(board, ~stm, &fa);
-        a_them.insert(a_them.end(), fa.idx, fa.idx + fa.n);
+        for (int f = 0; f < fa.n; ++f) {
+          a_them.push_back(fa.idx[f]);
+          a_them_kp.push_back(nnue::KPrelIndex(fa.idx[f]));
+        }
         a_them_off.push_back(static_cast<int64_t>(a_them.size()));
         nnue::GroupBFeatures(board, &fb);
         b.insert(b.end(), fb.idx, fb.idx + fb.n);
@@ -222,6 +229,8 @@ class BatchReader {
     d["a_us_off"] = Vec(a_us_off);
     d["a_them_idx"] = Vec(a_them);
     d["a_them_off"] = Vec(a_them_off);
+    d["a_us_kp"] = Vec(a_us_kp);
+    d["a_them_kp"] = Vec(a_them_kp);
     d["b_idx"] = Vec(b);
     d["b_off"] = Vec(b_off);
     d["p_idx"] = Vec(p);
@@ -344,6 +353,7 @@ PYBIND11_MODULE(jhbr5, m) {
   m.attr("NUM_SLOTS") = nnue::kNumSlots;
   m.attr("NUM_BUCKETS") = nnue::kNumBuckets;
   m.attr("NUM_BUCKETS_SEE") = nnue::kNumBucketsSee;
+  m.attr("KPREL_INPUTS") = nnue::kKPrelInputs;
   m.attr("MAX_ACTIVE_A") = nnue::kMaxActiveA;
   m.attr("MAX_ACTIVE_B") = nnue::kMaxActiveB;
   m.attr("MAX_ACTIVE_POLICY") = nnue::kMaxActivePolicy;
@@ -359,6 +369,13 @@ PYBIND11_MODULE(jhbr5, m) {
   m.attr("MAX_LEGAL_MOVES") = lczero::kMaxLegalMoves;
 
   m.def("feature_set_id", [] { return nnue::FeatureSetId(); });
+  m.def("kprel_index", [](py::array_t<int64_t> idx) {
+    auto r = idx.unchecked<1>();
+    py::array_t<int64_t> out(r.shape(0));
+    auto o = out.mutable_unchecked<1>();
+    for (py::ssize_t i = 0; i < r.shape(0); ++i) o(i) = nnue::KPrelIndex(static_cast<int>(r(i)));
+    return out;
+  }, "King-relative factoriser index for group-A feature indices (training only)");
   m.def("bucket_table_id", [](bool see) { return nnue::BucketTableId(see); }, py::arg("see") = true);
 
   m.def("value_features", [](const std::string& sfen) {

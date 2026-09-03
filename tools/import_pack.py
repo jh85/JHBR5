@@ -13,6 +13,7 @@ Writes one .rec shard per pack file (value-only records, flags kImportedPsv).
 """
 import argparse
 import glob
+import json
 import multiprocessing as mp
 import os
 import struct
@@ -109,19 +110,38 @@ def main():
     ap.add_argument("--build", default=os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "build"),
                     help="directory containing the jhbr5 Python module")
     args = ap.parse_args()
-    files = list(args.pack)
+    files = [os.path.abspath(f) for f in args.pack]
     if args.pack_dir:
-        files += sorted(glob.glob(os.path.join(args.pack_dir, "*.pack")))
+        files += sorted(os.path.abspath(f) for f in glob.glob(os.path.join(args.pack_dir, "**", "*.pack"), recursive=True))
     if not files:
         sys.exit("no .pack files")
     os.makedirs(args.out, exist_ok=True)
-    jobs = [(f, os.path.join(args.out, os.path.splitext(os.path.basename(f))[0] + ".rec"),
-             args.limit, args.min_ply, not args.keep_interrupted, os.path.abspath(args.build)) for f in files]
+    # Manifest of imported packs (basename + size) so duplicates in other
+    # directories or archives are skipped; shard names carry the relative path.
+    manifest_path = os.path.join(args.out, "imported.json")
+    manifest = json.load(open(manifest_path)) if os.path.exists(manifest_path) else {}
+    jobs = []
+    seen = set()
+    for f in files:
+        key = f"{os.path.basename(f)}:{os.path.getsize(f)}"
+        if key in manifest or key in seen:
+            print(f"skip (already imported): {f}")
+            continue
+        seen.add(key)
+        rel = os.path.relpath(f, args.pack_dir) if args.pack_dir and f.startswith(os.path.abspath(args.pack_dir) + os.sep) else os.path.relpath(f)
+        stem = os.path.splitext(rel.replace(os.sep, "_").replace("..", ""))[0].strip("_")
+        out_path = os.path.join(args.out, stem + ".rec")
+        jobs.append((f, out_path, args.limit, args.min_ply, not args.keep_interrupted, os.path.abspath(args.build)))
+    if not jobs:
+        print("nothing to import")
+        return
     t0 = time.time()
     total_pos = 0
     with mp.Pool(min(args.workers, len(jobs))) as pool:
         for path, games, positions, skipped in pool.imap_unordered(convert_file, jobs):
             total_pos += positions
+            manifest[f"{os.path.basename(path)}:{os.path.getsize(path)}"] = {"games": games, "positions": positions}
+            json.dump(manifest, open(manifest_path, "w"), indent=1)
             print(f"{os.path.basename(path)}: {games} games, {positions} positions, {skipped} skipped "
                   f"({total_pos / (time.time() - t0):.0f} pos/s)", flush=True)
     print(f"done: {total_pos} positions in {time.time() - t0:.0f}s -> {args.out}")

@@ -65,6 +65,24 @@ constexpr int HandSlot(int owner, int hand_kind, int count_index /*1-based*/) {
 constexpr int kGroupAInputs = 81 * kNumSlots;                   // 189,864
 constexpr int kMaxActiveA = 128;   // 38 in legal positions; test/tsume sfens may exceed
 
+// Training-only virtual feature for group A (docs/DESIGN.md §9.3): board
+// slot type/owner x king-relative offset (17x17); hand slots map to a zero
+// padding row. Folded into the group-A table at export; the engine never
+// uses it, but the index lives here so the trainer has no mapping code.
+constexpr int kKPrelOffsets = 17 * 17;
+constexpr int kKPrelInputs = 2 * kTypeIds * kKPrelOffsets + 1;   // 8093, last = padding
+constexpr int KPrelIndex(int group_a_index) {
+  const int k = group_a_index / kNumSlots;
+  const int slot = group_a_index % kNumSlots;
+  if (slot < kHandSlots) return kKPrelInputs - 1;
+  const int b = slot - kHandSlots;
+  const int owner_tid = b / 81;   // owner * kTypeIds + tid
+  const int sq = b % 81;
+  const int dx = sq / 9 - k / 9 + 8;
+  const int dy = sq % 9 - k % 9 + 8;
+  return owner_tid * kKPrelOffsets + dx * 17 + dy;
+}
+
 // Group B: absolute slots (stm frame) + attacker->target threat pairs.
 constexpr int kPairsPerOwner = 8228;    // verified at Init()
 constexpr int kThreatClasses = 16;      // target owner (2) x type class (8)

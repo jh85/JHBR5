@@ -33,6 +33,12 @@ def parse_args():
     ap.add_argument("--lr", type=float, default=1e-3)
     ap.add_argument("--lr-final", type=float, default=1e-5)
     ap.add_argument("--warmup", type=int, default=500)
+    ap.add_argument("--schedule", choices=["exp", "cosine", "flat-cosine"], default="flat-cosine",
+                    help="lr after warmup: exponential decay to lr-final, cosine to lr-final, or flat then cosine")
+    ap.add_argument("--flat-frac", type=float, default=0.6, help="flat-cosine: fraction of steps at the peak lr")
+    ap.add_argument("--val-shards", nargs="*", default=[], help="held-out shards for the validation loss")
+    ap.add_argument("--val-batches", type=int, default=16, help="validation batches (of --batch-size) held in memory")
+    ap.add_argument("--val-every", type=int, default=1000)
     ap.add_argument("--weight-decay", type=float, default=0.01)
     ap.add_argument("--wdl-lambda", type=float, default=0.7, help="weight of the score-derived WDL vs the game result")
     ap.add_argument("--score-scale", type=float, default=340.0)
@@ -56,8 +62,47 @@ def parse_args():
 def lr_at(step, args):
     if step < args.warmup:
         return args.lr * (step + 1) / args.warmup
-    t = min(1.0, (step - args.warmup) / max(1, args.steps - args.warmup))
-    return args.lr * (args.lr_final / args.lr) ** t
+    total = max(1, args.steps - args.warmup)
+    t = min(1.0, (step - args.warmup) / total)
+    if args.schedule == "exp":
+        return args.lr * (args.lr_final / args.lr) ** t
+    if args.schedule == "flat-cosine":
+        if t < args.flat_frac:
+            return args.lr
+        t = (t - args.flat_frac) / max(1e-9, 1.0 - args.flat_frac)
+    return args.lr_final + 0.5 * (args.lr - args.lr_final) * (1.0 + math.cos(math.pi * t))
+
+
+def load_validation(args, see):
+    if not args.val_shards:
+        return []
+    ds = RecordDataset(args.val_shards, args.batch_size, max(args.batch_size, 4096), 12345,
+                       require_dist=(args.net == "policy"), see=see, loop=False,
+                       move_fallback=(args.net == "policy" and args.policy_target == "auto"))
+    batches = []
+    for b in ds:
+        batches.append(b)
+        if len(batches) >= args.val_batches:
+            break
+    return batches
+
+
+@torch.no_grad()
+def validate(model, batches, args, device):
+    model.eval()
+    total, n_total = 0.0, 0
+    for b in batches:
+        b = {k: (v.to(device, non_blocking=True) if torch.is_tensor(v) else v) for k, v in b.items()}
+        n = b["n"]
+        if args.net == "value":
+            loss = value_loss(model(b), value_target(b, args.wdl_lambda, args.score_scale, args.score_offset))
+        else:
+            logits, seg = model(b)
+            loss = policy_loss(logits, seg, b["mv_visits"], n)
+        total += loss.item() * n
+        n_total += n
+    model.train()
+    return total / max(1, n_total)
 
 
 def main():
@@ -96,6 +141,10 @@ def main():
               "feature_set_id": jhbr5.feature_set_id(), "bucket_table_id": jhbr5.bucket_table_id(see)}
         torch.save(ck, os.path.join(args.out, f"ckpt_{tag}.pt"))
 
+    val_batches = load_validation(args, see)
+    if val_batches:
+        print(f"validation: {sum(b['n'] for b in val_batches)} positions from {len(args.val_shards)} shard specs")
+    best_val = float("inf")
     model.train()
     t0 = time.time()
     positions = 0
@@ -129,10 +178,18 @@ def main():
             print(f"step {step} loss {running / args.log_every:.4f} lr {lr_at(step, args):.2e} "
                   f"pos/s {positions / dt:.0f}", flush=True)
             running = 0.0
+        if val_batches and step % args.val_every == 0:
+            v = validate(model, val_batches, args, device)
+            print(f"step {step} val_loss {v:.4f}", flush=True)
+            if v < best_val:
+                best_val = v
+                save("best")
         if step % args.save_every == 0:
             save(step)
             save("last")
     save("last")
+    if val_batches:
+        print(f"final val_loss {validate(model, val_batches, args, device):.4f} (best {best_val:.4f})")
     if args.export:
         model.eval()
         model.cpu()

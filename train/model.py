@@ -14,6 +14,7 @@ module; this file contains no mapping arithmetic.
 """
 import math
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.utils.checkpoint
@@ -59,23 +60,31 @@ class ValueNet(nn.Module):
         # Factoriser: a slot-only table added to every king square of group A,
         # folded into `a` at export (docs/DESIGN.md §9.3).
         self.p = nn.EmbeddingBag(jhbr5.NUM_SLOTS, l1, mode="sum", include_last_offset=True, sparse=sparse) if factorise else None
+        # King-relative factoriser (piece type/owner x offset from the king);
+        # the last row is a zero padding row for hand slots.
+        self.kp = nn.EmbeddingBag(jhbr5.KPREL_INPUTS, l1, mode="sum", include_last_offset=True, sparse=sparse,
+                                  padding_idx=jhbr5.KPREL_INPUTS - 1) if factorise else None
         if self.p is not None:
             nn.init.zeros_(self.p.weight)
+            nn.init.zeros_(self.kp.weight)
         self.pst = nn.EmbeddingBag(jhbr5.GROUP_B_INPUTS, 3, mode="sum", include_last_offset=True, sparse=sparse)
         nn.init.zeros_(self.pst.weight)
         self.l2 = nn.Linear(3 * l1 // 2, jhbr5.VALUE_L2)
         self.l3 = nn.Linear(jhbr5.VALUE_L2, jhbr5.VALUE_L3)
         self.l4 = nn.Linear(jhbr5.VALUE_L3, 3)
 
-    def group_a(self, idx, off):
+    def group_a(self, idx, off, kp_idx=None):
         acc = self.a(idx, off)
         if self.p is not None:
             acc = acc + self.p(idx % jhbr5.NUM_SLOTS, off)
+            if kp_idx is None:
+                kp_idx = torch.from_numpy(jhbr5.kprel_index(idx.cpu().numpy())).to(idx.device)
+            acc = acc + self.kp(kp_idx, off)
         return acc
 
     def forward(self, batch):
-        acc_us = self.group_a(batch["a_us_idx"], batch["a_us_off"])
-        acc_them = self.group_a(batch["a_them_idx"], batch["a_them_off"])
+        acc_us = self.group_a(batch["a_us_idx"], batch["a_us_off"], batch.get("a_us_kp"))
+        acc_them = self.group_a(batch["a_them_idx"], batch["a_them_off"], batch.get("a_them_kp"))
         acc_b = self.b(batch["b_idx"], batch["b_off"])
         h = torch.cat([pairwise(acc_us), pairwise(acc_them), pairwise(acc_b)], dim=1)
         x = self.l2(h)
@@ -89,6 +98,7 @@ class ValueNet(nn.Module):
         self.b.emb.weight.clamp_(-QA_CLIP, QA_CLIP)
         if self.p is not None:
             self.p.weight.clamp_(-QA_CLIP / 2, QA_CLIP / 2)
+            self.kp.weight.clamp_(-QA_CLIP / 2, QA_CLIP / 2)
         self.a.bias.clamp_(-BIAS_CLIP, BIAS_CLIP)
         self.b.bias.clamp_(-BIAS_CLIP, BIAS_CLIP)
         self.l2.weight.clamp_(-L2_CLIP, L2_CLIP)
@@ -100,6 +110,11 @@ class ValueNet(nn.Module):
         w = self.a.emb.weight.detach().clone()
         if self.p is not None:
             w = (w.view(81, jhbr5.NUM_SLOTS, self.l1) + self.p.weight.detach()[None]).reshape(-1, self.l1)
+            kp_idx = torch.from_numpy(jhbr5.kprel_index(np.arange(jhbr5.GROUP_A_INPUTS, dtype=np.int64)))
+            kp = self.kp.weight.detach()
+            for start in range(0, w.shape[0], 16384):  # chunked gather to bound memory
+                sl = slice(start, min(start + 16384, w.shape[0]))
+                w[sl] += kp[kp_idx[sl].to(kp.device)].to(w.device)
         return w.clamp(-QA_CLIP, QA_CLIP)
 
 
