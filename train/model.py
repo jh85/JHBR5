@@ -144,13 +144,19 @@ class PolicyNet(nn.Module):
         seg = batch["mv_seg"]
         buckets = batch["mv_bucket"]
         total = buckets.shape[0]
-        if not self.training or total <= self.readout_chunk:
+        if total <= self.readout_chunk:
             return self._readout(buckets, hl, seg), seg
+        # Always chunk (validation included); checkpoint only when gradients
+        # are needed so the gathered rows are recomputed in backward.
+        use_ckpt = self.training and torch.is_grad_enabled()
         parts = []
         for start in range(0, total, self.readout_chunk):
             end = min(start + self.readout_chunk, total)
-            parts.append(torch.utils.checkpoint.checkpoint(
-                self._readout, buckets[start:end], hl, seg[start:end], use_reentrant=False))
+            if use_ckpt:
+                parts.append(torch.utils.checkpoint.checkpoint(
+                    self._readout, buckets[start:end], hl, seg[start:end], use_reentrant=False))
+            else:
+                parts.append(self._readout(buckets[start:end], hl, seg[start:end]))
         return torch.cat(parts), seg
 
     @torch.no_grad()
