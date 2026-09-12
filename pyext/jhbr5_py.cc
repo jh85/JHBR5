@@ -64,7 +64,8 @@ py::array_t<T> Vec(const std::vector<T>& v) {
 class BatchReader {
  public:
   BatchReader(std::vector<std::string> paths, int batch_size, int shuffle_buffer,
-              uint64_t seed, bool require_dist, bool see, bool loop, bool move_fallback)
+              uint64_t seed, bool require_dist, bool see, bool loop, bool move_fallback,
+              int arch)
       : paths_(std::move(paths)),
         batch_size_(batch_size),
         shuffle_buffer_(std::max(shuffle_buffer, batch_size)),
@@ -72,9 +73,11 @@ class BatchReader {
         require_dist_(require_dist),
         see_(see),
         loop_(loop),
-        move_fallback_(move_fallback) {
+        move_fallback_(move_fallback),
+        arch_(arch) {
     EnsureInit();
     if (paths_.empty()) throw std::invalid_argument("no shard paths");
+    if (arch_ != 1 && arch_ != 2) throw std::invalid_argument("arch must be 1 or 2");
   }
 
   py::object Next() {
@@ -160,11 +163,12 @@ class BatchReader {
     std::vector<int64_t> a_us_kp, a_them_kp;
     std::vector<int64_t> mv_bucket, mv_off{0};
     std::vector<float> mv_visits, score(n), result(n);
-    std::vector<int32_t> ply(n), n_moves(n);
+    std::vector<int32_t> ply(n), n_moves(n), phase(n);
     std::vector<uint8_t> has_dist(n);
     nnue::FeatureList<nnue::kMaxActiveA> fa;
     nnue::FeatureList<nnue::kMaxActiveB> fb;
     nnue::FeatureList<nnue::kMaxActivePolicy> fp;
+    nnue::FeatureList<nnue::kMaxActivePolicy2> fp2;
     {
       py::gil_scoped_release release;
       ShogiBoard board;
@@ -176,23 +180,38 @@ class BatchReader {
           throw std::runtime_error("record has an undecodable packed sfen");
         }
         const lczero::Color stm = board.side_to_move();
-        nnue::GroupAFeatures(board, stm, &fa);
-        for (int f = 0; f < fa.n; ++f) {
-          a_us.push_back(fa.idx[f]);
-          a_us_kp.push_back(nnue::KPrelIndex(fa.idx[f]));
+        if (arch_ == 2) {
+          nnue::GroupA2Features(board, stm, &fa);
+          a_us.insert(a_us.end(), fa.idx, fa.idx + fa.n);
+          a_us_off.push_back(static_cast<int64_t>(a_us.size()));
+          nnue::GroupA2Features(board, ~stm, &fa);
+          a_them.insert(a_them.end(), fa.idx, fa.idx + fa.n);
+          a_them_off.push_back(static_cast<int64_t>(a_them.size()));
+          phase[i] = nnue::PhaseBucket(board);
+        } else {
+          nnue::GroupAFeatures(board, stm, &fa);
+          for (int f = 0; f < fa.n; ++f) {
+            a_us.push_back(fa.idx[f]);
+            a_us_kp.push_back(nnue::KPrelIndex(fa.idx[f]));
+          }
+          a_us_off.push_back(static_cast<int64_t>(a_us.size()));
+          nnue::GroupAFeatures(board, ~stm, &fa);
+          for (int f = 0; f < fa.n; ++f) {
+            a_them.push_back(fa.idx[f]);
+            a_them_kp.push_back(nnue::KPrelIndex(fa.idx[f]));
+          }
+          a_them_off.push_back(static_cast<int64_t>(a_them.size()));
         }
-        a_us_off.push_back(static_cast<int64_t>(a_us.size()));
-        nnue::GroupAFeatures(board, ~stm, &fa);
-        for (int f = 0; f < fa.n; ++f) {
-          a_them.push_back(fa.idx[f]);
-          a_them_kp.push_back(nnue::KPrelIndex(fa.idx[f]));
-        }
-        a_them_off.push_back(static_cast<int64_t>(a_them.size()));
         nnue::GroupBFeatures(board, &fb);
         b.insert(b.end(), fb.idx, fb.idx + fb.n);
         b_off.push_back(static_cast<int64_t>(b.size()));
-        nnue::PolicyFeatures(board, &fp);
-        p.insert(p.end(), fp.idx, fp.idx + fp.n);
+        if (arch_ == 2) {
+          nnue::Policy2Features(board, &fp2);
+          p.insert(p.end(), fp2.idx, fp2.idx + fp2.n);
+        } else {
+          nnue::PolicyFeatures(board, &fp);
+          p.insert(p.end(), fp.idx, fp.idx + fp.n);
+        }
         p_off.push_back(static_cast<int64_t>(p.size()));
 
         score[i] = static_cast<float>(r.head.score);
@@ -229,8 +248,12 @@ class BatchReader {
     d["a_us_off"] = Vec(a_us_off);
     d["a_them_idx"] = Vec(a_them);
     d["a_them_off"] = Vec(a_them_off);
-    d["a_us_kp"] = Vec(a_us_kp);
-    d["a_them_kp"] = Vec(a_them_kp);
+    if (arch_ == 1) {
+      d["a_us_kp"] = Vec(a_us_kp);
+      d["a_them_kp"] = Vec(a_them_kp);
+    } else {
+      d["phase"] = Vec(phase);
+    }
     d["b_idx"] = Vec(b);
     d["b_off"] = Vec(b_off);
     d["p_idx"] = Vec(p);
@@ -254,6 +277,7 @@ class BatchReader {
   bool see_;
   bool loop_;
   bool move_fallback_;
+  int arch_;
   std::vector<data::RecordReader> readers_;
   std::vector<bool> live_;
   size_t next_slot_ = 0;
@@ -311,8 +335,20 @@ nnue::DType DTypeOf(const py::array& a) {
 }
 
 void WriteNet(const std::string& path, int kind, const std::vector<uint32_t>& l1, int l2,
-              int l3, int qa, int qb, int q_pst, bool see, const py::dict& tensors) {
+              int l3, int qa, int qb, int q_pst, bool see, const py::dict& tensors,
+              int version, int n_phase) {
   EnsureInit();
+  if (version != 1 && version != nnue::kNetVersion2) {
+    throw std::invalid_argument("version must be 1 or 2");
+  }
+  if (version == nnue::kNetVersion2) {
+    if (kind == nnue::kNetKindValue && n_phase != nnue::kPhaseBuckets) {
+      throw std::invalid_argument("v2 value nets require n_phase == 8");
+    }
+    if (kind == nnue::kNetKindPolicy && n_phase != 0) {
+      throw std::invalid_argument("v2 policy nets require n_phase == 0");
+    }
+  }
   nnue::NetWriter w;
   std::vector<py::array> keep;  // keep contiguous copies alive until written
   for (auto item : tensors) {
@@ -329,8 +365,12 @@ void WriteNet(const std::string& path, int kind, const std::vector<uint32_t>& l1
   }
   nnue::NetHeader h{};
   h.kind = static_cast<uint32_t>(kind);
-  h.feature_set_id = nnue::FeatureSetId();
+  h.feature_set_id = version == nnue::kNetVersion2 ? nnue::FeatureSetIdV2() : nnue::FeatureSetId();
   h.bucket_table_id = kind == nnue::kNetKindPolicy ? nnue::BucketTableId(see) : 0;
+  if (version == nnue::kNetVersion2) {
+    h.version = nnue::kNetVersion2;
+    h.n_phase = static_cast<uint16_t>(n_phase);
+  }
   for (size_t k = 0; k < l1.size() && k < 4; ++k) h.l1[k] = l1[k];
   h.l2 = static_cast<uint32_t>(l2);
   h.l3 = static_cast<uint32_t>(l3);
@@ -364,11 +404,28 @@ PYBIND11_MODULE(jhbr5, m) {
   m.attr("Q_PST") = nnue::kQPst;
   m.attr("VALUE_L2") = nnue::kValueL2;
   m.attr("VALUE_L3") = nnue::kValueL3;
+  m.attr("KING_BUCKETS") = nnue::kKingBuckets;
+  m.attr("GROUP_A2_INPUTS") = nnue::kGroupA2Inputs;
+  m.attr("POLICY2_INPUTS") = nnue::kPolicy2Inputs;
+  m.attr("PHASE_BUCKETS") = nnue::kPhaseBuckets;
+  m.attr("VALUE2_L2") = nnue::kValue2L2;
+  m.attr("MAX_ACTIVE_POLICY2") = nnue::kMaxActivePolicy2;
   m.attr("NET_KIND_VALUE") = nnue::kNetKindValue;
   m.attr("NET_KIND_POLICY") = nnue::kNetKindPolicy;
   m.attr("MAX_LEGAL_MOVES") = lczero::kMaxLegalMoves;
 
   m.def("feature_set_id", [] { return nnue::FeatureSetId(); });
+  m.def("feature_set_id_v2", [] { return nnue::FeatureSetIdV2(); });
+  m.def("king_bucket", [](py::array_t<int64_t> sq) {
+    auto r = sq.unchecked<1>();
+    py::array_t<int64_t> out(r.shape(0));
+    auto o = out.mutable_unchecked<1>();
+    for (py::ssize_t i = 0; i < r.shape(0); ++i) o(i) = nnue::KingBucket(static_cast<int>(r(i)));
+    return out;
+  }, "King bucket (3x3 grid, frame coordinates) for an array of frame squares");
+  m.def("phase_bucket", [](const std::string& sfen) {
+    return nnue::PhaseBucket(BoardFromSfen(sfen));
+  }, "Material phase bucket in [0, PHASE_BUCKETS) for an sfen");
   m.def("kprel_index", [](py::array_t<int64_t> idx) {
     auto r = idx.unchecked<1>();
     py::array_t<int64_t> out(r.shape(0));
@@ -378,21 +435,35 @@ PYBIND11_MODULE(jhbr5, m) {
   }, "King-relative factoriser index for group-A feature indices (training only)");
   m.def("bucket_table_id", [](bool see) { return nnue::BucketTableId(see); }, py::arg("see") = true);
 
-  m.def("value_features", [](const std::string& sfen) {
+  m.def("value_features", [](const std::string& sfen, int arch) -> py::tuple {
     ShogiBoard b = BoardFromSfen(sfen);
     nnue::FeatureList<nnue::kMaxActiveA> a1, a2;
     nnue::FeatureList<nnue::kMaxActiveB> fb;
+    if (arch == 2) {
+      nnue::GroupA2Features(b, b.side_to_move(), &a1);
+      nnue::GroupA2Features(b, ~b.side_to_move(), &a2);
+      nnue::GroupBFeatures(b, &fb);
+      return py::make_tuple(ToArray(a1), ToArray(a2), ToArray(fb), nnue::PhaseBucket(b));
+    }
+    if (arch != 1) throw std::invalid_argument("arch must be 1 or 2");
     nnue::GroupAFeatures(b, b.side_to_move(), &a1);
     nnue::GroupAFeatures(b, ~b.side_to_move(), &a2);
     nnue::GroupBFeatures(b, &fb);
     return py::make_tuple(ToArray(a1), ToArray(a2), ToArray(fb));
-  }, "Group A (stm frame), group A (opponent frame) and group B indices for an sfen");
-  m.def("policy_features", [](const std::string& sfen) {
+  }, py::arg("sfen"), py::arg("arch") = 1,
+     "arch=1: (group A stm, group A opp, group B); arch=2: same with v2 indices, plus phase bucket");
+  m.def("policy_features", [](const std::string& sfen, int arch) {
     ShogiBoard b = BoardFromSfen(sfen);
+    if (arch == 2) {
+      nnue::FeatureList<nnue::kMaxActivePolicy2> f;
+      nnue::Policy2Features(b, &f);
+      return ToArray(f);
+    }
+    if (arch != 1) throw std::invalid_argument("arch must be 1 or 2");
     nnue::FeatureList<nnue::kMaxActivePolicy> f;
     nnue::PolicyFeatures(b, &f);
     return ToArray(f);
-  });
+  }, py::arg("sfen"), py::arg("arch") = 1);
   m.def("legal_moves", [](const std::string& sfen) {
     ShogiBoard b = BoardFromSfen(sfen);
     MoveList moves = b.GenerateLegalMoves();
@@ -430,14 +501,14 @@ PYBIND11_MODULE(jhbr5, m) {
   });
   m.def("write_net", &WriteNet, py::arg("path"), py::arg("kind"), py::arg("l1"), py::arg("l2"),
         py::arg("l3"), py::arg("qa"), py::arg("qb"), py::arg("q_pst"), py::arg("see"),
-        py::arg("tensors"),
+        py::arg("tensors"), py::arg("version") = 1, py::arg("n_phase") = 0,
         "Write a JHBR5 .nn file (header fields + dict of name -> numpy array)");
 
   py::class_<BatchReader>(m, "BatchReader")
-      .def(py::init<std::vector<std::string>, int, int, uint64_t, bool, bool, bool, bool>(),
+      .def(py::init<std::vector<std::string>, int, int, uint64_t, bool, bool, bool, bool, int>(),
            py::arg("paths"), py::arg("batch_size"), py::arg("shuffle_buffer") = 100000,
            py::arg("seed") = 1, py::arg("require_dist") = false, py::arg("see") = true,
-           py::arg("loop") = false, py::arg("move_fallback") = false)
+           py::arg("loop") = false, py::arg("move_fallback") = false, py::arg("arch") = 1)
       .def("next", &BatchReader::Next, "Next batch as a dict of numpy arrays, or None")
       .def_property_readonly("records_read", &BatchReader::records_read);
 
