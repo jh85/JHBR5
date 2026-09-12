@@ -40,6 +40,14 @@ inline void PairwiseMul(const int16_t* acc, int n, int qa, int shift,
   }
 }
 
+inline void ScreluFull(const int16_t* acc, int n, int qa, int shift,
+                       int16_t* out) {
+  for (int i = 0; i < n; ++i) {
+    const int a = std::clamp<int>(acc[i], 0, qa);
+    out[i] = static_cast<int16_t>((a * a) >> shift);
+  }
+}
+
 inline int32_t DotI16I16(const int16_t* a, const int16_t* b, int n) {
   int32_t sum = 0;
   for (int i = 0; i < n; ++i) sum += static_cast<int32_t>(a[i]) * b[i];

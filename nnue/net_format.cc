@@ -68,7 +68,9 @@ bool NetFile::Load(const std::string& path, std::string* err) {
   };
   if (std::fread(&header_, sizeof(header_), 1, f) != 1) return fail("short header");
   if (std::memcmp(header_.magic, kNetMagic, 8) != 0) return fail("bad magic");
-  if (header_.version != kNetVersion) return fail("unsupported version");
+  if (header_.version != kNetVersion && header_.version != kNetVersion2) {
+    return fail("unsupported version");
+  }
   {
     NetHeader h = header_;
     h.header_crc32c = 0;
@@ -149,7 +151,7 @@ void NetWriter::AddTensor(const char* name, DType dtype,
 bool NetWriter::Write(const std::string& path, NetHeader header,
                       std::string* err) const {
   std::memcpy(header.magic, kNetMagic, 8);
-  header.version = kNetVersion;
+  if (header.version == 0) header.version = kNetVersion;
   header.n_tensors = static_cast<uint32_t>(entries_.size());
   header.payload_bytes = payload_bytes_;
 

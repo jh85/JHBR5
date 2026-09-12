@@ -20,17 +20,23 @@ class PolicyNet {
   bool Load(const std::string& path, std::string* err);
 
   int l1() const { return l1_; }
+  int version() const { return version_; }
+  bool is_v2() const { return version_ == 2; }
   bool see_doubling() const { return see_; }
   int num_rows() const { return see_ ? kNumBucketsSee : kNumBuckets; }
 
-  const int8_t* l1_w = nullptr;   // [kPolicyInputs][l1]
+  const int8_t* l1_w = nullptr;   // v1: [kPolicyInputs][l1];  v2: [kPolicy2Inputs][l1]
   const int16_t* l1_b = nullptr;  // [l1]
-  const int8_t* out_w = nullptr;  // [num_rows][l1 / 2]
+  const int8_t* out_w = nullptr;  // v1: [num_rows][l1/2];  v2: [num_rows][l1]
   const int16_t* out_b = nullptr; // [num_rows]
 
  private:
+  bool LoadV1(const std::string& path, std::string* err);
+  bool LoadV2(const std::string& path, std::string* err);
+
   NetFile file_;
   int l1_ = 0;
+  int version_ = 0;
   bool see_ = false;
 };
 
@@ -52,9 +58,11 @@ class PolicyScratch {
  private:
   const PolicyNet* net_;
   int l1_;
+  bool v2_;
   AlignedBuffer<int16_t> acc_;  // [l1]
-  AlignedBuffer<int16_t> hl_;   // [l1 / 2]
+  AlignedBuffer<int16_t> hl_;   // v1: [l1/2]; v2: [l1]
   FeatureList<kMaxActivePolicy> feats_;
+  FeatureList<kMaxActivePolicy2> feats2_;
   uint64_t expansions_ = 0, rows_ = 0;
 };
 

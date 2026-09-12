@@ -18,6 +18,7 @@ namespace jhbr5::nnue {
 
 constexpr char kNetMagic[8] = {'J', 'H', 'B', 'R', '5', 'N', 'N', '\0'};
 constexpr uint32_t kNetVersion = 1;
+constexpr uint32_t kNetVersion2 = 2;  // v2 architecture (docs/NNUE_V2_DESIGN.md)
 constexpr uint32_t kNetKindValue = 1;
 constexpr uint32_t kNetKindPolicy = 2;
 
@@ -40,7 +41,8 @@ struct NetHeader {
   uint64_t payload_bytes;
   uint32_t payload_crc32c;
   uint32_t header_crc32c;
-  uint8_t reserved[176];
+  uint16_t n_phase;      // v2 value nets: phase buckets (8); 0 for v1 and policy
+  uint8_t reserved[174];
 };
 static_assert(sizeof(NetHeader) == 256, "NetHeader must be 256 bytes");
 
@@ -84,7 +86,8 @@ class NetWriter {
   void AddTensor(const char* name, DType dtype, std::vector<uint64_t> shape,
                  const void* data);
   // Fills n_tensors, payload_bytes and both CRCs; other header fields must be
-  // set by the caller.
+  // set by the caller. `version` may be left 0 for the v1 default (kNetVersion);
+  // v2 writers set header.version = kNetVersion2 (and n_phase) themselves.
   bool Write(const std::string& path, NetHeader header, std::string* err) const;
 
  private:

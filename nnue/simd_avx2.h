@@ -65,6 +65,19 @@ inline void PairwiseMul(const int16_t* acc, int n, int qa, int shift,
   }
 }
 
+inline void ScreluFull(const int16_t* acc, int n, int qa, int shift,
+                       int16_t* out) {
+  const __m256i zero = _mm256_setzero_si256();
+  const __m256i qav = _mm256_set1_epi16(static_cast<int16_t>(qa));
+  for (int i = 0; i < n; i += 16) {
+    __m256i a = _mm256_load_si256(reinterpret_cast<const __m256i*>(acc + i));
+    a = _mm256_min_epi16(_mm256_max_epi16(a, zero), qav);
+    __m256i p = _mm256_mullo_epi16(a, a);  // <= qa*qa = 16384, fits int16
+    if (shift) p = _mm256_srai_epi16(p, shift);
+    _mm256_store_si256(reinterpret_cast<__m256i*>(out + i), p);
+  }
+}
+
 inline int32_t HorizontalSum(__m256i v) {
   __m128i lo = _mm256_castsi256_si128(v);
   __m128i hi = _mm256_extracti128_si256(v, 1);

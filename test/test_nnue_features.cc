@@ -62,9 +62,25 @@ int main(int argc, char** argv) {
     Fail("bucket count", "");
   }
 
+  // v2: the 3x3 king-bucket grid covers 0..8 with 9 squares each and rotates
+  // with the board (bucket(80-s) == 8 - bucket(s)).
+  {
+    int count[kKingBuckets] = {};
+    for (int s = 0; s < 81; ++s) {
+      const int b = KingBucket(s);
+      if (b < 0 || b >= kKingBuckets) Fail("king bucket range", std::to_string(s));
+      if (KingBucket(80 - s) != kKingBuckets - 1 - b) Fail("king bucket flip", std::to_string(s));
+      ++count[b];
+    }
+    for (int b = 0; b < kKingBuckets; ++b) {
+      if (count[b] != 9) Fail("king bucket coverage", std::to_string(b));
+    }
+  }
+
   std::ifstream in(argv[1]);
   std::string line;
-  int positions = 0, max_b = 0, max_p = 0;
+  int positions = 0, max_b = 0, max_p = 0, max_p2 = 0;
+  long phase_hist[kPhaseBuckets] = {};
   // SEE picks the lowest-square attacker among equal piece types, which is not
   // frame invariant when two same-type pieces attack the target and x-rays
   // differ (Stockfish and Monty share this property). Such cases are counted
@@ -126,6 +142,40 @@ int main(int argc, char** argv) {
     GroupADiff(board, stm, &st, &adds, &subs);
     if (adds.n || subs.n) Fail("A diff idempotent", sfen);
 
+    // v2 group A: range/uniqueness/active-count/flip-invariance as v1.
+    FeatureList<kMaxActiveA> a2_us, a2_them, fa2_us, fa2_them;
+    GroupA2Features(board, stm, &a2_us);
+    GroupA2Features(board, ~stm, &a2_them);
+    GroupA2Features(flipped, flipped.side_to_move(), &fa2_us);
+    GroupA2Features(flipped, ~flipped.side_to_move(), &fa2_them);
+    if (!InRangeUnique(Sorted(a2_us), kGroupA2Inputs)) Fail("A2_us range", sfen);
+    if (!InRangeUnique(Sorted(a2_them), kGroupA2Inputs)) Fail("A2_them range", sfen);
+    if (Sorted(a2_us) != Sorted(fa2_us)) Fail("A2_us flip invariance", sfen);
+    if (Sorted(a2_them) != Sorted(fa2_them)) Fail("A2_them flip invariance", sfen);
+    if (a2_us.n != pieces || a2_them.n != pieces) {
+      Fail("A2 active count " + std::to_string(a2_us.n) + " vs " + std::to_string(pieces), sfen);
+    }
+    FrameState st2{};
+    FeatureList<128> adds2, subs2;
+    GroupA2Diff(board, stm, &st2, &adds2, &subs2);
+    if (subs2.n != 0 || Sorted(adds2) != Sorted(a2_us)) Fail("A2 diff==scratch", sfen);
+    GroupA2Diff(board, stm, &st2, &adds2, &subs2);
+    if (adds2.n || subs2.n) Fail("A2 diff idempotent", sfen);
+
+    // v2 policy inputs.
+    FeatureList<kMaxActivePolicy2> p2, fp2;
+    Policy2Features(board, &p2);
+    Policy2Features(flipped, &fp2);
+    max_p2 = std::max(max_p2, p2.n);
+    if (!InRangeUnique(Sorted(p2), kPolicy2Inputs)) Fail("P2 range/unique", sfen);
+    if (Sorted(p2) != Sorted(fp2)) Fail("P2 flip invariance", sfen);
+
+    // v2 material phase: bounded and color-symmetric.
+    const int ph = PhaseBucket(board);
+    if (ph < 0 || ph >= kPhaseBuckets) Fail("phase range", sfen);
+    if (PhaseBucket(flipped) != ph) Fail("phase flip invariance", sfen);
+    ++phase_hist[ph < 0 || ph >= kPhaseBuckets ? 0 : ph];
+
     // Buckets: unique over legal moves, in range, flip invariant (incl. SEE).
     MoveList moves = board.GenerateLegalMoves();
     std::vector<int> buckets;
@@ -147,7 +197,10 @@ int main(int argc, char** argv) {
     }
   }
   if (see_mismatch * 10000 > see_checked) Fail("see flip invariance rate", std::to_string(see_mismatch));
-  std::printf("test_nnue_features: %d positions, max active B=%d P=%d, see frame mismatches %ld/%ld, %s\n",
-              positions, max_b, max_p, see_mismatch, see_checked, failures ? "FAILED" : "ok");
+  std::printf("test_nnue_features: %d positions, max active B=%d P=%d P2=%d, phases [",
+              positions, max_b, max_p, max_p2);
+  for (int i = 0; i < kPhaseBuckets; ++i) std::printf("%s%ld", i ? " " : "", phase_hist[i]);
+  std::printf("], see frame mismatches %ld/%ld, %s\n",
+              see_mismatch, see_checked, failures ? "FAILED" : "ok");
   return failures ? 1 : 0;
 }

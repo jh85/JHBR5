@@ -17,6 +17,7 @@ namespace {
 
 PairTables g_pairs;
 uint32_t g_feature_set_id = 0;
+uint32_t g_feature_set_id_v2 = 0;
 uint32_t g_bucket_table_id[2] = {0, 0};
 bool g_initialized = false;
 
@@ -90,6 +91,18 @@ void Init() {
   h = Fnv1a(h, g_pairs.off, sizeof(g_pairs.off));
   g_feature_set_id = h;
 
+  uint32_t h2 = 2166136261u;
+  h2 = Fnv1a(h2, "JHBR5-FS2", 9);
+  h2 = FnvInt(h2, kNumSlots);
+  h2 = FnvInt(h2, kGroupA2Inputs);
+  h2 = FnvInt(h2, kGroupBInputs);
+  h2 = FnvInt(h2, kPolicy2Inputs);
+  h2 = FnvInt(h2, kKingBuckets);
+  h2 = FnvInt(h2, kPhaseBuckets);
+  h2 = FnvInt(h2, kThreatClasses);
+  h2 = Fnv1a(h2, g_pairs.off, sizeof(g_pairs.off));
+  g_feature_set_id_v2 = h2;
+
   for (int see = 0; see < 2; ++see) {
     uint32_t b = 2166136261u;
     b = Fnv1a(b, "JHBR5-MB1", 9);
@@ -105,6 +118,11 @@ void Init() {
 uint32_t FeatureSetId() {
   assert(g_initialized);
   return g_feature_set_id;
+}
+
+uint32_t FeatureSetIdV2() {
+  assert(g_initialized);
+  return g_feature_set_id_v2;
 }
 
 uint32_t BucketTableId(bool see_doubling) {
@@ -282,6 +300,116 @@ void PolicyFeatures(const ShogiBoard& board,
       }
     }
   }
+}
+
+// ---------------------------------------------------------------------------
+// Architecture v2 (docs/NNUE_V2_DESIGN.md). Identical slot/owner conventions
+// to v1; only the king-square row is replaced by its 3x3 bucket.
+// ---------------------------------------------------------------------------
+
+void GroupA2Features(const ShogiBoard& board, Color p,
+                     FeatureList<kMaxActiveA>* out) {
+  out->Clear();
+  const int base = KingBucket(KingFrameSq(board, p)) * kNumSlots;
+  for (Color c : {BLACK, WHITE}) {
+    const int owner = c != p;
+    for (int tid = 1; tid < kTypeIds; ++tid) {
+      Bitboard bb = board.pieces(c, TypeFromId(tid));
+      while (bb.Any()) {
+        const Square sq = bb.Pop();
+        out->Push(base + BoardSlot(owner, tid, FrameSq(p, sq)));
+      }
+    }
+    const lczero::Hand hand = board.hand(c);
+    for (int h = 0; h < kHandKinds; ++h) {
+      const int cnt = hand.Count(HandKindType(h));
+      for (int k = 1; k <= cnt; ++k) out->Push(base + HandSlot(owner, h, k));
+    }
+  }
+}
+
+void GroupA2Diff(const ShogiBoard& board, Color p, FrameState* st,
+                 FeatureList<128>* adds, FeatureList<128>* subs) {
+  adds->Clear();
+  subs->Clear();
+  const int base = KingBucket(KingFrameSq(board, p)) * kNumSlots;
+  for (Color c : {BLACK, WHITE}) {
+    const int owner = c != p;
+    for (int tid = 1; tid < kTypeIds; ++tid) {
+      const Bitboard cur = board.pieces(c, TypeFromId(tid));
+      const Bitboard old = st->pieces[owner][tid];
+      Bitboard diff = cur ^ old;
+      if (diff.Empty()) continue;
+      Bitboard removed = diff & old;
+      Bitboard added = diff & cur;
+      while (removed.Any()) {
+        const Square sq = removed.Pop();
+        subs->Push(base + BoardSlot(owner, tid, FrameSq(p, sq)));
+      }
+      while (added.Any()) {
+        const Square sq = added.Pop();
+        adds->Push(base + BoardSlot(owner, tid, FrameSq(p, sq)));
+      }
+      st->pieces[owner][tid] = cur;
+    }
+    const lczero::Hand hand = board.hand(c);
+    for (int h = 0; h < kHandKinds; ++h) {
+      const int nc = hand.Count(HandKindType(h));
+      const int oc = st->hand[owner][h];
+      for (int k = oc + 1; k <= nc; ++k) adds->Push(base + HandSlot(owner, h, k));
+      for (int k = nc + 1; k <= oc; ++k) subs->Push(base + HandSlot(owner, h, k));
+      st->hand[owner][h] = static_cast<uint8_t>(nc);
+    }
+  }
+  st->initialized = true;
+}
+
+void Policy2Features(const ShogiBoard& board,
+                     FeatureList<kMaxActivePolicy2>* out) {
+  out->Clear();
+  const Color stm = board.side_to_move();
+  const int base = KingBucket(KingFrameSq(board, stm)) * kNumSlots;
+  const Bitboard attacked = AttackedSquares(board, ~stm);
+  const Bitboard defended = AttackedSquares(board, stm);
+  for (Color c : {BLACK, WHITE}) {
+    const int owner = c != stm;
+    for (int tid = 0; tid < kTypeIds; ++tid) {  // kings included (tid 0 live)
+      Bitboard bb = board.pieces(c, TypeFromId(tid));
+      while (bb.Any()) {
+        const Square sq = bb.Pop();
+        const int fsq = FrameSq(stm, sq);
+        out->Push(base + BoardSlot(owner, tid, fsq));
+        const int flags = (attacked.Test(sq) ? 1 : 0) + (defended.Test(sq) ? 2 : 0);
+        out->Push(kGroupA2Inputs + (owner * kTypeIds + tid) * 81 + fsq +
+                  kBoardSlots * flags);
+      }
+    }
+    const lczero::Hand hand = board.hand(c);
+    for (int h = 0; h < kHandKinds; ++h) {
+      const int cnt = hand.Count(HandKindType(h));
+      for (int k = 1; k <= cnt; ++k) {
+        out->Push(base + HandSlot(owner, h, k));
+        out->Push(kGroupA2Inputs + kPolicyBoardInputs + HandSlot(owner, h, k));
+      }
+    }
+  }
+}
+
+int PhaseBucket(const ShogiBoard& board) {
+  int units = 0;
+  for (Color c : {BLACK, WHITE}) {
+    for (int tid = 1; tid < kTypeIds; ++tid) {
+      units += kPhaseUnits[tid] * board.pieces(c, TypeFromId(tid)).PopCount();
+    }
+    const lczero::Hand hand = board.hand(c);
+    for (int h = 0; h < kHandKinds; ++h) {
+      units += kPhaseUnits[h + 1] * hand.Count(HandKindType(h));
+    }
+  }
+  // Spec: max units 104 -> phase = min(units * 8 / 105, 7); the min also keeps
+  // promotion-heavy positions (units > 104) inside [0, kPhaseBuckets).
+  const int phase = units * kPhaseBuckets / 105;
+  return phase < kPhaseBuckets ? phase : kPhaseBuckets - 1;
 }
 
 }  // namespace jhbr5::nnue

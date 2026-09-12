@@ -117,6 +117,35 @@ constexpr int kPolicyInputs = kPolicyBoardInputs + kHandSlots;  // 9148
 constexpr int kMaxActivePolicy = 40 + 2 * kHandSlotsPerOwner;   // 116 (hard bound)
 
 // ---------------------------------------------------------------------------
+// Architecture v2 (docs/NNUE_V2_DESIGN.md): king-bucketed group A, full-width
+// SCReLU, phase-conditioned value head, bucketed+absolute policy inputs.
+// Everything above is v1 and MUST NOT change (v1 nets stay bit-identical).
+// ---------------------------------------------------------------------------
+// 3x3 grid over the 9x9 board in frame coordinates (file/3 x 3 + rank/3).
+constexpr int kKingBuckets = 9;
+constexpr int KingBucket(int frame_sq) {
+  return ((frame_sq / 9) / 3) * 3 + (frame_sq % 9) / 3;
+}
+static_assert(KingBucket(0) == 0 && KingBucket(80) == 8);
+
+// Group A v2: v1 formula with the king bucket in place of the exact square.
+constexpr int kGroupA2Inputs = kKingBuckets * kNumSlots;        // 21,096
+static_assert(kGroupA2Inputs == 21096);
+
+// Policy v2: bucketed slots (kings included) + v1 absolute flags + v1 hands.
+constexpr int kPolicy2Inputs =
+    kGroupA2Inputs + kPolicyBoardInputs + kHandSlots;           // 30,244
+static_assert(kPolicy2Inputs == 30244);
+constexpr int kMaxActivePolicy2 = 2 * kMaxActivePolicy;         // 232 (hard bound)
+
+// Value head v2: material phase buckets and the widened L2.
+constexpr int kPhaseBuckets = 8;
+constexpr int kValue2L2 = 32;
+// Material units per piece type id (PhaseBucket): king 0, P 1, L/N 3,
+// S/G and promoted P/L/N/S (gold class) 5, B/+B 8, R/+R 9.
+constexpr int kPhaseUnits[kTypeIds] = {0, 1, 3, 3, 5, 8, 9, 5, 5, 5, 5, 5, 8, 9};
+
+// ---------------------------------------------------------------------------
 // Move buckets (stm frame), see move_buckets.cc.
 // ---------------------------------------------------------------------------
 constexpr int kPlainBuckets = 8115;
@@ -164,7 +193,9 @@ struct FeatureList {
 void Init();
 
 // Identifiers of the compiled mappings, stored in weight-file headers.
+// FeatureSetId() is the v1 id; FeatureSetIdV2() the v2 id (docs/NNUE_V2_DESIGN.md).
 uint32_t FeatureSetId();
+uint32_t FeatureSetIdV2();
 uint32_t BucketTableId(bool see_doubling);
 
 }  // namespace jhbr5::nnue

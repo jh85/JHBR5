@@ -156,6 +156,127 @@ int main(int argc, char** argv) {
     }
   }
 
+  // 5. v2 architecture (docs/NNUE_V2_DESIGN.md): same properties on random v2 nets.
+  const std::string v2path = tmp + "/jhbr5_test_value_v2.nn";
+  const std::string p2path = tmp + "/jhbr5_test_policy_v2.nn";
+  if (!nnue::WriteRandomValueNetV2(v2path, 256, 1, &err) ||
+      !nnue::WriteRandomPolicyNetV2(p2path, 512, true, 1, &err)) {
+    std::printf("FAIL write v2 nets: %s\n", err.c_str());
+    return 1;
+  }
+  nnue::NetworkSet nets2;
+  if (!nets2.Load(v2path, p2path, &err)) {
+    std::printf("FAIL load v2 nets: %s\n", err.c_str());
+    return 1;
+  }
+
+  // 5a. Scalar vs ISA, fresh scratch each time.
+  std::vector<nnue::Wdl> ref2_wdl;
+  for (const ShogiBoard& b : boards) {
+    simd::force_scalar = true;
+    nnue::Evaluator es(nets2);
+    const nnue::Wdl ws = es.Evaluate(b);
+    MoveList moves = const_cast<ShogiBoard&>(b).GenerateLegalMoves();
+    std::vector<float> ls(moves.size()), lv(moves.size());
+    es.Policy(b, moves, ls.data());
+    simd::force_scalar = false;
+    nnue::Evaluator ev(nets2);
+    const nnue::Wdl wv = ev.Evaluate(b);
+    ev.Policy(b, moves, lv.data());
+    if (!SameWdl(ws, wv)) Fail("v2 scalar/isa wdl", b.ToSfen());
+    if (std::memcmp(ls.data(), lv.data(), moves.size() * sizeof(float)) != 0) Fail("v2 scalar/isa policy", b.ToSfen());
+    const float sum = wv.win + wv.draw + wv.loss;
+    if (!(std::fabs(sum - 1.0f) < 1e-5f) || wv.win < 0 || wv.draw < 0 || wv.loss < 0) Fail("v2 wdl distribution", b.ToSfen());
+    ref2_wdl.push_back(wv);
+  }
+
+  // 5b. Finny caching along random walks == fresh evaluation at every step.
+  {
+    nnue::Evaluator cached(nets2);
+    Rng rng{7};
+    int steps = 0;
+    for (ShogiBoard b : boards) {
+      for (int ply = 0; ply < 12; ++ply) {
+        const nnue::Wdl wc = cached.Evaluate(b);
+        nnue::Evaluator fresh(nets2);
+        const nnue::Wdl wf = fresh.Evaluate(b);
+        if (!SameWdl(wc, wf)) Fail("v2 finny == scratch", b.ToSfen());
+        ++steps;
+        MoveList moves = b.GenerateLegalMoves();
+        if (moves.empty()) break;
+        b.DoMove(moves[static_cast<int>(rng.Next() % moves.size())]);
+      }
+    }
+    std::printf("v2 finny walk: %d evaluations, %.1f A-rows/eval, %.1f B-rows/eval\n", steps,
+                static_cast<double>(cached.value().rows_a()) / steps,
+                static_cast<double>(cached.value().rows_b()) / steps);
+  }
+
+  // 5c. King moves within and across buckets: finny == fresh at every step.
+  {
+    nnue::Evaluator cached(nets2);
+    ShogiBoard b;
+    b.SetFromSfen("4k4/9/9/9/4K4/9/9/9/9 b - 1");
+    int bucket_changes = 0, steps = 0;
+    for (int ply = 0; ply < 16; ++ply) {
+      const nnue::Wdl wc = cached.Evaluate(b);
+      nnue::Evaluator fresh(nets2);
+      if (!SameWdl(wc, fresh.Evaluate(b))) Fail("v2 finny == fresh (king walk)", b.ToSfen());
+      ++steps;
+      const int before = nnue::KingBucket(nnue::KingFrameSq(b, b.side_to_move()));
+      MoveList moves = b.GenerateLegalMoves();
+      if (moves.empty()) break;
+      // Directed stroll towards square 0: crosses 3x3 grid lines on the way.
+      int best = 0;
+      for (int i = 1; i < moves.size(); ++i) {
+        if (moves[i].to().as_idx() < moves[best].to().as_idx()) best = i;
+      }
+      b.DoMove(moves[best]);
+      if (nnue::KingBucket(nnue::KingFrameSq(b, b.side_to_move())) != before) ++bucket_changes;
+    }
+    if (steps == 0 || bucket_changes == 0) Fail("v2 king walk coverage", std::to_string(bucket_changes));
+    std::printf("v2 king walk: %d evaluations, %d bucket changes\n", steps, bucket_changes);
+  }
+
+  // 5d. Determinism across repeated evaluation with the same scratch.
+  {
+    nnue::Evaluator ev(nets2);
+    for (size_t i = 0; i < boards.size(); ++i) {
+      ev.Evaluate(boards[i]);
+      if (!SameWdl(ev.Evaluate(boards[i]), ref2_wdl[i])) Fail("v2 determinism", boards[i].ToSfen());
+    }
+  }
+
+  // 5e. v1 and v2 networks coexist: interleaved evaluation stays deterministic.
+  {
+    nnue::Evaluator ev1(nets), ev2(nets2);
+    for (size_t i = 0; i < boards.size(); ++i) {
+      if (!SameWdl(ev2.Evaluate(boards[i]), ref2_wdl[i])) Fail("v2 interleaved", boards[i].ToSfen());
+      if (!SameWdl(ev1.Evaluate(boards[i]), ref_wdl[i])) Fail("v1 interleaved", boards[i].ToSfen());
+    }
+  }
+
+  // 5f. v2 regression values (seed 1, L1 256/512, start position).
+  {
+    struct Exp { const char* sfen; float w, d, l; };
+    static const Exp kExpected2[] = {
+        {"lnsgkgsnl/1r5b1/ppppppppp/9/9/9/PPPPPPPPP/1B5R1/LNSGKGSNL b - 1", 0.328225f, 0.363114f, 0.308661f},
+    };
+    nnue::Evaluator ev(nets2);
+    for (const Exp& e : kExpected2) {
+      ShogiBoard b;
+      b.SetFromSfen(e.sfen);
+      const nnue::Wdl w = ev.Evaluate(b);
+      std::printf("v2 regression %s -> W %.6f D %.6f L %.6f\n", e.sfen, w.win, w.draw, w.loss);
+      if (e.w >= 0 && (std::fabs(w.win - e.w) > 1e-5f || std::fabs(w.draw - e.d) > 1e-5f ||
+                       std::fabs(w.loss - e.l) > 1e-5f)) {
+        Fail("v2 regression value", e.sfen);
+      }
+    }
+  }
+
+  std::remove(v2path.c_str());
+  std::remove(p2path.c_str());
   std::remove(vpath.c_str());
   std::remove(ppath.c_str());
   std::printf("test_nnue_net backend=%s: %zu positions, %s\n", simd::BackendName(), boards.size(),

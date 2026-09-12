@@ -67,6 +67,13 @@ inline void PairwiseMul(const int16_t* acc, int n, int qa, int shift,
   JHBR5_SIMD_NS::PairwiseMul(acc, n, qa, shift, out);
 }
 
+// out[i] = clamp(acc[i],0,qa)^2 >> shift, i < n (full-width SCReLU, v2)
+inline void ScreluFull(const int16_t* acc, int n, int qa, int shift,
+                       int16_t* out) {
+  if (force_scalar) return scalar::ScreluFull(acc, n, qa, shift, out);
+  JHBR5_SIMD_NS::ScreluFull(acc, n, qa, shift, out);
+}
+
 // sum_i a[i]*b[i] as int32 (no overflow protection: callers size the scales)
 inline int32_t DotI16I16(const int16_t* a, const int16_t* b, int n) {
   if (force_scalar) return scalar::DotI16I16(a, b, n);

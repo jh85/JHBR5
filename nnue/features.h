@@ -54,6 +54,31 @@ void GroupBFeatures(const ShogiBoard& board, FeatureList<kMaxActiveB>* out);
 void PolicyFeatures(const ShogiBoard& board,
                     FeatureList<kMaxActivePolicy>* out);
 
+// ---------------------------------------------------------------------------
+// Architecture v2 (docs/NNUE_V2_DESIGN.md). Same frames and slot tables as v1.
+// ---------------------------------------------------------------------------
+
+// Group A v2, from scratch: v1 with KingBucket(king frame square) in place of
+// the exact king square (kingless positions use bucket 0, as v1 uses row 0).
+void GroupA2Features(const ShogiBoard& board, Color p,
+                     FeatureList<kMaxActiveA>* out);
+
+// Group A v2 as a diff against `st` (the caller guarantees `st` belongs to the
+// current king bucket).
+void GroupA2Diff(const ShogiBoard& board, Color p, FrameState* st,
+                 FeatureList<128>* adds, FeatureList<128>* subs);
+
+// Policy v2 inputs (frame = side to move), three concatenated ranges:
+//   [0, kGroupA2Inputs)                  bucketed slots, kings included
+//   [kGroupA2Inputs, +kBoardSlots*4)     v1 absolute flag features verbatim
+//   [+kBoardSlots*4, kPolicy2Inputs)     v1 absolute hand slots verbatim
+void Policy2Features(const ShogiBoard& board,
+                     FeatureList<kMaxActivePolicy2>* out);
+
+// Material phase bucket in [0, kPhaseBuckets): color-symmetric unit sum over
+// board and hands, phase = min(units * kPhaseBuckets / 105, kPhaseBuckets - 1).
+int PhaseBucket(const ShogiBoard& board);
+
 // Squares attacked by at least one piece of colour c (current occupancy).
 Bitboard AttackedSquares(const ShogiBoard& board, Color c);
 

@@ -36,6 +36,7 @@ void RunCase(int n, int seed) {
   const int rows = 64;
   nnue::AlignedBuffer<int8_t> base(static_cast<size_t>(rows) * n);
   nnue::AlignedBuffer<int16_t> bias(n), acc_s(n), acc_v(n), out_s(n / 2), out_v(n / 2), b16(n);
+  nnue::AlignedBuffer<int16_t> full_s(n), full_v(n);
   for (size_t i = 0; i < base.size(); ++i) base[i] = static_cast<int8_t>(rng.Int(-128, 127));
   for (int i = 0; i < n; ++i) {
     bias[i] = static_cast<int16_t>(rng.Int(-2000, 2000));
@@ -59,6 +60,12 @@ void RunCase(int n, int seed) {
     simd::force_scalar = false;
     simd::PairwiseMul(acc_s.data(), n, 128, shift, out_v.data());
     Check(std::memcmp(out_s.data(), out_v.data(), n) == 0, "PairwiseMul", n, seed);
+
+    simd::force_scalar = true;
+    simd::ScreluFull(acc_s.data(), n, 128, shift, full_s.data());
+    simd::force_scalar = false;
+    simd::ScreluFull(acc_s.data(), n, 128, shift, full_v.data());
+    Check(std::memcmp(full_s.data(), full_v.data(), n * 2) == 0, "ScreluFull", n, seed);
   }
 
   simd::force_scalar = true;
