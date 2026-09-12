@@ -9,6 +9,15 @@ Real-valued semantics that the engine's integer pipeline reproduces
           softmax(z) -> (W, D, L)
   policy: hl = pairwise(W_p[active] + b_p);  logit(m) = out_w[bucket(m)] . hl + out_b[bucket(m)]
 
+Architecture v2 (docs/NNUE_V2_DESIGN.md, selected per net by --arch v2):
+
+  value:  group A rows are king-bucketed (no factorisers); activation is the
+          full-width screlu; residual L3; L4 conditioned on the material phase
+          bucket that arrives as batch['phase']:
+          act_g = clamp(acc_g,0,1)^2 (full width); y1 = screlu(L2(cat(act)));
+          h = y1 + screlu(L3(y1)); z = L4_w[phase] @ h + L4_b[phase] + pst[active_b]
+  policy: v2 input mapping; hl = clamp(acc,0,1)^2 (full width); readout unchanged
+
 Every feature index and move bucket comes from the engine through the `jhbr5`
 module; this file contains no mapping arithmetic.
 """
@@ -118,6 +127,46 @@ class ValueNet(nn.Module):
         return w.clamp(-QA_CLIP, QA_CLIP)
 
 
+class ValueNetV2(nn.Module):
+    """v2 value net (docs/NNUE_V2_DESIGN.md §2): king-bucketed group A (no
+    factorisers), full-width screlu, residual L3, phase-conditioned L4."""
+
+    def __init__(self, l1=1024, sparse=False):
+        super().__init__()
+        self.l1 = l1
+        self.a = SparseGroup(jhbr5.GROUP_A2_INPUTS, l1, 38, sparse)
+        self.b = SparseGroup(jhbr5.GROUP_B_INPUTS, l1, 100, sparse)
+        self.pst = nn.EmbeddingBag(jhbr5.GROUP_B_INPUTS, 3, mode="sum", include_last_offset=True, sparse=sparse)
+        nn.init.zeros_(self.pst.weight)
+        self.l2 = nn.Linear(3 * l1, jhbr5.VALUE2_L2)
+        self.l3 = nn.Linear(jhbr5.VALUE2_L2, jhbr5.VALUE_L3)
+        self.l4_w = nn.Parameter(torch.empty(jhbr5.PHASE_BUCKETS, 3, jhbr5.VALUE_L3))
+        self.l4_b = nn.Parameter(torch.empty(jhbr5.PHASE_BUCKETS, 3))
+        bound = 1.0 / math.sqrt(jhbr5.VALUE_L3)  # nn.Linear default init, per phase slice
+        nn.init.uniform_(self.l4_w, -bound, bound)
+        nn.init.uniform_(self.l4_b, -bound, bound)
+
+    def forward(self, batch):
+        acc_us = self.a(batch["a_us_idx"], batch["a_us_off"])
+        acc_them = self.a(batch["a_them_idx"], batch["a_them_off"])
+        acc_b = self.b(batch["b_idx"], batch["b_off"])
+        act = torch.cat([screlu(acc_us), screlu(acc_them), screlu(acc_b)], dim=1)
+        y1 = screlu(self.l2(act))
+        h = y1 + screlu(self.l3(y1))
+        phase = batch["phase"].long()
+        z = (self.l4_w[phase] @ h.unsqueeze(2)).squeeze(2) + self.l4_b[phase]
+        return z + self.pst(batch["b_idx"], batch["b_off"])  # logits in order W, D, L
+
+    @torch.no_grad()
+    def clip_weights(self):
+        self.a.emb.weight.clamp_(-QA_CLIP, QA_CLIP)
+        self.b.emb.weight.clamp_(-QA_CLIP, QA_CLIP)
+        self.a.bias.clamp_(-BIAS_CLIP, BIAS_CLIP)
+        self.b.bias.clamp_(-BIAS_CLIP, BIAS_CLIP)
+        self.l2.weight.clamp_(-L2_CLIP, L2_CLIP)
+        self.l2.bias.clamp_(-L2_CLIP, L2_CLIP)
+
+
 class PolicyNet(nn.Module):
     def __init__(self, l1=4096, see=True, sparse=False):
         super().__init__()
@@ -141,6 +190,58 @@ class PolicyNet(nn.Module):
     def forward(self, batch):
         """Returns flat logits over all legal moves of the batch and the segment id per move."""
         hl = pairwise(self.hidden(batch["p_idx"], batch["p_off"]))
+        seg = batch["mv_seg"]
+        buckets = batch["mv_bucket"]
+        total = buckets.shape[0]
+        if total <= self.readout_chunk:
+            return self._readout(buckets, hl, seg), seg
+        # Always chunk (validation included); checkpoint only when gradients
+        # are needed so the gathered rows are recomputed in backward.
+        use_ckpt = self.training and torch.is_grad_enabled()
+        parts = []
+        for start in range(0, total, self.readout_chunk):
+            end = min(start + self.readout_chunk, total)
+            if use_ckpt:
+                parts.append(torch.utils.checkpoint.checkpoint(
+                    self._readout, buckets[start:end], hl, seg[start:end], use_reentrant=False))
+            else:
+                parts.append(self._readout(buckets[start:end], hl, seg[start:end]))
+        return torch.cat(parts), seg
+
+    @torch.no_grad()
+    def clip_weights(self):
+        self.hidden.emb.weight.clamp_(-QA_CLIP, QA_CLIP)
+        self.hidden.bias.clamp_(-BIAS_CLIP, BIAS_CLIP)
+        self.out_w.weight.clamp_(-QA_CLIP, QA_CLIP)
+        self.out_b.weight.clamp_(-POLICY_OUT_BIAS_CLIP, POLICY_OUT_BIAS_CLIP)
+
+
+class PolicyNetV2(nn.Module):
+    """v2 policy net (docs/NNUE_V2_DESIGN.md §3): v2 input mapping, full-width
+    screlu hidden layer, full-width bucket readout."""
+
+    def __init__(self, l1=4096, see=True, sparse=False):
+        super().__init__()
+        self.l1 = l1
+        self.see = see
+        self.rows = jhbr5.NUM_BUCKETS_SEE if see else jhbr5.NUM_BUCKETS
+        self.hidden = SparseGroup(jhbr5.POLICY2_INPUTS, l1, 95, sparse)
+        self.out_w = nn.Embedding(self.rows, l1, sparse=sparse)
+        self.out_b = nn.Embedding(self.rows, 1, sparse=sparse)
+        nn.init.uniform_(self.out_w.weight, -1.0 / math.sqrt(l1), 1.0 / math.sqrt(l1))
+        nn.init.zeros_(self.out_b.weight)
+
+    # Moves per checkpointed chunk of the readout. The gathered rows
+    # (chunk x l1 floats) are recomputed in backward, so peak memory is
+    # bounded by the chunk instead of batch x legal moves.
+    readout_chunk = 32768
+
+    def _readout(self, buckets, hl, seg):
+        return (self.out_w(buckets) * hl[seg]).sum(dim=1) + self.out_b(buckets).squeeze(1)
+
+    def forward(self, batch):
+        """Returns flat logits over all legal moves of the batch and the segment id per move."""
+        hl = screlu(self.hidden(batch["p_idx"], batch["p_off"]))
         seg = batch["mv_seg"]
         buckets = batch["mv_bucket"]
         total = buckets.shape[0]

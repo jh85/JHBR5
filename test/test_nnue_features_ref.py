@@ -24,6 +24,13 @@ GROUP_A = 81 * NUM_SLOTS
 GROUP_B = NUM_SLOTS + 2 * PAIRS_PER_OWNER * THREAT_CLASSES
 POLICY_BOARD = 2 * 14 * 81 * 4
 POLICY_INPUTS = POLICY_BOARD + 76
+KING_BUCKETS = 9
+PHASE_BUCKETS = 8
+GROUP_A2 = KING_BUCKETS * NUM_SLOTS
+POLICY2 = GROUP_A2 + POLICY_BOARD + 76
+# Material phase units per piece idx (promoted = idx | 8); kings contribute 0.
+PHASE_UNITS = {1: 1, 2: 3, 3: 3, 4: 5, 5: 8, 6: 9, 7: 5, 8: 0,
+               9: 5, 10: 5, 11: 5, 12: 5, 13: 8, 14: 9}
 NUM_BUCKETS = 10043
 SEE_THRESHOLD = -90
 CLS = {0: 7, 1: 0, 2: 1, 3: 2, 4: 3, 5: 5, 6: 6, 7: 4, 8: 4, 9: 4, 10: 4, 11: 4, 12: 5, 13: 6}
@@ -169,6 +176,15 @@ def feature_set_id():
     return fnv1a(h, flat)
 
 
+def feature_set_id_v2():
+    h = 2166136261
+    h = fnv1a(h, b"JHBR5-FS2")
+    for v in (NUM_SLOTS, GROUP_A2, GROUP_B, POLICY2, KING_BUCKETS, PHASE_BUCKETS, THREAT_CLASSES):
+        h = fnv1a(h, struct.pack("<i", v))
+    flat = b"".join(struct.pack("<i", T["off"][t][s]) for t in range(14) for s in range(81))
+    return fnv1a(h, flat)
+
+
 # --- position ----------------------------------------------------------------
 class Pos:
     def __init__(self, sfen):
@@ -237,6 +253,51 @@ def group_a(pos, p):
     return sorted(out)
 
 
+def king_bucket(fs):
+    return ((fs // 9) // 3) * 3 + (fs % 9) // 3
+
+
+def group_a2(pos, p):
+    base = king_bucket(frame_sq(p, pos.king[p]) if p in pos.king else 0) * NUM_SLOTS
+    out = []
+    for s, (c, idx) in pos.board.items():
+        if idx == 8:
+            continue
+        out.append(base + slot(int(c != p), tid(idx), frame_sq(p, s)))
+    for c in (BLACK, WHITE):
+        for h in range(7):
+            for k in range(1, pos.hand[c][h] + 1):
+                out.append(base + hand_slot(int(c != p), h, k))
+    return sorted(out)
+
+
+def policy2(pos):
+    stm = pos.stm
+    base = king_bucket(frame_sq(stm, pos.king[stm]) if stm in pos.king else 0) * NUM_SLOTS
+    att = pos.attacked_by(1 - stm)
+    dfd = pos.attacked_by(stm)
+    out = []
+    for s, (c, idx) in pos.board.items():  # kings included (tid 0 live)
+        fsq = frame_sq(stm, s)
+        out.append(base + slot(int(c != stm), tid(idx), fsq))
+        flags = (1 if s in att else 0) + (2 if s in dfd else 0)
+        out.append(GROUP_A2 + (int(c != stm) * 14 + tid(idx)) * 81 + fsq + 2268 * flags)
+    for c in (BLACK, WHITE):
+        for h in range(7):
+            for k in range(1, pos.hand[c][h] + 1):
+                out.append(base + hand_slot(int(c != stm), h, k))
+                out.append(GROUP_A2 + POLICY_BOARD + hand_slot(int(c != stm), h, k))
+    return sorted(out)
+
+
+def phase(pos):
+    units = sum(PHASE_UNITS[idx] for _c, idx in pos.board.values())
+    for c in (BLACK, WHITE):
+        for h in range(7):
+            units += PHASE_UNITS[h + 1] * pos.hand[c][h]
+    return min(units * PHASE_BUCKETS // 105, PHASE_BUCKETS - 1)
+
+
 def group_b(pos):
     stm = pos.stm
     out = []
@@ -291,21 +352,29 @@ def bucket(pos, usi):
     return T["plain_off"][t][frm] + rank_in(T["plain"][t][frm], to)
 
 
-def main():
-    binary, sfens = sys.argv[1], sys.argv[2]
-    out = subprocess.run([binary, sfens], capture_output=True, text=True, check=True).stdout
+def check_arch(binary, sfens, v2):
+    cmd = [binary, sfens] + (["--arch", "2"] if v2 else [])
+    out = subprocess.run(cmd, capture_output=True, text=True, check=True).stdout
     lines = out.splitlines()
-    fs = int(lines[0].split()[1])
     fails = 0
+    fs = int(lines[0].split()[1])
     if fs != feature_set_id():
         print(f"FAIL feature set id: engine {fs} reference {feature_set_id()}")
         fails += 1
-    i, positions = 1, 0
+    i = 1
+    if v2:
+        fs2 = int(lines[1].split()[1])
+        if fs2 != feature_set_id_v2():
+            print(f"FAIL feature set id v2: engine {fs2} reference {feature_set_id_v2()}")
+            fails += 1
+        i = 2
+    positions = 0
     while i < len(lines):
         assert lines[i].startswith("S ")
         sfen = lines[i][2:]
         pos = Pos(sfen)
         got = {}
+        phase_got = None
         i += 1
         moves = []
         while lines[i] != "E":
@@ -313,30 +382,51 @@ def main():
             if tag == "M":
                 _, usi, bk, _see = lines[i].split()
                 moves.append((usi, int(bk)))
+            elif tag == "PH":
+                phase_got = int(lines[i].split()[1])
             else:
                 vals = [int(x) for x in lines[i].split()[2:]]
                 got[tag] = sorted(vals)
             i += 1
         i += 1
         positions += 1
-        exp = {
-            "A_us": group_a(pos, pos.stm),
-            "A_them": group_a(pos, 1 - pos.stm),
-            "B": group_b(pos),
-            "P": policy(pos),
-        }
+        if v2:
+            exp = {
+                "A2_us": group_a2(pos, pos.stm),
+                "A2_them": group_a2(pos, 1 - pos.stm),
+                "B": group_b(pos),
+                "P2": policy2(pos),
+            }
+        else:
+            exp = {
+                "A_us": group_a(pos, pos.stm),
+                "A_them": group_a(pos, 1 - pos.stm),
+                "B": group_b(pos),
+                "P": policy(pos),
+            }
         for k, v in exp.items():
             if got[k] != v:
                 fails += 1
                 if fails < 10:
                     print(f"FAIL {k} {sfen}\n  engine {got[k]}\n  ref    {v}")
+        if v2 and phase_got != phase(pos):
+            fails += 1
+            if fails < 10:
+                print(f"FAIL PH {sfen}: engine {phase_got} ref {phase(pos)}")
         for usi, bk in moves:
             rb = bucket(pos, usi)
             if rb != bk:
                 fails += 1
                 if fails < 10:
                     print(f"FAIL bucket {sfen} {usi}: engine {bk} ref {rb}")
-    print(f"test_nnue_features_ref: {positions} positions, {'FAILED' if fails else 'ok'}")
+    print(f"  arch {'2' if v2 else '1'}: {positions} positions, {'FAILED' if fails else 'ok'}")
+    return fails
+
+
+def main():
+    binary, sfens = sys.argv[1], sys.argv[2]
+    fails = check_arch(binary, sfens, v2=False) + check_arch(binary, sfens, v2=True)
+    print(f"test_nnue_features_ref: {'FAILED' if fails else 'ok'}")
     sys.exit(1 if fails else 0)
 
 

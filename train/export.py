@@ -10,8 +10,9 @@ import numpy as np
 import torch
 
 import jhbr5
-from model import PolicyNet, ValueNet
-from quantized import calibrate_qb, quantize_policy, quantize_value
+from model import PolicyNet, PolicyNetV2, ValueNet, ValueNetV2
+from quantized import (calibrate_qb, calibrate_qb_v2, quantize_policy, quantize_policy_v2,
+                       quantize_value, quantize_value_v2)
 
 DEFAULT_CALIB = [
     "lnsgkgsnl/1r5b1/ppppppppp/9/9/9/PPPPPPPPP/1B5R1/LNSGKGSNL b - 1",
@@ -25,10 +26,11 @@ DEFAULT_CALIB = [
 
 def load_checkpoint(path):
     ck = torch.load(path, map_location="cpu")
+    v2 = ck.get("arch", "v1") == "v2"
     if ck["net"] == "value":
-        model = ValueNet(ck["l1"], factorise=ck.get("factorise", True))
+        model = ValueNetV2(ck["l1"]) if v2 else ValueNet(ck["l1"], factorise=ck.get("factorise", True))
     else:
-        model = PolicyNet(ck["l1"], see=ck.get("see", True))
+        model = PolicyNetV2(ck["l1"], see=ck.get("see", True)) if v2 else PolicyNet(ck["l1"], see=ck.get("see", True))
     model.load_state_dict(ck["state_dict"])
     model.eval()
     return ck, model
@@ -49,24 +51,43 @@ def export_policy(model, out_path):
                     jhbr5.QA, jhbr5.POLICY_QB, jhbr5.Q_PST, model.see, t)
 
 
+def export_value_v2(model, out_path, calib_sfens, max_qb=1024):
+    feats = [jhbr5.value_features(s, arch=2) for s in calib_sfens]
+    qb = calibrate_qb_v2(model, feats, max_qb=max_qb)
+    t = quantize_value_v2(model, qb)
+    jhbr5.write_net(out_path, jhbr5.NET_KIND_VALUE, [model.l1, model.l1, model.l1, 0],
+                    jhbr5.VALUE2_L2, jhbr5.VALUE_L3, jhbr5.QA, qb, jhbr5.Q_PST, False, t,
+                    version=2, n_phase=jhbr5.PHASE_BUCKETS)
+    return qb
+
+
+def export_policy_v2(model, out_path):
+    t = quantize_policy_v2(model)
+    jhbr5.write_net(out_path, jhbr5.NET_KIND_POLICY, [model.l1, 0, 0, 0], 0, 0,
+                    jhbr5.QA, jhbr5.POLICY_QB, jhbr5.Q_PST, model.see, t, version=2, n_phase=0)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--checkpoint", required=True)
     ap.add_argument("--out", required=True)
+    ap.add_argument("--arch", choices=["v1", "v2"], default=None,
+                    help="default: read from the checkpoint (v1 for older checkpoints)")
     ap.add_argument("--calib-sfens", help="file of sfens for QB calibration (value nets)")
     ap.add_argument("--max-qb", type=int, default=1024)
     args = ap.parse_args()
     ck, model = load_checkpoint(args.checkpoint)
+    v2 = (args.arch or ck.get("arch", "v1")) == "v2"
     if ck["net"] == "value":
         sfens = DEFAULT_CALIB
         if args.calib_sfens:
             with open(args.calib_sfens) as f:
                 sfens = [l.split("\t")[0].strip() for l in f if l.strip()][:4096]
-        qb = export_value(model, args.out, sfens, args.max_qb)
-        print(f"wrote {args.out}: value l1={model.l1} qb={qb}")
+        qb = (export_value_v2 if v2 else export_value)(model, args.out, sfens, args.max_qb)
+        print(f"wrote {args.out}: value l1={model.l1} qb={qb} arch={'v2' if v2 else 'v1'}")
     else:
-        export_policy(model, args.out)
-        print(f"wrote {args.out}: policy l1={model.l1} see={model.see} rows={model.rows}")
+        (export_policy_v2 if v2 else export_policy)(model, args.out)
+        print(f"wrote {args.out}: policy l1={model.l1} see={model.see} rows={model.rows} arch={'v2' if v2 else 'v1'}")
 
 
 if __name__ == "__main__":

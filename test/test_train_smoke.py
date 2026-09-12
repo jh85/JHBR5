@@ -49,19 +49,25 @@ env = dict(os.environ, PYTHONPATH=args.build + os.pathsep + os.environ.get("PYTH
 out = os.path.join(args.tmp, "jhbr5_smoke_run")
 common = ["--shards", shard, "--batch-size", "64", "--steps", "6", "--workers", "0", "--device", "cpu",
           "--out", out, "--log-every", "3", "--save-every", "1000", "--shuffle-buffer", "256"]
-for net, l1, nn in [("value", "256", "smoke_value.nn"), ("policy", "512", "smoke_policy.nn")]:
-    r = subprocess.run([sys.executable, os.path.join(train_dir, "train.py"), "--net", net, "--l1", l1,
-                        "--export", os.path.join(args.tmp, nn)] + common, env=env, capture_output=True, text=True)
+runs = [("value", "v1", "256", "smoke_value.nn"), ("policy", "v1", "512", "smoke_policy.nn"),
+        ("value", "v2", "256", "smoke_value2.nn"), ("policy", "v2", "512", "smoke_policy2.nn")]
+for net, arch, l1, nn in runs:
+    r = subprocess.run([sys.executable, os.path.join(train_dir, "train.py"), "--net", net, "--arch", arch,
+                        "--l1", l1, "--export", os.path.join(args.tmp, nn)] + common,
+                       env=env, capture_output=True, text=True)
     print(r.stdout[-800:])
     if r.returncode != 0:
         print(r.stderr[-2000:])
-        print("FAIL train", net)
+        print("FAIL train", net, arch)
         sys.exit(1)
-r = subprocess.run([args.eval, os.path.join(args.tmp, "smoke_value.nn"), os.path.join(args.tmp, "smoke_policy.nn"),
-                    args.sfens], capture_output=True, text=True)
-ok = r.returncode == 0 and r.stdout.count("\nE\n") >= 50
-print("test_train_smoke:", "ok" if ok else f"FAILED ({r.stderr[-500:]})")
-for f in [shard, os.path.join(args.tmp, "smoke_value.nn"), os.path.join(args.tmp, "smoke_policy.nn")]:
+ok = True
+for arch, vnn, pnn in [("v1", "smoke_value.nn", "smoke_policy.nn"), ("v2", "smoke_value2.nn", "smoke_policy2.nn")]:
+    r = subprocess.run([args.eval, os.path.join(args.tmp, vnn), os.path.join(args.tmp, pnn),
+                        args.sfens], capture_output=True, text=True)
+    good = r.returncode == 0 and r.stdout.count("\nE\n") >= 50
+    print(f"test_train_smoke arch {arch}:", "ok" if good else f"FAILED ({r.stderr[-500:]})")
+    ok = ok and good
+for f in [shard] + [os.path.join(args.tmp, nn) for _n, _a, _l, nn in runs]:
     if os.path.exists(f):
         os.remove(f)
 sys.exit(0 if ok else 1)

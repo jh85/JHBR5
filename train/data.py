@@ -37,7 +37,8 @@ def to_tensors(b, device=None):
 
 class RecordDataset(IterableDataset):
     def __init__(self, shards, batch_size, shuffle_buffer=100000, seed=1,
-                 require_dist=False, see=True, loop=True, move_fallback=False):
+                 require_dist=False, see=True, loop=True, move_fallback=False,
+                 arch=1):
         super().__init__()
         self.paths = expand_shards(shards)
         if not self.paths:
@@ -49,6 +50,7 @@ class RecordDataset(IterableDataset):
         self.see = see
         self.loop = loop
         self.move_fallback = move_fallback
+        self.arch = arch
 
     def __iter__(self):
         info = get_worker_info()
@@ -56,7 +58,7 @@ class RecordDataset(IterableDataset):
         paths = self.paths[wid::nw] if nw <= len(self.paths) else self.paths
         reader = jhbr5.BatchReader(paths, self.batch_size, self.shuffle_buffer,
                                    self.seed + 1000 * wid, self.require_dist, self.see, self.loop,
-                                   self.move_fallback)
+                                   self.move_fallback, self.arch)
         while True:
             b = reader.next()
             if b is None:
