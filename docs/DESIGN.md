@@ -811,3 +811,50 @@ reproducible.
 * Value-only eval cache; policy never cached.
 * `move16` in records; in-engine threaded datagen rather than processes.
 * Removing the MLH head and all TensorRT/ONNX/encoder code in Phase 1.
+
+## 16. NNUE v2 (implemented, branch `nnue-v2`)
+
+Motivation: v1 saturated in training — validation loss and SPRT were both flat
+across width, init and data-mix probes (`runs/dist1/FINAL_REPORT.md` §4) — so
+the ceiling is feature expressiveness, not capacity or training length. v2 is
+an additional architecture selected per net file by `NetHeader.version == 2`;
+v1 nets load and evaluate bit-identically and `--arch v1` stays the training
+default. The authoritative spec is `docs/NNUE_V2_DESIGN.md`; the format deltas
+are in `docs/NNUE_FORMAT.md` "Version 2". The four changes:
+
+1. **King-bucketed group A.** The exact-king-square (81-row) group A is
+   replaced by 9 king buckets (a 3×3 grid over the board in frame
+   coordinates): `index = KingBucket(k)·2344 + slot`, one shared table, 21,096
+   inputs (9× smaller than v1's 189,864 and strictly more expressive than the
+   factorised v1 table). The finny cache keys on the bucket, so king moves
+   inside a bucket need no refresh (9× higher hit rate).
+2. **Full-width SCReLU at L1.** `act[i] = clamp(acc[i],0,128)²` over the whole
+   accumulator instead of pairwise-mul halving: activation width 3·L1 (was
+   3·L1/2), same int16 range (max 128² = 16,384), negligible cost.
+3. **Residual, phase-conditioned value head.** L2 widened 16 → 32; L3 32 → 32
+   with a residual add (`h = y1 + screlu(l3(y1))`); L4 conditioned on 8
+   material-phase buckets (`phase = min(units·8/105, 7)` over
+   1·P + 3·(L,N) + 5·gold-class + 8·(B,+B) + 9·(R,+R), both colors, board +
+   hands).
+4. **Policy v2 inputs.** 30,244 = 21,096 king-bucketed slots (king id live,
+   keyed by the stm king bucket) + the 9,072 absolute attack/defend-flag
+   features verbatim + the 76 hand slots verbatim; full-width SCReLU with the
+   same output scale as v1 (`>> 2`); move-bucket readout unchanged except the
+   rows are L1p wide.
+
+Unchanged from v1: group B (absolute slots + threat pairs, 265,640 inputs,
+recomputed from scratch), the PST skip on group B, move buckets and SEE
+doubling, frames/perspective, the quantisation scheme (i8 ×128 L1 weights,
+i16 accumulators, calibrated power-of-two qb, f32 head, i16 PST ×256), and
+the file container (256-byte header, 64-byte alignment, CRC-32C; v2 only adds
+`version = 2` and carves `n_phase` out of the reserved bytes).
+
+Measured during implementation (dev machine, random M nets): the v2 finny
+cache touches ~5.7 group-A rows/eval vs v1's ~7.6; qb calibration picks about
+one halving lower for v2 because the L2 input width doubled; the random-net
+`l2_w` fill is [−100,100] for v2 (v1: [−200,200]) to keep int32 dot headroom
+identical. File sizes at the M widths (measured): value v2 ≈ 295 MB (vs 468
+MB), policy v2 ≈ 206 MB (vs 79 MB).
+
+Non-goals (deliberately not implemented): a shared value/policy trunk,
+horizontal mirroring, QAT (fake-quant forward), group-B changes.

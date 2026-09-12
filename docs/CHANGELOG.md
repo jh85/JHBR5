@@ -1,5 +1,31 @@
 # JHBR5 changelog
 
+## Unreleased — NNUE v2 architecture (branch `nnue-v2`)
+
+v2 is an additional net architecture selected per file by
+`NetHeader.version == 2`; v1 nets, loaders and the `--arch v1` training path
+are unchanged and bit-identical. Spec: `docs/NNUE_V2_DESIGN.md`; summary:
+`docs/DESIGN.md` §16; format: `docs/NNUE_FORMAT.md` "Version 2".
+
+* `b1e9865` nnue: v2 C++ core — 9 king buckets replacing the exact king
+  square in group A (21,096 inputs), full-width SCReLU (`simd::ScreluFull`,
+  scalar/AVX2 bit-identical), residual L3 with L2 widened to 32, L4
+  conditioned on 8 material-phase buckets, policy v2 inputs (30,244 =
+  bucketed + absolute flags + hands), `NetHeader.n_phase` carved from
+  reserved, loader dispatch on `version`, `make_random_net --arch v2`,
+  `dump_nnue_features --arch 2`; C++ tests extended.
+* `4629913` pyext: v2 bindings (`feature_set_id_v2`, `king_bucket`,
+  `phase_bucket`, `value_features`/`policy_features(arch=2)`,
+  `write_net(version, n_phase)`) and `BatchReader(arch=2)` (v2 indices,
+  per-batch `phase`, no factoriser).
+* `eb2534b` train: `ValueNetV2`/`PolicyNetV2` model classes, v2 quantized
+  reference forwards and export (`write_net(version=2)`), round-trip and
+  train-smoke tests for v2.
+* `06e4f76` train: `--arch {v1,v2}` wiring (default v1), `--fresh-opt`
+  resume flag; `docs/NNUE_V2_DESIGN.md`.
+* Docs: `docs/NNUE_FORMAT.md` v2 section, `docs/DESIGN.md` §16,
+  `nets/README.md` v1/v2 coexistence note.
+
 ## Unreleased — Phase 5 (testing) and first training
 
 * Pre-rental trainer work (2026-09-03): king-relative factoriser `KPrel`
