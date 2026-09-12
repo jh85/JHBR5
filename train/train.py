@@ -19,13 +19,14 @@ from torch.utils.data import DataLoader
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import jhbr5  # noqa: E402
 from data import RecordDataset  # noqa: E402
-from export import export_policy, export_value, DEFAULT_CALIB  # noqa: E402
-from model import PolicyNet, ValueNet, policy_loss, value_loss, value_target  # noqa: E402
+from export import export_policy, export_policy_v2, export_value, export_value_v2, DEFAULT_CALIB  # noqa: E402
+from model import PolicyNet, PolicyNetV2, ValueNet, ValueNetV2, policy_loss, value_loss, value_target  # noqa: E402
 
 
 def parse_args():
     ap = argparse.ArgumentParser()
     ap.add_argument("--net", choices=["value", "policy"], required=True)
+    ap.add_argument("--arch", choices=["v1", "v2"], default="v1", help="NNUE architecture (docs/NNUE_V2_DESIGN.md)")
     ap.add_argument("--shards", nargs="+", required=True, help="shard files, globs or directories")
     ap.add_argument("--l1", type=int, default=None, help="value: 1024, policy: 4096")
     ap.add_argument("--batch-size", type=int, default=16384)
@@ -55,6 +56,8 @@ def parse_args():
     ap.add_argument("--save-every", type=int, default=5000)
     ap.add_argument("--log-every", type=int, default=100)
     ap.add_argument("--resume")
+    ap.add_argument("--fresh-opt", action="store_true",
+                    help="with --resume: keep weights but reset step to 0 and optimizer state")
     ap.add_argument("--export", help="write the .nn file here at the end")
     return ap.parse_args()
 
@@ -78,7 +81,8 @@ def load_validation(args, see):
         return []
     ds = RecordDataset(args.val_shards, args.batch_size, max(args.batch_size, 4096), 12345,
                        require_dist=(args.net == "policy"), see=see, loop=False,
-                       move_fallback=(args.net == "policy" and args.policy_target == "auto"))
+                       move_fallback=(args.net == "policy" and args.policy_target == "auto"),
+                       arch=2 if args.arch == "v2" else 1)
     batches = []
     for b in ds:
         batches.append(b)
@@ -111,34 +115,38 @@ def main():
     os.makedirs(args.out, exist_ok=True)
     device = torch.device(args.device)
     see = not args.no_see
+    v2 = args.arch == "v2"
     l1 = args.l1 or (1024 if args.net == "value" else 4096)
 
     if args.net == "value":
-        model = ValueNet(l1, factorise=not args.no_factoriser)
+        model = ValueNetV2(l1) if v2 else ValueNet(l1, factorise=not args.no_factoriser)
     else:
-        model = PolicyNet(l1, see=see)
+        model = PolicyNetV2(l1, see=see) if v2 else PolicyNet(l1, see=see)
     model.to(device)
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, betas=(0.9, 0.999), weight_decay=args.weight_decay)
     step = 0
     if args.resume:
         ck = torch.load(args.resume, map_location=device)
         model.load_state_dict(ck["state_dict"])
-        opt.load_state_dict(ck["optimizer"])
-        step = ck["step"]
+        if not args.fresh_opt:
+            opt.load_state_dict(ck["optimizer"])
+            step = ck["step"]
         print(f"resumed from {args.resume} at step {step}")
 
     ds = RecordDataset(args.shards, args.batch_size, args.shuffle_buffer, args.seed,
                        require_dist=(args.net == "policy"), see=see, loop=True,
-                       move_fallback=(args.net == "policy" and args.policy_target == "auto"))
+                       move_fallback=(args.net == "policy" and args.policy_target == "auto"),
+                       arch=2 if v2 else 1)
     loader = DataLoader(ds, batch_size=None, num_workers=args.workers, pin_memory=device.type == "cuda",
                         persistent_workers=args.workers > 0)
-    print(f"{args.net} net l1={l1} params={sum(p.numel() for p in model.parameters())/1e6:.1f}M "
-          f"device={device} shards={len(ds.paths)} feature_set_id={jhbr5.feature_set_id()}")
+    fs_id = jhbr5.feature_set_id_v2() if v2 else jhbr5.feature_set_id()
+    print(f"{args.net} net arch={args.arch} l1={l1} params={sum(p.numel() for p in model.parameters())/1e6:.1f}M "
+          f"device={device} shards={len(ds.paths)} feature_set_id={fs_id}")
 
     def save(tag):
-        ck = {"net": args.net, "l1": l1, "see": see, "factorise": not args.no_factoriser,
+        ck = {"net": args.net, "arch": args.arch, "l1": l1, "see": see, "factorise": not args.no_factoriser,
               "state_dict": model.state_dict(), "optimizer": opt.state_dict(), "step": step,
-              "feature_set_id": jhbr5.feature_set_id(), "bucket_table_id": jhbr5.bucket_table_id(see)}
+              "feature_set_id": fs_id, "bucket_table_id": jhbr5.bucket_table_id(see)}
         torch.save(ck, os.path.join(args.out, f"ckpt_{tag}.pt"))
 
     val_batches = load_validation(args, see)
@@ -194,10 +202,10 @@ def main():
         model.eval()
         model.cpu()
         if args.net == "value":
-            qb = export_value(model, args.export, DEFAULT_CALIB)
+            qb = (export_value_v2 if v2 else export_value)(model, args.export, DEFAULT_CALIB)
             print(f"exported {args.export} qb={qb}")
         else:
-            export_policy(model, args.export)
+            (export_policy_v2 if v2 else export_policy)(model, args.export)
             print(f"exported {args.export}")
 
 
