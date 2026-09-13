@@ -99,13 +99,14 @@ def main():
             cmd = [sys.executable, os.path.join(REPO, "train", "train.py"), "--net", net, "--shards"] + shards + [
                 "--l1", str(opts["l1"]), "--steps", str(opts["steps"]), "--batch-size", str(opts.get("batch_size", 16384)),
                 "--lr", str(opts.get("lr", 1e-3)), "--workers", str(t.get("workers", 4)), "--seed", str(seed),
+                "--device", str(opts.get("device", "cuda:0")),
                 "--out", os.path.join(gen, "train", net), "--export", os.path.join(gen, "nets", f"{net}.nn")]
             if net == "value":
                 cmd += ["--wdl-lambda", str(opts.get("wdl_lambda", 0.7))]
             if have_incumbent and opts.get("resume_from_incumbent", True):
                 prev = os.path.join(root, f"gen_{args.generation - 1}", "train", net, "ckpt_last.pt")
                 if os.path.exists(prev):
-                    cmd += ["--resume", prev]
+                    cmd += ["--resume", prev, "--fresh-opt"]
             run(cmd, log=log)
 
     if "test" in stages:
