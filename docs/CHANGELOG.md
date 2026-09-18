@@ -23,6 +23,11 @@ are unchanged and bit-identical. Spec: `docs/NNUE_V2_DESIGN.md`; summary:
   train-smoke tests for v2.
 * `06e4f76` train: `--arch {v1,v2}` wiring (default v1), `--fresh-opt`
   resume flag; `docs/NNUE_V2_DESIGN.md`.
+* `docs/NNUE_V2_POSTMORTEM.md`: v2 concluded a **negative result** (2026-09-18).
+  v2r1 (400k steps): value wash (+8 undecided), policy −75 REJECTED, pair
+  −70 @5k / −80 @20k REJECTED. v2x (1.2M steps, full bank): policy val gap
+  +0.055→+0.015, policy-only −26 undecided, pair +1 parity @5k but −45
+  REJECTED @20k. v2 parked; v1 remains the playing architecture.
 * Docs: `docs/NNUE_FORMAT.md` v2 section, `docs/DESIGN.md` §16,
   `nets/README.md` v1/v2 coexistence note.
 
